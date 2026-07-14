@@ -3,13 +3,13 @@ import time
 import os
 from datetime import datetime
 
-CAM_IP = "192.168.0.51"  # 카메라 IP 주소
+CAM_IP = "192.168.0.51"  # 카메라 IP 주소 192.168. 사설 대역 사용 권장
 SAVE_DIR = "thermal_dataset"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # 수집할 이미지 종류: "thermal" 만 또는 "both" (thermal + visual)
 MODE = "both"
-INTERVAL = 0.5
+INTERVAL = 10.0
 
 URLS = {
     "thermal": f"http://{CAM_IP}/api/image/current?imgformat=JPEG",

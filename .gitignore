@@ -1,4 +1,7 @@
 /.vscode
 /test.py
 /thermal_dataset
+/thermal_to_rgb.npy
 /__pycache__
+/.obsidian
+*.pyc
