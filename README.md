@@ -27,9 +27,12 @@ project/
 ├── metadata.py             # CSV 메타데이터 생성/업데이트
 ├── checking.py             # 데이터셋 무결성 검사 및 복구
 ├── calibration.py          # Thermal-RGB Homography 캘리브레이션 도구
+├── test.py                 # Threshold 판단 + 상태 머신 테스트
+├── notifier.py             # Telegram 알림 전송 모듈
 ├── product_design.md       # 제품 설계 계획안
 ├── experiment_config.json  # 실험 설정
 ├── requirements.txt        # 의존성 패키지
+├── .env.example            # 환경변수 템플릿 (BOT_TOKEN, CHAT_ID)
 ├── docs/
 │   └── 카메라_도면.png      # FLIR A50 카메라 도면
 └── thermal_dataset/        # 수집된 데이터셋
@@ -90,9 +93,23 @@ pip install -r requirements.txt
 - `thermal_dataset/`에 Thermal/RGB 이미지 및 온도 행렬(.npy) 수집 완료
 - 실험 조건: `normal` 상태 기준 데이터
 
+### 7. Threshold 판단 및 상태 머신 (`test.py`)
+- 95th percentile 온도 기준 상태 판정 (Normal / Warning / Critical)
+- Baseline + 15°C → Warning, Baseline + 25°C → Critical
+- 상태 변화 시에만 알림 전송 (Normal → Warning → Critical → Normal)
+- 알림 쿨다운 10분 적용 (연속 발송 방지)
+- 온도 이력 deque 기반 기록 및 요약 출력
+
+### 8. Telegram 알림 (`notifier.py`)
+- 이미지(Overlay) + 캡션(온도, 상태, 로봇ID) 전송
+- 이미지 전송 실패 시 텍스트-only 폴백
+- `.env` 파일 기반 BOT_TOKEN / CHAT_ID 설정 (python-dotenv 불필요)
+- `.env` 미설정 시 dry-run 모드로 콘솔 출력
+- `.env.example` 템플릿 제공, `.env`는 `.gitignore`로 보호
+
 ## 🚧 현재 작업 중
 
-- 온도 분석 결과를 기반으로 Threshold 판단 로직 구현 검토 중
+- `test.py`와 `notifier.py`를 실제 `.npy` 데이터 및 Overlay 이미지와 연동
 
 ## 📋 앞으로 작업할 내용
 
@@ -102,10 +119,10 @@ pip install -r requirements.txt
 |------|------|------|
 | ROI 설정 자동화 | ⬜ | 캘리브레이션 결과 기반 Thermal 좌표계 ROI 자동 매핑 |
 | 온도 분석 파이프라인 | ⬜ | max_temp, mean_temp, 95th percentile 통계 계산 |
-| Threshold 판단 로직 | ⬜ | 기준 온도 + 15°C 초과 시 Warning 판정 |
-| 상태 머신 | ⬜ | Normal → Warning → Critical 상태 전이 |
+| Threshold 판단 로직 | ✅ | 기준 온도 + 15°C 초과 시 Warning, +25°C Critical 판정 |
+| 상태 머신 | ✅ | Normal → Warning → Critical → Normal 상태 전이 |
+| Telegram 알림 | ✅ | 이미지+캡션 전송, dry-run 모드, .env 기반 토큰 관리 |
 | Overlay 시각화 | ⬜ | RGB 이미지에 과열 부위 표시 및 온도 레이블 |
-| Telegram 알림 | ⬜ | 상태 변화 시 봇 메시지 전송 (10분 쿨다운 포함) |
 | 이력 관리 | ⬜ | 온도 트렌드 저장 및 추세 분석 |
 
 ### Phase 2 — 고도화
@@ -170,11 +187,14 @@ pip install -r requirements.txt
 
 ```gitignore
 # 아래 항목들이 .gitignore에 등록되어 있는지 확인
+/.vscode
 /thermal_dataset
 /thermal_to_rgb.npy
-/test.py
-/.vscode
 /__pycache__
+/.obsidian
+*.pyc
+.env
+.env.example
 ```
 
 ## 라이선스
