@@ -51,6 +51,47 @@ Overlay
       ↓
 Telegram 알림
 ```
+
+## 실시간 감시 시퀀스 (monitor.py)
+
+캡처, 무결성 검사, 분석, 알림을 하나의 연속 시퀀스로 자동화합니다.
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  monitor.py (시퀀서)                    │
+│                                                        │
+│  백그라운드 스레드:                                      │
+│    CaptureSession → 논스톱 이미지 수집 (JPG)              │
+│                                                        │
+│  메인 루프 (2초 주기):                                   │
+│    1. 신규 이미지쌍 스캔                                 │
+│    2. NPY 누락 시 JPEG에서 자동 추출                      │
+│    3. ROI 온도 통계 추출 (max/mean/95th + 클러스터)      │
+│    4. 이중 경로 Threshold 판정 (95th + max)              │
+│    5. 상태 머신 (Normal → Warning → Critical)            │
+│    6. 과열 시 Overlay 생성 + Telegram 알림               │
+│    7. 주기적: 무결성 검사(60s) + CSV 메타데이터(120s)     │
+│                                                        │
+│  모든 단계 예외 처리 → 로그만 남기고 시퀀스 계속           │
+└──────────────────────────────────────────────────────┘
+```
+
+## 통합 설정 (config.json)
+
+모든 설정을 단일 파일로 관리합니다. 구버전 설정 파일은 최초 실행 시 자동 이관됩니다.
+
+```
+config.json
+├── camera        IP, 캡처 주기
+├── identity      카메라ID, 로봇ID
+├── roi           좌표(x1,y1,x2,y2), baseline, warning/critical delta
+├── monitoring    처리 주기, 쿨다운 타이머
+├── hotspot       최소 클러스터 크기 (95th 경로 / max 경로)
+├── paths         dataset_dir, overlay_dir, homography_path
+├── display       표시 해상도
+└── tools         exiftool 경로, 캡처 모드
+```
+
 ## 1차 개발 범위(MVP)
 
 ```
@@ -60,7 +101,7 @@ Single Camera MVP
 # 3. 데이터 수집 방식
 
 ```
-10초 주기 Snapshot 요청
+1초 주기 Snapshot 요청
 ```
 #### 수집 데이터:
 
@@ -167,11 +208,33 @@ hot_temp = np.percentile(
 ```
 ---
 # 7. 임계값 판단(Threshold)
+
+**이중 경로 판정 (Dual-Path)**
+
+| 경로 | 기준 | 조건 | 목적 |
+|------|------|------|------|
+| 1 — 95th percentile | `95th >= baseline + delta` + cluster ≥ 3px | 넓은 영역이 서서히 과열될 때 감지 | 주 경로 |
+| 2 — max 온도 | `max >= baseline + critical_delta` + cluster ≥ 10px | ROI 대비 소수 픽셀만 국소 과열될 때 보완 | 보조 경로 |
+
+**클러스터 분석 (다중 핫스팟)**
+
 ```
-if hot_temp >
-baseline + 15:
-    warning
+# cv2.connectedComponentsWithStats로 모든 과열 클러스터 검출
+mask = roi > (baseline + warning_delta)
+num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+
+# 3px 이상의 클러스터만 발열로 인정 (1~2px = 센서 노이즈)
+# 각 클러스터마다 무게중심 좌표 + 최고 온도 기록
+for label_id in range(1, num_labels):
+    if stats[label_id, cv2.CC_STAT_AREA] >= 3:
+        centroids.append((cx, cy, cluster_max_temp))
 ```
+
+```
+if hot_temp > baseline + 15: warning
+if hot_temp > baseline + 25: critical
+```
+
 ---
 # 8. 상태 머신
 ```

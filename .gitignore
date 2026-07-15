@@ -5,3 +5,4 @@
 /.obsidian
 *.pyc
 .env
+config.json

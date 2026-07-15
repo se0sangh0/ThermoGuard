@@ -14,8 +14,11 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 
-MIN_HOTSPOT_SIZE = 3       # 95th percentile 경로 최소 클러스터 크기
-MIN_HOTSPOT_SIZE_MAX = 10  # max 온도 경로 최소 클러스터 크기 (노이즈 방지용 상향)
+from config import load_config
+
+_cfg = load_config()
+MIN_HOTSPOT_SIZE = _cfg.hotspot.min_size       # 95th percentile 경로 최소 클러스터 크기
+MIN_HOTSPOT_SIZE_MAX = _cfg.hotspot.min_size_max  # max 온도 경로 최소 클러스터 크기 (노이즈 방지용 상향)
 
 
 class Status(Enum):
@@ -28,7 +31,7 @@ class Status(Enum):
 class MonitorState:
     status: Status = Status.NORMAL
     last_alarm_time: float = 0.0
-    alarm_cooldown: float = 10 * 60  # 10분
+    alarm_cooldown: float = _cfg.monitoring.alarm_cooldown_sec  # from config.json
 
 
 def evaluate_threshold(

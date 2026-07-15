@@ -21,22 +21,23 @@ from datetime import datetime
 
 import requests
 
-SAVE_DIR = "thermal_dataset"
+from config import load_config
 
 
 class CaptureSession:
     def __init__(
         self,
-        cam_ip: str = "192.168.0.51",
-        mode: str = "both",
-        interval: float = 10.0,
-        save_dir: str = SAVE_DIR,
+        cam_ip: str | None = None,
+        mode: str | None = None,
+        interval: float | None = None,
+        save_dir: str | None = None,
         log_callback=None,
     ):
-        self.cam_ip = cam_ip
-        self.mode = mode          # "thermal" or "both"
-        self.interval = interval
-        self.save_dir = save_dir
+        cfg = load_config()
+        self.cam_ip = cam_ip or cfg.camera.ip
+        self.mode = mode or cfg.tools.mode      # "thermal" or "both"
+        self.interval = interval or cfg.camera.capture_interval_sec
+        self.save_dir = save_dir or cfg.paths.dataset_dir
         self.log_callback = log_callback  # callable(str) for GUI output
         self._running = False
         self._thread = None

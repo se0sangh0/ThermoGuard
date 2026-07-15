@@ -14,9 +14,12 @@ import sys
 import cv2
 import numpy as np
 
-DATASET_DIR = "thermal_dataset"
-HOMOGRAPHY_PATH = "thermal_to_rgb.npy"
-OVERLAY_DIR = os.path.join(DATASET_DIR, "overlay")
+from config import load_config
+
+cfg = load_config()
+DATASET_DIR = cfg.paths.dataset_dir
+HOMOGRAPHY_PATH = cfg.paths.homography_path
+OVERLAY_DIR = cfg.paths.overlay_dir
 
 # 시각화 스타일
 ROI_COLOR_NORMAL = (0, 255, 0)    # 초록

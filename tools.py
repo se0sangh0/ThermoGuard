@@ -17,6 +17,7 @@ from datetime import datetime
 from capture import CaptureSession
 from checking import run_check
 from metadata import run_metadata
+from config import load_config
 
 
 class ToolApp:
@@ -40,20 +41,21 @@ class ToolApp:
     # UI 구성
     # --------------------------------------------------------
     def _build_ui(self):
+        cfg = load_config()
         # 상단 - 캡처 설정
         config_frame = ttk.LabelFrame(self.root, text="Capture Settings", padding=10)
         config_frame.pack(fill="x", padx=10, pady=(10, 5))
 
         ttk.Label(config_frame, text="Camera IP:").grid(row=0, column=0, sticky="w", padx=(0, 5))
-        self.cam_ip_var = tk.StringVar(value="192.168.0.51")
+        self.cam_ip_var = tk.StringVar(value=cfg.camera.ip)
         ttk.Entry(config_frame, textvariable=self.cam_ip_var, width=20).grid(row=0, column=1, sticky="w")
 
         ttk.Label(config_frame, text="Interval (s):").grid(row=0, column=2, sticky="w", padx=(15, 5))
-        self.interval_var = tk.StringVar(value="10")
+        self.interval_var = tk.StringVar(value=str(cfg.camera.capture_interval_sec))
         ttk.Entry(config_frame, textvariable=self.interval_var, width=6).grid(row=0, column=3, sticky="w")
 
         ttk.Label(config_frame, text="Mode:").grid(row=0, column=4, sticky="w", padx=(15, 5))
-        self.mode_var = tk.StringVar(value="both")
+        self.mode_var = tk.StringVar(value=cfg.tools.mode)
         mode_cb = ttk.Combobox(config_frame, textvariable=self.mode_var,
                                values=["both", "thermal"], state="readonly", width=8)
         mode_cb.grid(row=0, column=5, sticky="w")

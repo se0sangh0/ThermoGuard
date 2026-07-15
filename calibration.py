@@ -1,3 +1,17 @@
+"""
+calibration.py - Thermal-RGB Homography 캘리브레이션 도구
+
+Thermal 이미지와 RGB 이미지에서 대응점을 선택하여 Homography 행렬을 계산합니다.
+계산된 행렬은 thermal_to_rgb.npy로 저장됩니다.
+
+조작:
+    마우스 클릭 (좌우 교차) : Thermal → RGB 대응점 선택
+    S             : 현재까지의 점으로 Homography 계산 및 저장
+    R             : 모든 선택점 초기화
+    Z             : 마지막 선택점 취소 (Undo)
+    ESC / Q       : 종료 (변경사항 저장 안 함)
+"""
+
 import cv2
 import numpy as np
 import sys
@@ -30,8 +44,11 @@ def click_rgb(event, x, y, flags, param):
         else:
             print("[경고] Thermal 포인트를 먼저 클릭하세요.")
 
-DATASET_DIR = "thermal_dataset"
-DISPLAY_WIDTH = 800  # 이미지 표시 너비 (비율 유지)
+from config import load_config
+
+cfg = load_config()
+DATASET_DIR = cfg.paths.dataset_dir
+DISPLAY_WIDTH = cfg.display.display_width  # 이미지 표시 너비 (비율 유지)
 
 def resize_for_display(img, width):
     h, w = img.shape[:2]
@@ -74,6 +91,8 @@ if rgb is None:
 
 print(f"Thermal: {thermal_path}")
 print(f"RGB: {rgb_path}")
+print("  Click alternating: Thermal -> RGB -> Thermal -> ...")
+print("  S = compute & save   R = reset   Z = undo   ESC/Q = quit without saving")
 
 #윈도우 띄우기
 cv2.namedWindow("Thermal")
@@ -117,22 +136,44 @@ while True:
         dp = (int(pt[0] / rgb_scale), int(pt[1] / rgb_scale))
         cv2.putText(r, str(i + 1), dp, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
+    # 안내 텍스트
+    cv2.putText(t, "Thermal | S: save  R: reset  Z: undo  Q: quit",
+                (10, t.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(r, "RGB | S: save  R: reset  Z: undo  Q: quit",
+                (10, r.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
     cv2.imshow("Thermal", t)
     cv2.imshow("RGB", r)
 
     key = cv2.waitKey(1)
 
-    if key == ord('q'):
-        break
-    elif key == ord('z'):
+    if key == ord('q') or key == 27:  # Q or ESC: 저장 없이 종료
+        print("Quit without saving.")
+        cv2.destroyAllWindows()
+        sys.exit(0)
+    elif key == ord('r'):  # Reset: 모든 선택점 초기화
+        thermal_pts.clear()
+        rgb_pts.clear()
+        pair_state = "thermal"
+        print("[Reset] All points cleared.")
+    elif key == ord('z'):  # Undo
         if pair_state == "rgb" and thermal_pts:
             thermal_pts.pop()
             pair_state = "thermal"
-            print(f"[Undo] 마지막 Thermal 포인트 제거")
+            print(f"[Undo] Last thermal point removed ({len(thermal_pts)} remaining)")
         elif pair_state == "thermal" and rgb_pts:
             rgb_pts.pop()
             pair_state = "rgb"
-            print(f"[Undo] 마지막 RGB 포인트 제거")
+            print(f"[Undo] Last RGB point removed ({len(rgb_pts)} remaining)")
+        else:
+            print("[Undo] Nothing to undo.")
+    elif key == ord('s'):  # Save: Homography 계산 및 저장
+        if len(thermal_pts) < 4:
+            print(f"[Save] Need at least 4 point pairs, currently have {len(thermal_pts)}")
+        elif len(thermal_pts) != len(rgb_pts):
+            print(f"[Save] Point count mismatch: thermal={len(thermal_pts)} vs rgb={len(rgb_pts)}")
+        else:
+            break  # 루프 탈출하여 Homography 계산 진행
 
 cv2.destroyAllWindows()
 

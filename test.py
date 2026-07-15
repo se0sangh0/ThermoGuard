@@ -9,17 +9,20 @@ import time
 from collections import deque
 
 from _encoding import setup_encoding
+from config import load_config
 from threshold import Status, MonitorState, evaluate_threshold, should_alarm
 
 setup_encoding()
 
+cfg = load_config()
+
 # ============================================================
-# 테스트 설정
+# 테스트 설정 (config.json 기준)
 # ============================================================
-BASELINE_TEMP = 35.0
-WARNING_DELTA = 15.0
-CRITICAL_DELTA = 25.0
-ALARM_COOLDOWN = 10 * 60
+BASELINE_TEMP = cfg.roi.baseline_temp
+WARNING_DELTA = cfg.roi.warning_delta
+CRITICAL_DELTA = cfg.roi.critical_delta
+ALARM_COOLDOWN = cfg.monitoring.alarm_cooldown_sec
 
 # ------------------------------------------------------------
 # 임시 온도 시나리오

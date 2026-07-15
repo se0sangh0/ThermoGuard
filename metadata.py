@@ -2,6 +2,7 @@
 metadata.py - CSV 메타데이터 생성 및 업데이트
 
 정상 JPG-NPY 파일쌍을 기준으로 metadata.csv를 생성/업데이트합니다.
+ROI 분석 + Threshold 판정 결과를 포함합니다.
 이미 CSV에 있는 레코드는 건너뜁니다.
 
 사용법 (import):
@@ -17,16 +18,26 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from thermal_utils import extract_from_jpeg
+from roi import load_roi_config, extract_roi_from_npy
+from threshold import evaluate_threshold
+from config import load_config
 
-SAVE_DIR = "thermal_dataset"
-CONFIG_PATH = "experiment_config.json"
+SAVE_DIR = load_config().paths.dataset_dir
 
 CSV_HEADER = [
-    "image_id", "timestamp", "image_path", "thermal_path",
-    "min_temp", "max_temp", "mean_temp",
-    "experiment_id", "condition", "target_temp",
-    "distance_cm", "angle_deg", "ambient_temp", "notes",
+    "image_id",
+    "timestamp",
+    "camera_id",
+    "robot_id",
+    "image_path",
+    "thermal_path",
+    "min_temp",
+    "max_temp",
+    "mean_temp",
+    "hotspot_temp",
+    "ambient_temp",
+    "delta_temp",
+    "alarm_level",
 ]
 
 
@@ -48,20 +59,21 @@ def _log(msg: str, log_callback=None, messages: list[str] | None = None):
 
 
 def run_metadata(
-    save_dir: str = SAVE_DIR,
-    config_path: str = CONFIG_PATH,
+    save_dir: str | None = None,
     log_callback=None,
 ) -> MetadataResult:
     result = MetadataResult()
+
+    if save_dir is None:
+        save_dir = load_config().paths.dataset_dir
 
     if not os.path.isdir(save_dir):
         _log(f"'{save_dir}' folder not found.", log_callback, result.messages)
         return result
 
-    config = {}
-    if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+    cfg = load_config()
+
+    roi_config = load_roi_config()
 
     files = os.listdir(save_dir)
     jpgs = {f.replace(".jpg", ""): f
@@ -104,26 +116,42 @@ def run_metadata(
             npy_path = os.path.join(save_dir, npys[base])
             thermal = np.load(npy_path)
 
-            try:
-                _, cap_meta = extract_from_jpeg(jpg_path)
-            except Exception:
-                cap_meta = {"timestamp": "", "distance_cm": 0, "ambient_temp": 0.0}
+            # ROI 분석 + Threshold 판정
+            roi_result = extract_roi_from_npy(npy_path, roi_config)
+            alarm_status = evaluate_threshold(
+                roi_result.hot_temp_95,
+                roi_result.max_temp,
+                roi_config.baseline_temp,
+                roi_config.warning_delta,
+                roi_config.critical_delta,
+                max_hotspot_size=roi_result.max_hotspot_size,
+            )
+
+            # hotspot_temp: centroids 중 최고 온도 (실제 발열원), 없으면 ROI max
+            hotspot_temp = round(roi_result.max_temp, 2)
+            if roi_result.hotspot_centroids:
+                hotspot_temp = round(max(c[2] for c in roi_result.hotspot_centroids), 2)
+            # 대안: ROI 95th percentile
+            # hotspot_temp = round(float(roi_result.hot_temp_95), 2)
+
+            # ambient: 전체 프레임 10th percentile (배경 온도 추정 — hotspot 영향 최소화)
+            ambient = round(float(np.nanpercentile(thermal, 10)), 2)
+            delta_temp = round(hotspot_temp - ambient, 2)
 
             row = [
                 base,
-                cap_meta.get("timestamp", ""),
+                base[:14],
+                cfg.identity.camera_id,
+                cfg.identity.robot_id,
                 jpgs[base],
                 npys[base],
-                round(float(np.nanmin(thermal)), 2),
-                round(float(np.nanmax(thermal)), 2),
-                round(float(np.nanmean(thermal)), 2),
-                config.get("experiment_id", ""),
-                config.get("condition", ""),
-                config.get("target_temp", ""),
-                cap_meta.get("distance_cm", ""),
-                config.get("angle_deg", ""),
-                round(float(cap_meta.get("ambient_temp", 0)), 2),
-                config.get("notes", ""),
+                round(float(np.nanmin(roi_result.roi_thermal)), 2),
+                round(float(roi_result.max_temp), 2),                # ROI max
+                round(float(roi_result.mean_temp), 2),               # ROI mean
+                hotspot_temp,                                         # ROI 95th
+                ambient,                                              # full frame 10th
+                delta_temp,
+                alarm_status.value,
             ]
             writer.writerow(row)
             count += 1

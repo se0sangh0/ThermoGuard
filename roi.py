@@ -1,11 +1,10 @@
 """
 roi.py - ROI 설정 및 온도 통계 추출
 
-roi_config.json에서 ROI 좌표를 불러와 .npy 온도 행렬에서
+config.json에서 ROI 좌표를 불러와 .npy 온도 행렬에서
 해당 영역의 온도 통계값을 계산합니다.
 """
 
-import json
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -13,13 +12,14 @@ from typing import Optional
 import cv2
 import numpy as np
 
-# 프로젝트 루트 기준 경로
-ROI_CONFIG_PATH = "roi_config.json"
-DATASET_DIR = "thermal_dataset"
+from config import load_config, RoiConfig as AppRoiConfig
 
 # Thermal 이미지 vs .npy 해상도 차이 보정
-DISPLAY_W = 640
-DISPLAY_H = 480
+DISPLAY_W = load_config().display.roi_display_width
+DISPLAY_H = load_config().display.roi_display_height
+
+# 하위 호환을 위한 wrapper
+RoiConfig = AppRoiConfig
 
 
 @dataclass
@@ -34,35 +34,17 @@ class RoiResult:
     hotspot_centroids: list = field(default_factory=list)  # [(x, y, temp), ...] in 640x480 좌표계
 
 
-@dataclass
-class RoiConfig:
-    x1: int = 0
-    y1: int = 0
-    x2: int = 640
-    y2: int = 480
-    baseline_temp: float = 35.0
-    warning_delta: float = 15.0
-    critical_delta: float = 25.0
-
-
-def load_roi_config(config_path: str = ROI_CONFIG_PATH) -> RoiConfig:
-    """roi_config.json 에서 ROI 설정 불러오기"""
-    if not os.path.isfile(config_path):
-        print(f"[roi] {config_path} not found, using default (full frame)")
-        return RoiConfig()
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    roi = cfg.get("thermal_roi", {})
+def load_roi_config() -> RoiConfig:
+    """config.json 에서 ROI 설정 불러오기 (하위 호환 wrapper)"""
+    cfg = load_config()
     return RoiConfig(
-        x1=int(roi.get("x1", 0)),
-        y1=int(roi.get("y1", 0)),
-        x2=int(roi.get("x2", 640)),
-        y2=int(roi.get("y2", 480)),
-        baseline_temp=float(cfg.get("baseline_temp", 35.0)),
-        warning_delta=float(cfg.get("warning_delta", 15.0)),
-        critical_delta=float(cfg.get("critical_delta", 25.0)),
+        x1=cfg.roi.x1,
+        y1=cfg.roi.y1,
+        x2=cfg.roi.x2,
+        y2=cfg.roi.y2,
+        baseline_temp=cfg.roi.baseline_temp,
+        warning_delta=cfg.roi.warning_delta,
+        critical_delta=cfg.roi.critical_delta,
     )
 
 
@@ -130,7 +112,7 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
         )
 
     # 국소 발열 클러스터 분석
-    # baseline + warning_delta 기준 초과 픽셀 수 + 가장 큰 연결 클러스터 크기
+    # baseline + warning_delta 기준 초과 픽셀을 connected components로 그룹화
     over_threshold = config.baseline_temp + config.warning_delta
     hotspot_mask = roi > over_threshold
     over_pixels = int(np.sum(hotspot_mask))
@@ -141,21 +123,26 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
 
     if over_pixels > 0:
         hotspot_uint8 = hotspot_mask.astype(np.uint8)
-        _, labels, stats, centroids_raw = cv2.connectedComponentsWithStats(
+        num_labels, labels, stats, centroids_raw = cv2.connectedComponentsWithStats(
             hotspot_uint8, connectivity=8
         )
         # stats[0]은 배경(label 0) 전체 영역이므로 제외
-        if len(stats) > 1:
+        if num_labels > 1:
             max_cluster = int(stats[1:, cv2.CC_STAT_AREA].max())
 
         # ROI 내부 좌표 -> thermal 이미지(640x480) 좌표로 변환
         scale_back_x = DISPLAY_W / thermal.shape[1]
         scale_back_y = DISPLAY_H / thermal.shape[0]
 
-        for label_id in range(1, len(stats)):
+        for label_id in range(1, num_labels):
             area = int(stats[label_id, cv2.CC_STAT_AREA])
             if area < MIN_HOTSPOT:
                 continue
+            # 클러스터별 마스크 및 온도
+            cluster_mask = labels == label_id
+            cluster_temps = roi[cluster_mask]
+            cluster_max_temp = float(np.nanmax(cluster_temps))
+
             cx, cy = centroids_raw[label_id]
             # ROI 오프셋 적용 후 thermal 이미지 좌표계로 변환
             if roi is not thermal:
@@ -163,9 +150,7 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
                 cy += y1
             tx = round(cx * scale_back_x)
             ty = round(cy * scale_back_y)
-            cluster_mask = (labels == label_id) & hotspot_mask
-            cluster_max = float(np.nanmax(roi[hotspot_mask & (labels == label_id)]))
-            centroids.append((tx, ty, cluster_max))
+            centroids.append((tx, ty, cluster_max_temp))
 
     return RoiResult(
         roi_thermal=roi,
@@ -186,6 +171,9 @@ if __name__ == "__main__":
     from _encoding import setup_encoding
     setup_encoding()
 
+    cfg = load_config()
+    dataset_dir = cfg.paths.dataset_dir
+
     print("=== ROI Test ===\n")
     config = load_roi_config()
     print(f"ROI bounds: ({config.x1}, {config.y1}) - ({config.x2}, {config.y2})")
@@ -193,13 +181,12 @@ if __name__ == "__main__":
     print(f"Warning delta: {config.warning_delta}C")
     print(f"Critical delta: {config.critical_delta}C")
 
-    # 최신 .npy 파일 찾기
-    if os.path.isdir(DATASET_DIR):
+    if os.path.isdir(dataset_dir):
         npy_files = sorted(
-            [f for f in os.listdir(DATASET_DIR) if f.endswith("_thermal.npy")]
+            [f for f in os.listdir(dataset_dir) if f.endswith("_thermal.npy")]
         )
         if npy_files:
-            npy_path = os.path.join(DATASET_DIR, npy_files[-1])
+            npy_path = os.path.join(dataset_dir, npy_files[-1])
             print(f"\nTesting with: {npy_path}")
             result = extract_roi_from_npy(npy_path, config)
             print(f"  Max temp: {result.max_temp:.1f}C")
@@ -209,6 +196,6 @@ if __name__ == "__main__":
             print(f"  Over-threshold pixels: {result.over_temp_pixels}")
             print(f"  Max hotspot cluster size: {result.max_hotspot_size}")
         else:
-            print("\nNo .npy files found in thermal_dataset/")
+            print("\nNo .npy files found")
     else:
-        print(f"\n'{DATASET_DIR}' directory not found")
+        print(f"\n'{dataset_dir}' directory not found")

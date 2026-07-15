@@ -16,8 +16,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from thermal_utils import extract_from_jpeg
+from config import load_config
 
-SAVE_DIR = "thermal_dataset"
+SAVE_DIR = load_config().paths.dataset_dir
 
 
 class CheckResult:

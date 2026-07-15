@@ -8,14 +8,22 @@ import numpy as np
 from PIL import Image
 import io
 
-# exiftool 경로
-EXIFTOOL = os.path.abspath(os.path.join(
-    os.environ.get("CONDA_PREFIX", ""),
-    "Lib", "site-packages", "dji_executables",
-    "dji_thermal_sdk_v1.7", "exiftool-12.35.exe"
-))
-if not os.path.exists(EXIFTOOL):
-    EXIFTOOL = "exiftool"
+# exiftool 경로 — config.json에서 설정하거나, 없으면 DJI SDK 경로 → PATH fallback
+def _get_default_exiftool() -> str:
+    from config import load_config
+    cfg = load_config()
+    if cfg.tools.exiftool_path:
+        return cfg.tools.exiftool_path
+    bundled = os.path.abspath(os.path.join(
+        os.environ.get("CONDA_PREFIX", ""),
+        "Lib", "site-packages", "dji_executables",
+        "dji_thermal_sdk_v1.7", "exiftool-12.35.exe"
+    ))
+    if os.path.exists(bundled):
+        return bundled
+    return "exiftool"
+
+EXIFTOOL = _get_default_exiftool()
 
 ABSOLUTE_ZERO = 273.15
 

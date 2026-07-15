@@ -18,6 +18,7 @@ from datetime import datetime
 
 import numpy as np
 
+from config import load_config
 from roi import load_roi_config, extract_roi_from_npy
 from threshold import (
     Status,
@@ -27,8 +28,9 @@ from threshold import (
 from overlay import create_overlay, save_overlay
 from notifier import send_alarm as send_telegram
 
-DATASET_DIR = "thermal_dataset"
-OVERLAY_DIR = os.path.join(DATASET_DIR, "overlay")
+_cfg = load_config()
+DATASET_DIR = _cfg.paths.dataset_dir
+OVERLAY_DIR = _cfg.paths.overlay_dir
 
 
 def scan_pairs() -> list[dict]:

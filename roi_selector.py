@@ -12,6 +12,7 @@ Thermal 이미지를 띄우고 마우스 드래그로 ROI 영역을 지정합니
     ESC / Q       : 종료 (변경사항 저장 안 함)
     S             : 현재 선택 영역을 roi_config.json에 저장 후 종료
     R             : 선택 영역 초기화
+    Z             : 마지막 드래그 취소 (Undo)
 """
 
 import json
@@ -22,14 +23,17 @@ import glob
 import cv2
 import numpy as np
 
-DATASET_DIR = "thermal_dataset"
-CONFIG_PATH = "roi_config.json"
-DISPLAY_WIDTH = 800
+from config import load_config, save_config
+
+cfg = load_config()
+DATASET_DIR = cfg.paths.dataset_dir
+DISPLAY_WIDTH = cfg.display.display_width
 
 # ROI 상태
 roi_start = None   # (x, y) 드래그 시작점 (원본 이미지 좌표)
 roi_end = None     # (x, y) 드래그 끝점 (원본 이미지 좌표)
 final_roi = None   # 확정된 ROI (x1, y1, x2, y2) 원본 이미지 좌표
+prev_roi = None    # Undo용: 직전 확정 ROI 저장
 dragging = False
 scale = 1.0
 
@@ -41,13 +45,14 @@ def resize_for_display(img, width):
 
 
 def mouse_callback(event, x, y, flags, param):
-    global roi_start, roi_end, final_roi, dragging
+    global roi_start, roi_end, final_roi, prev_roi, dragging
 
     # 표시 좌표 -> 원본 좌표
     ox = int(x * scale)
     oy = int(y * scale)
 
     if event == cv2.EVENT_LBUTTONDOWN:
+        prev_roi = final_roi
         roi_start = (ox, oy)
         roi_end = (ox, oy)
         final_roi = None
@@ -85,44 +90,27 @@ def get_roi_box():
 
 
 def load_existing_roi():
-    """기존 roi_config.json에서 저장된 ROI 불러오기"""
-    if not os.path.isfile(CONFIG_PATH):
-        return None
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    roi = cfg.get("thermal_roi", {})
-    x1 = roi.get("x1")
-    y1 = roi.get("y1")
-    x2 = roi.get("x2")
-    y2 = roi.get("y2")
-    if None not in (x1, y1, x2, y2):
-        return (int(x1), int(y1), int(x2), int(y2))
+    """config.json에서 저장된 ROI 불러오기"""
+    c = load_config()
+    if None not in (c.roi.x1, c.roi.y1, c.roi.x2, c.roi.y2):
+        return (c.roi.x1, c.roi.y1, c.roi.x2, c.roi.y2)
     return None
 
 
 def save_roi(roi):
-    """roi_config.json에 ROI 좌표 저장"""
+    """config.json에 ROI 좌표 저장"""
     x1, y1, x2, y2 = roi
-
-    if os.path.isfile(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    else:
-        cfg = {}
-
-    cfg["thermal_roi"] = {
-        "_comment": "Thermal 이미지(640x480) 기준 관심 영역 [x1, y1, x2, y2]",
-        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-    }
-
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4, ensure_ascii=False)
-
-    print(f"[roi_selector] ROI saved to {CONFIG_PATH}: ({x1},{y1})-({x2},{y2})")
+    c = load_config(force_reload=True)
+    c.roi.x1 = x1
+    c.roi.y1 = y1
+    c.roi.x2 = x2
+    c.roi.y2 = y2
+    save_config(c)
+    print(f"[roi_selector] ROI saved to config.json: ({x1},{y1})-({x2},{y2})")
 
 
 def main():
-    global scale
+    global scale, final_roi, prev_roi, roi_start, roi_end, dragging
 
     # 이미지 선택
     if len(sys.argv) >= 2:
@@ -144,12 +132,11 @@ def main():
 
     print(f"Loaded: {img_path}  ({img.shape[1]}x{img.shape[0]})")
     print("  Drag mouse to set ROI")
-    print("  S = save & exit    R = reset    ESC/Q = quit without saving")
+    print("  S = save & exit    R = reset    Z = undo    ESC/Q = quit without saving")
 
     # 기존 ROI 있으면 로드
     existing = load_existing_roi()
     if existing:
-        global final_roi
         final_roi = existing
         print(f"  Loaded existing ROI: ({existing[0]},{existing[1]})-({existing[2]},{existing[3]})")
 
@@ -179,7 +166,7 @@ def main():
                         (dx1, dy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         # 안내 텍스트
-        cv2.putText(disp, "Drag: set ROI | S: save | R: reset | Q: quit",
+        cv2.putText(disp, "Drag: set ROI | S: save | R: reset | Z: undo | Q: quit",
                     (10, disp.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         cv2.imshow("ROI Selector - Thermal Image", disp)
@@ -189,12 +176,16 @@ def main():
             print("Quit without saving.")
             break
         elif key == ord("r"):  # Reset
-            global roi_start, roi_end, dragging
             roi_start = None
             roi_end = None
             final_roi = None
+            prev_roi = None
             dragging = False
             print("ROI reset.")
+        elif key == ord("z"):  # Undo
+            final_roi = prev_roi
+            prev_roi = None
+            print("ROI undone." if final_roi else "Nothing to undo.")
         elif key == ord("s"):  # Save
             box = get_roi_box()
             if box:
