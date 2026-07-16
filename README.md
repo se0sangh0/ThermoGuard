@@ -68,8 +68,6 @@ project/
 ├── .env.example            # 환경변수 템플릿 (BOT_TOKEN, CHAT_ID)
 ├── requirements.txt        # 의존성 패키지
 ├── product_design.md       # 제품 설계 계획안
-├── docs/
-│   └── 카메라_도면.png      # FLIR A50 카메라 도면
 └── thermal_dataset/        # 수집된 데이터셋
     ├── *.jpg               # Thermal 원본 이미지
     ├── *_thermal.npy       # 픽셀별 온도 행렬
