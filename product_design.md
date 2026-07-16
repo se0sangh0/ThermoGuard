@@ -149,7 +149,7 @@ RGB 이미지
 Thermal 이미지
 Temperature Matrix (.npy)
 ```
-##### ~~*실시간 스트리밍 미사용 이유*
+##### *실시간 스트리밍 미사용 이유*
 - 네트워크 품질 불확실
 - 방화벽 제약
 - 대역폭 제한
@@ -162,54 +162,11 @@ Temperature Matrix (.npy)
 #.npy 파일은 픽셀별 실제 온도 정보를 포함하여 재분석 필요 없음
 temperature[y, x] = 36.4
 ```
-
----
-# ~~5. AI 분석 절차
-## Step 1
-### RGB 영상에서 로봇 검출
-```
-Robot Detection
-```
-출력:
-```
-robot_bbox
-```
-## Step 2
-### Thermal 영역 매핑
-	RGB ROI를 Thermal 좌표계로 변환.
-## Step 3
-### Temperature ROI 추출
-```
-roi = thermal[
-    y1:y2,
-    x1:x2
-]
-```
-## Step 4
-
-### 온도 통계 계산
-
-```
-max_temp
-mean_temp
-95_percentile_temp
-```
-### 권장 지표
-
-```
-temperature = np.percentile(
-    roi,
-    95
-    # 최대 온도가 노이즈로 인한 피크치 일 수 있기에 95 기준으로
-)
-```
-
 ---
 # 5. ROI 분석
 
-	1. 최초 설치
-
 ```
+#1회 진행 필요 
 #1. GUI 대시보드(tools.py)에서 "Set ROI" 버튼 클릭
 # → roi_selector.py (OpenCV GUI) 실행
 # → Thermal 이미지에서 마우스 드래그로 ROI 영역 지정
@@ -249,7 +206,6 @@ hot_temp = np.percentile(
 # 7. 임계값 판단(Threshold)
 
 **이중 경로 판정 (Dual-Path)**
-
 | 경로 | 기준 | 조건 | 목적 |
 |------|------|------|------|
 | 1 — 95th percentile | `95th >= baseline + delta` + cluster ≥ 3px | 넓은 영역이 서서히 과열될 때 감지 | 주 경로 |
@@ -290,8 +246,8 @@ Critical
 #대시 보드에는 열화상 이미지에 과열부위 디택팅 된 이미지
 ┌──────────────────┐
 │      Robot       │
-│        🔴        │
-│      83.5℃       │
+│        🔴       │
+│      83.5℃      │
 │                  │
 │ Status : Warning │
 └──────────────────┘
