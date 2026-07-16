@@ -1,8 +1,10 @@
 /.vscode
 /thermal_dataset
 /thermal_to_rgb.npy
-/__pycache__
+__pycache__/
 /.obsidian
 *.pyc
+*.bak
 .env
 config.json
+/docs
