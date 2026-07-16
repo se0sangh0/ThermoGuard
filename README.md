@@ -55,7 +55,7 @@ project/
 │   │
 │   └── tools/              # 🛠️ 운영 도구
 │       ├── __init__.py
-│       ├── tools.py        # 통합 운영 도구 GUI (ToolApp)
+│       ├── tools.py        # 통합 모니터링 대시보드 GUI (MonitoringDashboard)
 │       ├── roi_selector.py # GUI ROI 영역 설정 도구
 │       └── calibration.py  # Thermal-RGB Homography 캘리브레이션
 │
@@ -121,7 +121,7 @@ python -m thermal_monitoring.tools.calibration
 # 7a. 실시간 감시 시퀀서 실행 (캡처 + 분석 + 알림 통합)
 python monitor.py
 
-# 7b. (또는) GUI 통합 운영 도구
+# 7b. (또는) GUI 통합 모니터링 대시보드
 python tools.py
 
 # 7c. (또는) 기존 데이터셋 배치 분석
@@ -192,7 +192,7 @@ python -m tests.test_overlay
 | 모듈 | 설명 |
 |------|------|
 | `config.py` | **통합 설정 모듈** — 모든 설정의 단일 진실 공급원, config.json 읽기/쓰기, 구버전 파일 자동 이관 |
-| `tools.py` | 통합 운영 GUI — Capture(Start/Stop), Dataset Check, Metadata Generation 버튼, 실시간 로그 |
+| `tools.py` | 통합 모니터링 대시보드 GUI — 환경 설정(카메라 IP, 연결 상태, 디렉토리, 저장 주기), 실시간 감지 화면(Thermal/Visual 오버레이 이미지 + 핫스팟 마커), 로그 테이블(감지 시간/위치/온도/경고/알림), ROI 설정·캘리브레이션 연동 |
 | `capture.py` | FLIR A50에서 Thermal + RGB 이미지 수집 (`CaptureSession` 클래스, GUI/스크립트 겸용) |
 | `thermal_utils.py` | Radiometric JPEG에서 exiftool로 Raw Thermal 추출, Planck 변환으로 실제 °C 환산 |
 | `checking.py` | 데이터셋 무결성 검사 — NPY 누락 시 JPG에서 복구, 고아 NPY 정리 (`run_check()` 함수) |
@@ -204,7 +204,7 @@ python -m tests.test_overlay
 
 | 모듈 | 설명 |
 |------|------|
-| `monitor.py` | **실시간 감시 시퀀서** — 백그라운드 캡처 + 신규 이미지 자동 분석 + 무결성 검사 + 메타데이터 + 알림 |
+| `monitor.py` | **실시간 감시 시퀀서 (CLI)** — 백그라운드 캡처 + 신규 이미지 자동 분석 + 무결성 검사 + 메타데이터 + 알림 |
 | `roi.py` | `.npy`에서 ROI 영역 온도 통계(max, mean, 95th) 추출 + connected components 클러스터 분석 + **모든 핫스팟 중심좌표 추출** |
 | `threshold.py` | 이중 경로 상태 판정 (95th percentile + max 온도) + 클러스터 크기 기반 노이즈 필터링, 상태 변화 시 알림 쿨다운 |
 | `overlay.py` | Thermal/RGB 이미지에 ROI 박스 + 온도 정보 + **모든 핫스팟 마커** 표시, Homography 기반 좌표 변환 |
@@ -253,7 +253,7 @@ python -m tests.test_overlay
 | Telegram 알림 | ✅ | `notifier.py` — 이미지+캡션 전송, `.env` 토큰 관리 |
 | Overlay 시각화 | ✅ | `overlay.py` — Thermal/RGB 이미지에 온도 정보 + 핫스팟 마커 표시, Homography 좌표 변환 |
 | 통합 파이프라인 | ✅ | `pipeline.py` — ROI → Threshold → Overlay → 알림 |
-| 통합 운영 GUI | ✅ | `tools.py` — Capture, Check, Metadata 한 화면에서 실행 |
+| 통합 모니터링 GUI | ✅ | `tools.py` — 환경 설정 + 실시간 감지 화면 + 로그 테이블, ROI 설정·캘리브레이션 연동 |
 | 이력 관리 | ⬜ | 온도 트렌드 DB 저장 — DB 설계 완료 후 진행 |
 | 웹 대시보드 | ⬜ | 실시간 상태/트렌드/알림 표시 — 동료 작업 대기 |
 | 실시간 모니터링 | ⬜ | DB + 대시보드 연동 후 `pipeline.py` 실시간 전환 |
