@@ -32,8 +32,9 @@ class CheckResult:
         self.messages: list[str] = []
 
 
-def _scan():
-    files = os.listdir(SAVE_DIR)
+# GUI-UPDATE: Browse로 선택한 Dataset을 검사하도록 전역 SAVE_DIR 의존을 제거했다.
+def _scan(save_dir: str):
+    files = os.listdir(save_dir)
     jpgs = {f.replace(".jpg", ""): f
             for f in files if f.endswith(".jpg") and "_visual" not in f}
     npys = {f.replace("_thermal.npy", ""): f
@@ -60,7 +61,7 @@ def run_check(
         _log(f"'{save_dir}' folder not found.", log_callback, result.messages)
         return result
 
-    jpg_bases, npy_bases = _scan()
+    jpg_bases, npy_bases = _scan(save_dir)
     paired = set(jpg_bases.keys()) & set(npy_bases.keys())
     missing = set(jpg_bases.keys()) - set(npy_bases.keys())
     orphan = set(npy_bases.keys()) - set(jpg_bases.keys())
@@ -101,6 +102,10 @@ def run_check(
             os.remove(npy_path)
             _log(f"  REMOVED {npy_path}", log_callback, result.messages)
             result.removed += 1
+
+    # GUI-UPDATE: 결과 요약은 복구·삭제가 반영된 최종 파일 상태로 표시한다.
+    result.total_npy += result.fixed - result.removed
+    result.paired += result.fixed
 
     _log(f"\nDone. Fixed: {result.fixed}, Failed: {result.failed}, "
          f"Removed: {result.removed}", log_callback, result.messages)

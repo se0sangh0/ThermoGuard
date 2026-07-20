@@ -70,6 +70,8 @@ def _prepare_canvas(
         scale은 원본 좌표 -> 표시용 좌표 변환 비율 (thermal 이미지는 640x480 그대로 사용)
     """
     tx1, ty1, tx2, ty2 = roi_bounds
+    # GUI-UPDATE: RGB 파일이 없는 thermal-only 모드의 fallback을 위해 선초기화한다.
+    canvas = None
 
     if homography is not None and os.path.isfile(visual_jpg_path):
         canvas = cv2.imread(visual_jpg_path)
@@ -235,6 +237,11 @@ def create_overlay(
     """
     if homography is None:
         homography = _load_homography()
+    # GUI-UPDATE: Visual 파일이 없으면 Homography를 적용하지 않고 Thermal에 표시한다.
+    if homography is not None and (
+        not visual_jpg_path or not os.path.isfile(visual_jpg_path)
+    ):
+        homography = None
 
     canvas, canvas_roi, sx, sy = _prepare_canvas(
         thermal_jpg_path, visual_jpg_path, roi_bounds, homography

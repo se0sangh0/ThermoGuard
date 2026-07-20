@@ -41,9 +41,10 @@ class CaptureSession:
         self.log_callback = log_callback  # callable(str) for GUI output
         self._running = False
         self._thread = None
+        # GUI-UPDATE: cam_ip 인자가 None이어도 config에서 확정된 self.cam_ip를 사용한다.
         self._urls = {
-            "thermal": f"http://{cam_ip}/api/image/current?imgformat=JPEG",
-            "visual": f"http://{cam_ip}/api/image/current?imgformat=JPEG_visual",
+            "thermal": f"http://{self.cam_ip}/api/image/current?imgformat=JPEG",
+            "visual": f"http://{self.cam_ip}/api/image/current?imgformat=JPEG_visual",
         }
 
     def _log(self, msg: str):
@@ -102,11 +103,13 @@ class CaptureSession:
             except Exception as e:
                 self._log(f"[capture] Error: {e}")
 
-            # interval 동안 대기 (stop 체크를 위해 1초씩 분할)
-            for _ in range(int(self.interval)):
-                if not self._running:
+            # GUI-UPDATE: 소수점 촬영 주기를 보존하면서 stop 요청에도 빠르게 반응한다.
+            deadline = time.monotonic() + self.interval
+            while self._running:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-                time.sleep(1)
+                time.sleep(min(0.2, remaining))
 
 
 # ------------------------------------------------------------

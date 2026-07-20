@@ -184,7 +184,10 @@ def run_calibration(thermal_path=None, rgb_path=None):
         if H is None:
             print("Homography 계산 실패 (점들이 동일선상에 있을 수 있습니다).")
         else:
-            np.save("thermal_to_rgb.npy", H)
+            # GUI-UPDATE: 실행 위치가 아니라 config.json의 저장 경로를 따른다.
+            output_path = cfg.paths.homography_path
+            np.save(output_path, H)
+            print(f"Homography saved: {output_path}")
             print("Homography matrix:")
             print(H)
             projected = cv2.perspectiveTransform(thermal_arr.reshape(-1, 1, 2), H)

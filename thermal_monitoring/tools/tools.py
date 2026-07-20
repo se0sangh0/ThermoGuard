@@ -6,11 +6,19 @@ tools.py - 통합 모니터링 대시보드 GUI
 
 사용법:
     python tools.py
+
+[GUI-UPDATE 변경 요약]
+    - 계획서 기능: Mode, Check Dataset, Generate Metadata 추가
+    - System Status: Not Ready / Ready / Monitoring / Error 추가
+    - ExifTool 경로 선택과 비동기 카메라 연결 검사 추가
+    - Detection Log / Activity Log 분리 및 백그라운드 로그 연동
+    - thermal-only 수집·분석과 사용자 오류 피드백 보완
 """
 
 import os
 import sys
 import glob
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -25,6 +33,9 @@ import requests
 
 from ..config import load_config, save_config
 from ..capture.capture import CaptureSession
+# GUI-UPDATE: 계획서의 데이터 검사·메타데이터 기능을 버튼에서 호출한다.
+from ..data.checking import run_check, CheckResult
+from ..data.metadata import run_metadata, MetadataResult
 from ..analysis.roi import load_roi_config, extract_roi_from_npy, RoiResult
 from ..analysis.threshold import (
     Status, MonitorState, evaluate_with_state,
@@ -66,8 +77,13 @@ class MonitoringDashboard:
 
         self._processed_bases: set = set()
         self._camera_connected = False
+        # GUI-UPDATE: 장시간 작업의 중복 실행을 막는 상태 플래그.
+        self._connection_check_running = False
+        self._system_ready = False
         self._roi_running = False
         self._calib_running = False
+        self._check_running = False
+        self._metadata_running = False
         self._photo_ref: Optional[ImageTk.PhotoImage] = None
 
         self._build_ui()
@@ -104,10 +120,16 @@ class MonitoringDashboard:
         view_frame.pack(fill="x", padx=5, pady=(5, 10))
 
         self._view_var = tk.StringVar(value="thermal")
-        ttk.Radiobutton(view_frame, text="Thermal", variable=self._view_var,
-                        value="thermal", command=self._on_view_changed).pack(anchor="w")
-        ttk.Radiobutton(view_frame, text="Visual", variable=self._view_var,
-                        value="visual", command=self._on_view_changed).pack(anchor="w")
+        self._thermal_radio = ttk.Radiobutton(
+            view_frame, text="Thermal", variable=self._view_var,
+            value="thermal", command=self._on_view_changed,
+        )
+        self._thermal_radio.pack(anchor="w")
+        self._visual_radio = ttk.Radiobutton(
+            view_frame, text="Visual", variable=self._view_var,
+            value="visual", command=self._on_view_changed,
+        )
+        self._visual_radio.pack(anchor="w")
 
         # Detection info
         info_frame = ttk.LabelFrame(ctrl_frame, text="Detection Info", padding=8)
@@ -133,6 +155,15 @@ class MonitoringDashboard:
         tool_frame = ttk.LabelFrame(ctrl_frame, text="Tools", padding=8)
         tool_frame.pack(fill="x", padx=5)
 
+        # GUI-UPDATE: 계획서에 명시된 데이터 운영 버튼 2종.
+        self._check_btn = ttk.Button(tool_frame, text="Check Dataset",
+                                     command=self._run_dataset_check)
+        self._check_btn.pack(fill="x", pady=(0, 6))
+
+        self._metadata_btn = ttk.Button(tool_frame, text="Generate Metadata",
+                                        command=self._run_metadata_generation)
+        self._metadata_btn.pack(fill="x", pady=(0, 10))
+
         self._roi_btn = ttk.Button(tool_frame, text="Set ROI",
                                    command=self._launch_roi_selector)
         self._roi_btn.pack(fill="x", pady=(0, 6))
@@ -153,10 +184,17 @@ class MonitoringDashboard:
         self._cam_ip_var = tk.StringVar(value=self._config.camera.ip)
         cam_ip_entry = ttk.Entry(env_frame, textvariable=self._cam_ip_var, width=18)
         cam_ip_entry.grid(row=0, column=1, sticky="w")
+        cam_ip_entry.bind("<Return>", lambda _event: self._check_camera_connection())
 
         self._cam_status_label = ttk.Label(env_frame, text="○ Disconnected",
                                            foreground="#888888")
         self._cam_status_label.grid(row=0, column=2, sticky="w", padx=(10, 0))
+
+        self._connection_btn = ttk.Button(
+            env_frame, text="Check Connection",
+            command=self._check_camera_connection,
+        )
+        self._connection_btn.grid(row=0, column=3, sticky="w", padx=(10, 0))
 
         # Row 1: Dataset dir + Browse
         ttk.Label(env_frame, text="Dataset:").grid(row=1, column=0, sticky="w",
@@ -168,19 +206,64 @@ class MonitoringDashboard:
         browse_btn = ttk.Button(env_frame, text="Browse...", command=self._change_dataset_dir)
         browse_btn.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(6, 0))
 
-        # Row 2: Interval + Start/Stop
+        # GUI-UPDATE: 발표자료 입력 설정과 맞추기 위해 Mode를 추가했다.
+        # Row 2: Interval + Mode + Start/Stop
         ttk.Label(env_frame, text="Interval (s):").grid(row=2, column=0, sticky="w",
                                                          padx=(0, 5), pady=(6, 0))
         self._interval_var = tk.StringVar(value=str(self._config.camera.capture_interval_sec))
         interval_entry = ttk.Entry(env_frame, textvariable=self._interval_var, width=6)
         interval_entry.grid(row=2, column=1, sticky="w", pady=(6, 0))
 
+        ttk.Label(env_frame, text="Mode:").grid(
+            row=2, column=2, sticky="e", padx=(10, 5), pady=(6, 0))
+        self._mode_var = tk.StringVar(value=self._config.tools.mode)
+        self._mode_combo = ttk.Combobox(
+            env_frame, textvariable=self._mode_var,
+            values=("both", "thermal"), state="readonly", width=9,
+        )
+        self._mode_combo.grid(row=2, column=3, sticky="w", pady=(6, 0))
+
         self._monitor_btn = ttk.Button(env_frame, text="Start Monitoring",
                                        command=self._toggle_monitoring)
-        self._monitor_btn.grid(row=2, column=2, sticky="w", padx=(10, 0), pady=(6, 0))
+        self._monitor_btn.grid(row=2, column=4, sticky="w", padx=(10, 0), pady=(6, 0))
 
-        # Row 3: Status bar
-        self._status_bar_var = tk.StringVar(value="Ready")
+        # GUI-UPDATE: NPY 복구에 필요한 ExifTool을 GUI에서 직접 지정한다.
+        # Row 3: ExifTool path
+        ttk.Label(env_frame, text="ExifTool:").grid(
+            row=3, column=0, sticky="w", padx=(0, 5), pady=(6, 0))
+        self._exiftool_var = tk.StringVar(
+            value=self._config.tools.exiftool_path or "Auto-detect from PATH")
+        exiftool_entry = ttk.Entry(
+            env_frame, textvariable=self._exiftool_var,
+            width=40, state="readonly",
+        )
+        exiftool_entry.grid(
+            row=3, column=1, columnspan=2, sticky="we", pady=(6, 0))
+        ttk.Button(
+            env_frame, text="Browse...", command=self._change_exiftool_path,
+        ).grid(row=3, column=3, sticky="w", padx=(10, 0), pady=(6, 0))
+
+        # GUI-UPDATE: 시스템 준비 상태와 준비되지 않은 이유를 분리 표시한다.
+        # Row 4: System readiness
+        ttk.Label(env_frame, text="System Status:").grid(
+            row=4, column=0, sticky="w", padx=(0, 5), pady=(8, 0))
+        self._system_status_label = ttk.Label(
+            env_frame, text="● Not Ready", foreground="#888888",
+            font=("", 10, "bold"),
+        )
+        self._system_status_label.grid(
+            row=4, column=1, sticky="w", pady=(8, 0))
+
+        self._readiness_reason_var = tk.StringVar(value="Checking system requirements...")
+        self._readiness_reason_label = ttk.Label(
+            env_frame, textvariable=self._readiness_reason_var,
+            foreground="#666666",
+        )
+        self._readiness_reason_label.grid(
+            row=4, column=2, columnspan=3, sticky="w", padx=(10, 0), pady=(8, 0))
+
+        # Status bar
+        self._status_bar_var = tk.StringVar(value="Checking system readiness...")
         status_bar = ttk.Label(self.root, textvariable=self._status_bar_var,
                                relief="sunken", anchor="w", padding=3)
         status_bar.pack(fill="x", padx=10, pady=(0, 5))
@@ -189,8 +272,18 @@ class MonitoringDashboard:
         log_frame = ttk.LabelFrame(self.root, text="로그 화면", padding=5)
         log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
+        # GUI-UPDATE: 감지 결과와 운영·오류 로그가 섞이지 않도록 탭을 분리한다.
+        notebook = ttk.Notebook(log_frame)
+        notebook.pack(fill="both", expand=True)
+
+        detection_tab = ttk.Frame(notebook)
+        activity_tab = ttk.Frame(notebook)
+        notebook.add(detection_tab, text="Detection Log")
+        notebook.add(activity_tab, text="Activity Log")
+
         columns = ("time", "location", "temperature", "alert", "notified")
-        self._log_tree = ttk.Treeview(log_frame, columns=columns, show="headings", height=12)
+        self._log_tree = ttk.Treeview(
+            detection_tab, columns=columns, show="headings", height=12)
 
         self._log_tree.heading("time", text="Detection Time")
         self._log_tree.heading("location", text="Location")
@@ -209,32 +302,145 @@ class MonitoringDashboard:
         self._log_tree.tag_configure("Warning", foreground="#ff8800")
         self._log_tree.tag_configure("Normal", foreground="#888888")
 
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical",
+        scrollbar = ttk.Scrollbar(detection_tab, orient="vertical",
                                   command=self._log_tree.yview)
         self._log_tree.configure(yscrollcommand=scrollbar.set)
 
         self._log_tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        self._activity_text = tk.Text(
+            activity_tab, height=12, wrap="word", state="disabled",
+            font=("Consolas", 9), background="#111111", foreground="#dddddd",
+        )
+        activity_scrollbar = ttk.Scrollbar(
+            activity_tab, orient="vertical", command=self._activity_text.yview)
+        self._activity_text.configure(yscrollcommand=activity_scrollbar.set)
+        self._activity_text.pack(side="left", fill="both", expand=True)
+        activity_scrollbar.pack(side="right", fill="y")
+
     # ════════════════════════════════════════════════════════════
     # 환경 설정 메서드
     # ════════════════════════════════════════════════════════════
     def _check_camera_connection(self):
+        # GUI-UPDATE: HTTP timeout 동안 GUI가 멈추지 않도록 별도 스레드에서 검사한다.
         ip = self._cam_ip_var.get().strip()
+        if self._connection_check_running:
+            return
         if not ip:
-            self._camera_connected = False
-        else:
+            self._finish_camera_connection_check(False)
+            return
+
+        self._connection_check_running = True
+        self._cam_status_label.configure(text="◌ Checking...", foreground="#666666")
+        self._connection_btn.configure(state="disabled")
+
+        def _run_check():
+            connected = False
             try:
                 r = requests.get(f"http://{ip}/api/image/current?imgformat=JPEG",
                                  timeout=5)
-                self._camera_connected = r.status_code == 200
+                connected = r.status_code == 200
             except Exception:
-                self._camera_connected = False
+                connected = False
+            self.root.after(
+                0, lambda: self._finish_camera_connection_check(connected))
 
+        threading.Thread(target=_run_check, daemon=True).start()
+
+    def _finish_camera_connection_check(self, connected: bool):
+        self._connection_check_running = False
+        self._camera_connected = connected
+        self._connection_btn.configure(state="normal")
         if self._camera_connected:
             self._cam_status_label.configure(text="● Connected", foreground="#00aa00")
         else:
             self._cam_status_label.configure(text="○ Disconnected", foreground="#888888")
+        self._append_activity_log(
+            f"Camera {self._cam_ip_var.get().strip()}: "
+            f"{'connected' if connected else 'disconnected'}")
+        self._refresh_readiness()
+
+    def _dataset_is_ready(self) -> bool:
+        # GUI-UPDATE: Dataset이 실제로 생성·기록 가능한지 Ready 조건으로 확인한다.
+        dataset_dir = self._config.paths.dataset_dir
+        if not dataset_dir:
+            return False
+        try:
+            os.makedirs(dataset_dir, exist_ok=True)
+            return os.path.isdir(dataset_dir) and os.access(dataset_dir, os.W_OK)
+        except OSError:
+            return False
+
+    def _exiftool_is_available(self) -> bool:
+        # GUI-UPDATE: 설정 경로 → PATH → 번들 실행 파일 순서로 확인한다.
+        configured = self._config.tools.exiftool_path.strip()
+        if configured:
+            return os.path.isfile(configured)
+
+        if shutil.which("exiftool"):
+            return True
+
+        try:
+            from ..capture.thermal_utils import EXIFTOOL
+            return os.path.isabs(EXIFTOOL) and os.path.isfile(EXIFTOOL)
+        except Exception:
+            return False
+
+    def _roi_is_valid(self) -> bool:
+        roi = self._config.roi
+        values = (roi.x1, roi.y1, roi.x2, roi.y2)
+        return None not in values and roi.x1 < roi.x2 and roi.y1 < roi.y2
+
+    def _has_calibration_pair(self) -> bool:
+        dataset_dir = self._config.paths.dataset_dir
+        if not os.path.isdir(dataset_dir):
+            return False
+        for thermal_jpg in glob.glob(os.path.join(dataset_dir, "*.jpg")):
+            if "_visual" in os.path.basename(thermal_jpg):
+                continue
+            visual_jpg = thermal_jpg.replace(".jpg", "_visual.jpg")
+            if os.path.isfile(visual_jpg):
+                return True
+        return False
+
+    def _refresh_readiness(self) -> bool:
+        # GUI-UPDATE: 운영 준비 조건을 한 곳에서 판정하고 상태 문구를 갱신한다.
+        reasons = []
+        if not self._camera_connected:
+            reasons.append("Camera disconnected")
+        if not self._dataset_is_ready():
+            reasons.append("Dataset unavailable")
+        if not self._exiftool_is_available():
+            reasons.append("ExifTool not found")
+        if not self._roi_is_valid():
+            reasons.append("ROI not configured")
+
+        self._system_ready = not reasons
+
+        if self._running and self._system_ready:
+            self._system_status_label.configure(
+                text="● Monitoring", foreground="#0066cc")
+            self._readiness_reason_var.set("Capture and analysis are running")
+            self._monitor_btn.configure(state="normal")
+        elif self._running:
+            self._system_status_label.configure(text="● Error", foreground="#cc0000")
+            self._readiness_reason_var.set(" / ".join(reasons))
+            self._monitor_btn.configure(state="normal")
+        elif self._system_ready:
+            self._system_status_label.configure(text="● Ready", foreground="#00aa00")
+            self._readiness_reason_var.set("All required checks passed")
+            self._monitor_btn.configure(state="normal")
+            if self._status_bar_var.get() == "Checking system readiness...":
+                self._status_bar_var.set("System ready.")
+        else:
+            self._system_status_label.configure(text="● Not Ready", foreground="#888888")
+            self._readiness_reason_var.set(" / ".join(reasons))
+            self._monitor_btn.configure(state="normal")
+            if self._status_bar_var.get() == "Checking system readiness...":
+                self._status_bar_var.set(f"Not ready: {' / '.join(reasons)}")
+
+        return self._system_ready
 
     def _change_dataset_dir(self):
         new_dir = filedialog.askdirectory(
@@ -249,9 +455,137 @@ class MonitoringDashboard:
             self._processed_bases.clear()
             self._prime_processed_cache()
             self._log_to_status(f"Dataset directory changed: {new_dir}")
+            self._refresh_readiness()
+
+    def _change_exiftool_path(self):
+        # GUI-UPDATE: 선택 경로를 config.json에 저장해 다음 실행에도 재사용한다.
+        new_path = filedialog.askopenfilename(
+            title="Select ExifTool executable",
+            filetypes=(
+                ("Executable", "*.exe" if sys.platform == "win32" else "*"),
+                ("All files", "*.*"),
+            ),
+        )
+        if not new_path:
+            return
+        self._config.tools.exiftool_path = new_path
+        save_config(self._config)
+        self._exiftool_var.set(new_path)
+        self._append_activity_log(f"ExifTool path changed: {new_path}")
+        self._log_to_status("ExifTool path saved.")
+        self._refresh_readiness()
 
     def _log_to_status(self, msg: str):
         self.root.after(0, lambda: self._status_bar_var.set(msg))
+
+    def _append_activity_log(self, msg: str):
+        """GUI-UPDATE: 백그라운드 작업 로그를 tkinter 메인 스레드에서 표시."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {msg.rstrip()}\n"
+
+        def _insert():
+            if not self.root.winfo_exists():
+                return
+            self._activity_text.configure(state="normal")
+            self._activity_text.insert("end", line)
+            line_count = int(self._activity_text.index("end-1c").split(".")[0])
+            if line_count > 1000:
+                self._activity_text.delete("1.0", f"{line_count - 1000}.0")
+            self._activity_text.configure(state="disabled")
+            self._activity_text.see("end")
+
+        self.root.after(0, _insert)
+
+    def _run_dataset_check(self):
+        # GUI-UPDATE: 무결성 검사는 파일 작업이므로 GUI 밖의 스레드에서 수행한다.
+        if self._check_running:
+            self._log_to_status("Dataset check is already running.")
+            return
+
+        self._check_running = True
+        self._check_btn.configure(state="disabled")
+        self._log_to_status("Checking dataset integrity...")
+        self._append_activity_log("=== Dataset check started ===")
+        save_dir = self._config.paths.dataset_dir
+
+        def _run():
+            try:
+                result = run_check(
+                    save_dir=save_dir,
+                    log_callback=self._append_activity_log,
+                )
+                self.root.after(0, lambda: self._finish_dataset_check(result, None))
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc: self._finish_dataset_check(None, exc))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _finish_dataset_check(
+        self,
+        result: Optional[CheckResult],
+        error: Optional[Exception],
+    ):
+        self._check_running = False
+        self._check_btn.configure(state="normal")
+        if error is not None:
+            message = f"Dataset check failed: {error}"
+            self._append_activity_log(message)
+            self._log_to_status(message)
+            return
+
+        message = (
+            f"Dataset check complete — JPG {result.total_jpg}, "
+            f"NPY {result.total_npy}, Pairs {result.paired}, "
+            f"Fixed {result.fixed}, Failed {result.failed}, "
+            f"Removed {result.removed}"
+        )
+        self._append_activity_log(message)
+        self._log_to_status(message)
+
+    def _run_metadata_generation(self):
+        # GUI-UPDATE: metadata.csv 생성 중에도 영상·버튼 이벤트를 유지한다.
+        if self._metadata_running:
+            self._log_to_status("Metadata generation is already running.")
+            return
+
+        self._metadata_running = True
+        self._metadata_btn.configure(state="disabled")
+        self._log_to_status("Generating metadata.csv...")
+        self._append_activity_log("=== Metadata generation started ===")
+        save_dir = self._config.paths.dataset_dir
+
+        def _run():
+            try:
+                result = run_metadata(
+                    save_dir=save_dir,
+                    log_callback=self._append_activity_log,
+                )
+                self.root.after(0, lambda: self._finish_metadata_generation(result, None))
+            except Exception as exc:
+                self.root.after(
+                    0, lambda exc=exc: self._finish_metadata_generation(None, exc))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _finish_metadata_generation(
+        self,
+        result: Optional[MetadataResult],
+        error: Optional[Exception],
+    ):
+        self._metadata_running = False
+        self._metadata_btn.configure(state="normal")
+        if error is not None:
+            message = f"Metadata generation failed: {error}"
+            self._append_activity_log(message)
+            self._log_to_status(message)
+            return
+
+        message = (
+            f"Metadata complete — Pairs {result.total_pairs}, "
+            f"Existing {result.existing}, Added {result.new}"
+        )
+        self._append_activity_log(message)
+        self._log_to_status(message)
 
     # ════════════════════════════════════════════════════════════
     # 모니터링 시작/중지
@@ -263,7 +597,17 @@ class MonitoringDashboard:
             self._start_monitoring()
 
     def _start_monitoring(self):
+        # GUI-UPDATE: Ready 검사 후 화면에서 선택한 Mode를 캡처 세션에 전달한다.
+        if not self._refresh_readiness():
+            self._log_to_status(
+                f"Not ready: {self._readiness_reason_var.get()}")
+            return
+
         cam_ip = self._cam_ip_var.get().strip()
+        mode = self._mode_var.get().strip()
+        if mode not in ("both", "thermal"):
+            self._log_to_status("Invalid capture mode.")
+            return
         try:
             interval = float(self._interval_var.get())
             if interval <= 0:
@@ -274,6 +618,7 @@ class MonitoringDashboard:
 
         self._config.camera.ip = cam_ip
         self._config.camera.capture_interval_sec = interval
+        self._config.tools.mode = mode
         save_config(self._config)
 
         self._monitor_state = MonitorState()
@@ -284,15 +629,20 @@ class MonitoringDashboard:
 
         self._capture_session = CaptureSession(
             cam_ip=cam_ip,
-            mode="both",
+            mode=mode,
             interval=interval,
             save_dir=self._config.paths.dataset_dir,
-            log_callback=None,
+            # GUI-UPDATE: 캡처 성공·실패를 콘솔 대신 Activity Log에도 표시한다.
+            log_callback=self._append_activity_log,
         )
         self._capture_session.start()
 
         self._monitor_btn.configure(text="Stop Monitoring")
-        self._log_to_status(f"Monitoring started — {cam_ip}, interval={interval}s")
+        self._log_to_status(
+            f"Monitoring started — {cam_ip}, mode={mode}, interval={interval}s")
+        self._append_activity_log(
+            f"Monitoring started: camera={cam_ip}, mode={mode}, interval={interval}s")
+        self._refresh_readiness()
         self._monitoring_tick()
 
     def _stop_monitoring(self):
@@ -305,6 +655,8 @@ class MonitoringDashboard:
             self._capture_session = None
         self._monitor_btn.configure(text="Start Monitoring")
         self._log_to_status("Monitoring stopped.")
+        self._append_activity_log("Monitoring stopped")
+        self._refresh_readiness()
 
     # ════════════════════════════════════════════════════════════
     # 모니터링 루프 (root.after)
@@ -322,6 +674,7 @@ class MonitoringDashboard:
                 self._mark_processed(pair["base"])
 
             self._refresh_display()
+            self._refresh_readiness()
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -346,6 +699,9 @@ class MonitoringDashboard:
                         if f.endswith(".jpg") and "_visual" not in f}
         visual_jpgs = {f.replace("_visual.jpg", ""): f for f in files
                        if f.endswith("_visual.jpg")}
+        # GUI-UPDATE: thermal 모드는 RGB 파일 없이 Thermal JPG만으로 처리한다.
+        if self._mode_var.get() == "thermal":
+            return set(thermal_jpgs.keys())
         return set(thermal_jpgs.keys()) & set(visual_jpgs.keys())
 
     def _prime_processed_cache(self):
@@ -368,7 +724,10 @@ class MonitoringDashboard:
         visual_jpgs = {f.replace("_visual.jpg", ""): f for f in files
                        if f.endswith("_visual.jpg")}
 
-        bases = sorted(set(thermal_jpgs.keys()) & set(visual_jpgs.keys()))
+        if self._mode_var.get() == "thermal":
+            bases = sorted(thermal_jpgs.keys())
+        else:
+            bases = sorted(set(thermal_jpgs.keys()) & set(visual_jpgs.keys()))
         new_pairs = []
         for base in bases:
             if base in self._processed_bases:
@@ -380,12 +739,17 @@ class MonitoringDashboard:
                     jpg_path = os.path.join(dataset_dir, thermal_jpgs[base])
                     thermal, _ = extract_from_jpeg(jpg_path)
                     np.save(npy_path, thermal)
-                except Exception:
+                except Exception as exc:
+                    # GUI-UPDATE: 이전에는 조용히 무시하던 변환 실패를 화면에 노출한다.
+                    self._append_activity_log(
+                        f"NPY extraction failed for {base}: {exc}")
                     continue
+            visual_name = visual_jpgs.get(base)
             new_pairs.append({
                 "base": base,
                 "thermal_jpg": os.path.join(dataset_dir, thermal_jpgs[base]),
-                "visual_jpg": os.path.join(dataset_dir, visual_jpgs[base]),
+                "visual_jpg": (
+                    os.path.join(dataset_dir, visual_name) if visual_name else ""),
                 "npy": npy_path,
             })
         return new_pairs
@@ -432,7 +796,9 @@ class MonitoringDashboard:
             )
 
             self._current_overlay = overlay
-            self._current_visual_overlay = cv2.imread(pair["visual_jpg"])
+            # GUI-UPDATE: thermal-only 모드에서는 Visual 화면이 없어도 정상 처리한다.
+            self._current_visual_overlay = (
+                cv2.imread(pair["visual_jpg"]) if pair["visual_jpg"] else None)
             if self._current_visual_overlay is not None:
                 self._current_visual_overlay = cv2.resize(
                     self._current_visual_overlay, (overlay.shape[1], overlay.shape[0]))
@@ -471,6 +837,10 @@ class MonitoringDashboard:
         except Exception as e:
             import traceback
             traceback.print_exc()
+            # GUI-UPDATE: 분석 실패 원인을 터미널뿐 아니라 GUI에서도 확인한다.
+            self._append_activity_log(
+                f"Analysis failed for {pair.get('base', 'unknown')}: {e}")
+            self._log_to_status(f"Analysis error: {e}")
 
     # ════════════════════════════════════════════════════════════
     # 알림
@@ -492,8 +862,10 @@ class MonitoringDashboard:
                 self._monitor_state.last_alarm_time = time.time()
             return success
         except RuntimeError:
+            self._append_activity_log("Telegram skipped: not configured")
             return False
-        except Exception:
+        except Exception as exc:
+            self._append_activity_log(f"Telegram error: {exc}")
             return False
 
     # ════════════════════════════════════════════════════════════
@@ -522,6 +894,7 @@ class MonitoringDashboard:
                 text=f"95th: {self._current_roi_result.hot_temp_95:.1f} °C")
             self._hotspot_label.configure(
                 text=f"Hotspots: {len(self._current_roi_result.hotspot_centroids)}")
+        self._refresh_readiness()
 
     def _on_view_changed(self):
         self._current_view = self._view_var.get()
@@ -650,7 +1023,11 @@ class MonitoringDashboard:
         self._cam_ip_var.set(self._config.camera.ip)
         self._dir_var.set(self._config.paths.dataset_dir)
         self._interval_var.set(str(self._config.camera.capture_interval_sec))
+        self._mode_var.set(self._config.tools.mode)
+        self._exiftool_var.set(
+            self._config.tools.exiftool_path or "Auto-detect from PATH")
         self._check_camera_connection()
+        self._refresh_readiness()
 
     # ════════════════════════════════════════════════════════════
     # 종료 처리

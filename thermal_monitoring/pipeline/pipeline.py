@@ -139,12 +139,17 @@ def run_pipeline():
 
         # 4. 알림 전송
         if do_alarm:
-            send_telegram(
-                image_path=overlay_path or pair["thermal_jpg"],
-                temp=result.hot_temp_95,
-                status=new_status.value,
-            )
-            state.last_alarm_time = time.time()
+            try:
+                send_telegram(
+                    image_path=overlay_path or pair["thermal_jpg"],
+                    temp=result.hot_temp_95,
+                    status=new_status.value,
+                )
+                state.last_alarm_time = time.time()
+            except RuntimeError:
+                print("  ▲ Alarm skipped (Telegram not configured)")
+            except Exception as e:
+                print(f"  ▲ Alarm error: {e}")
 
     # 요약
     print()

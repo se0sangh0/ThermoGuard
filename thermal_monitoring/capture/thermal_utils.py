@@ -79,7 +79,8 @@ def extract_from_jpeg(jpg_path, exiftool=None):
         meta keys: timestamp, distance_cm, ambient_temp
     """
     if exiftool is None:
-        exiftool = EXIFTOOL
+        # GUI-UPDATE: GUI에서 경로를 변경한 경우를 반영하도록 호출 시점에 다시 확인한다.
+        exiftool = _get_default_exiftool()
 
     meta_args = [
         exiftool, "-j",
