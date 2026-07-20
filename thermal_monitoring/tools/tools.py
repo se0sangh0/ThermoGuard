@@ -943,28 +943,27 @@ class MonitoringDashboard:
     def _launch_roi_selector(self):
         if self._roi_running:
             return
+        img_path = self._find_latest_thermal_jpg()
+        if not img_path:
+            self._log_to_status("No thermal image found for ROI selection.")
+            return
         self._roi_running = True
         self._log_to_status("Launching ROI Selector...")
 
-        def _run():
+        def _open():
+            old_argv = sys.argv
+            sys.argv = ["roi_selector", img_path]
             try:
-                img_path = self._find_latest_thermal_jpg()
-                if not img_path:
-                    self._log_to_status("No thermal image found for ROI selection.")
-                    return
-                old_argv = sys.argv
-                sys.argv = ["roi_selector", img_path]
-                try:
-                    from ..tools.roi_selector import main as roi_main
-                    roi_main()
-                finally:
-                    sys.argv = old_argv
+                from ..tools.roi_selector import main as roi_main
+                roi_main()
             finally:
+                sys.argv = old_argv
                 self._roi_running = False
                 self._config = load_config(force_reload=True)
                 self.root.after(0, self._update_env_display)
                 self._log_to_status("ROI Selector closed.")
-        threading.Thread(target=_run, daemon=True).start()
+
+        self.root.after(100, _open)
 
     def _pick_calibration_image(self) -> str:
         """가장 hotspot이 많은 thermal 이미지, 없으면 가장 최근 이미지."""
@@ -996,20 +995,20 @@ class MonitoringDashboard:
     def _launch_calibration(self):
         if self._calib_running:
             return
+        thermal_jpg = self._pick_calibration_image()
+        if not thermal_jpg or not os.path.isfile(thermal_jpg):
+            self._log_to_status("No image found for calibration.")
+            return
+        visual_jpg = thermal_jpg.replace(".jpg", "_visual.jpg")
+        if not os.path.isfile(visual_jpg):
+            self._log_to_status(f"Visual image not found: {visual_jpg}")
+            return
+
         self._calib_running = True
         self._log_to_status("Launching Calibration...")
 
-        def _run():
+        def _open():
             try:
-                thermal_jpg = self._pick_calibration_image()
-                if not thermal_jpg or not os.path.isfile(thermal_jpg):
-                    self._log_to_status("No image found for calibration.")
-                    return
-                visual_jpg = thermal_jpg.replace(".jpg", "_visual.jpg")
-                if not os.path.isfile(visual_jpg):
-                    self._log_to_status(f"Visual image not found: {visual_jpg}")
-                    return
-
                 from ..tools.calibration import run_calibration
                 run_calibration(thermal_jpg, visual_jpg)
             finally:
@@ -1017,7 +1016,8 @@ class MonitoringDashboard:
                 self._config = load_config(force_reload=True)
                 self.root.after(0, self._update_env_display)
                 self._log_to_status("Calibration closed.")
-        threading.Thread(target=_run, daemon=True).start()
+
+        self.root.after(100, _open)
 
     def _update_env_display(self):
         self._cam_ip_var.set(self._config.camera.ip)
