@@ -173,44 +173,23 @@ def probe_thermal_from_url(url: str, timeout: float = 10.0) -> float | None:
 
         exiftool = _get_default_exiftool()
 
-        # FLIR 카메라가 사용하는 최고 온도 관련 태그들을 한 번에 모두 조회
-        probe_args = [exiftool, "-j", "-s"]
-        probe_tags = [
-            "Main:MaxValue",
-            "ApparentTemperature",
-            "CameraTemperatureMaximum",
-            "CameraTemperatureRangeMax",
-            "XMP:ApparentTemperature",
-        ]
-        for tag in probe_tags:
-            probe_args.append(f"-{tag}")
-        probe_args.append("-")
-
-        meta_proc = subprocess.run(
-            probe_args,
+        # Raw Thermal을 stdout 파이프로만 추출 (디스크 저장 없음)
+        raw_proc = subprocess.run(
+            [exiftool, "-RawThermalImage", "-b", "-"],
             input=r.content,
             capture_output=True,
             timeout=15,
         )
-        if meta_proc.returncode != 0:
-            _log.warning("probe: exiftool failed (rc=%d)", meta_proc.returncode)
+        if raw_proc.returncode != 0 or not raw_proc.stdout:
+            _log.warning("probe: raw thermal extraction failed (rc=%d, size=%d)",
+                         raw_proc.returncode, len(raw_proc.stdout))
             return None
 
-        try:
-            meta = json.loads(meta_proc.stdout.decode())[0]
-        except (json.JSONDecodeError, IndexError) as e:
-            _log.warning("probe: JSON parse failed: %s", e)
-            return None
-
-        # 수집된 모든 값에서 실온 범위 온도 찾기
-        for key, val in meta.items():
-            if isinstance(val, (int, float, str)) and val != "":
-                temp = extract_float(val)
-                if -100 < temp < 2000:
-                    return temp
-
-        _log.warning("probe: no temperature value found in %d tags", len(meta))
-        return None
+        raw_stream = io.BytesIO(raw_proc.stdout)
+        thermal_img = Image.open(raw_stream)
+        raw_np = np.array(thermal_img, dtype=np.uint16).astype(np.float64)
+        result = float(np.nanmax(raw_np))
+        return result
 
     except Exception as e:
         _log.warning("probe failed: %s", e)
