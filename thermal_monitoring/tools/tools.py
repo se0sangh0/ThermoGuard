@@ -462,7 +462,7 @@ class MonitoringDashboard:
         new_path = filedialog.askopenfilename(
             title="Select ExifTool executable",
             filetypes=(
-                ("Executable", "*.exe"),
+                ("Executable", "*.exe" if sys.platform == "win32" else "*"),
                 ("All files", "*.*"),
             ),
         )

@@ -5,7 +5,7 @@ roi_selector.py - GUI ROI 영역 설정 도구
     python roi_selector.py [thermal_image.jpg]
 
 Thermal 이미지를 띄우고 마우스 드래그로 ROI 영역을 지정합니다.
-선택 완료 후 S 키를 누르면 roi_config.json이 자동 업데이트됩니다.
+선택 완료 후 S 키를 누르면 config.json이 자동 업데이트됩니다.
 
 조작:
     마우스 드래그 : ROI 영역 선택
