@@ -70,6 +70,9 @@ def evaluate_threshold(
 
 
 def should_alarm(new_status: Status, state: MonitorState) -> bool:
+    """Critical 상태 변화일 때만 알림. Warning은 인터벌만 전환."""
+    if new_status != Status.CRITICAL:
+        return False
     if new_status == state.status:
         return False
     now = time.time()

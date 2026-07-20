@@ -210,13 +210,17 @@ class CaptureSession:
                     is_normal = self.interval == self._normal_interval
 
                 if is_normal and self.probe_callback and self._was_connected and probe_backoff <= 0:
+                    _log.debug("probe: running thermal check")
                     temp = probe_thermal_from_url(self._urls["thermal"], timeout=5.0)
-                    if temp is not None and self.probe_callback(temp):
-                        _log.info("Probe detected elevated temp (%.1f°C) — triggering immediate capture", temp)
-                        self._log(f"[capture] Probe: {temp:.1f}°C — immediate capture triggered")
-                        break  # → 즉시 루프 재진입하여 풀캡처
-                    elif temp is None:
-                        probe_backoff = 5  # 실패 시 5초간 프로브 중단
+                    if temp is not None:
+                        _log.debug("probe: max_temp=%.1f°C", temp)
+                        if self.probe_callback(temp):
+                            _log.info("Probe detected elevated temp (%.1f°C) — triggering immediate capture", temp)
+                            self._log(f"[capture] Probe: {temp:.1f}°C — immediate capture triggered")
+                            break
+                    else:
+                        _log.warning("probe failed — backing off 5s")
+                        probe_backoff = 5
 
                 if probe_backoff > 0:
                     probe_backoff -= 1
