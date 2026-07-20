@@ -19,6 +19,7 @@ monitor.py - 실시간 열화상 감시 시퀀서 (Real-time Thermal Monitoring 
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -28,6 +29,7 @@ from ..config import load_config
 from ..capture.capture import CaptureSession
 from ..data.checking import run_check
 from ..data.metadata import run_metadata
+from ..data.cleanup import run_cleanup_if_due
 from ..analysis.roi import load_roi_config, extract_roi_from_npy
 from ..analysis.threshold import (
     Status,
@@ -40,6 +42,7 @@ from ..analysis.notifier import send_alarm
 _cfg = load_config()
 DATASET_DIR = _cfg.paths.dataset_dir
 OVERLAY_DIR = _cfg.paths.overlay_dir
+MAX_PARALLEL_PAIRS = max(2, (os.cpu_count() or 4) // 2)
 
 # 처리 루프가 새 파일을 확인하는 주기 (초)
 PROCESS_INTERVAL = _cfg.monitoring.process_interval_sec
@@ -192,6 +195,20 @@ class MonitorSequencer:
         except Exception as e:
             self._log(f"Metadata update error (recovering): {e}")
 
+    # ── 오래된 데이터 정리 ───────────────────────────────────
+    def _run_cleanup(self):
+        """오래된 데이터셋 정리 (1시간마다 자동 실행)"""
+        try:
+            result = run_cleanup_if_due(
+                save_dir=DATASET_DIR,
+                log_callback=self._log,
+            )
+            if result is not None:
+                self._log(f"Cleanup: {result.removed_pairs} pairs removed, "
+                          f"{result.freed_bytes / (1024 * 1024):.1f} MB freed")
+        except Exception as e:
+            self._log(f"Cleanup error (recovering): {e}")
+
     # ── 단일 쌍 처리 ─────────────────────────────────────────
     def _process_pair(self, pair: dict) -> bool:
         """
@@ -308,6 +325,7 @@ class MonitorSequencer:
 
         integrity_timer = time.time()
         metadata_timer = time.time()
+        cleanup_timer = time.time()
 
         while self._running:
             try:
@@ -323,15 +341,31 @@ class MonitorSequencer:
                     self._run_metadata_update()
                     metadata_timer = now
 
+                # 주기적 오래된 데이터 정리 (1시간마다)
+                if now - cleanup_timer >= 3600:
+                    self._run_cleanup()
+                    cleanup_timer = now
+
                 # 신규 쌍 스캔
                 new_pairs = self._scan_new_pairs()
                 if new_pairs:
                     self._log(f"→ {len(new_pairs)} new pair(s) detected")
-                    for pair in new_pairs:
-                        if not self._running:
-                            break
-                        self._process_pair(pair)
-                        self._mark_processed(pair["base"])
+                    # 다중 쌍을 스레드 풀로 병렬 처리
+                    if len(new_pairs) > 1:
+                        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_PAIRS) as executor:
+                            futures = {
+                                executor.submit(self._process_pair, pair): pair["base"]
+                                for pair in new_pairs
+                            }
+                            for future in as_completed(futures):
+                                base = futures[future]
+                                self._mark_processed(base)
+                    else:
+                        for pair in new_pairs:
+                            if not self._running:
+                                break
+                            self._process_pair(pair)
+                            self._mark_processed(pair["base"])
 
             except Exception as e:
                 self._log(f"Loop error (recovering): {e}")

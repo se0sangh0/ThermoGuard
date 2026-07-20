@@ -38,8 +38,9 @@ project/
 │   │
 │   ├── data/               # 🗄️ 데이터 관리
 │   │   ├── __init__.py
-│   │   ├── checking.py     # 데이터셋 무결성 검사 및 복구
-│   │   └── metadata.py     # CSV 메타데이터 생성/업데이트
+│   │   ├── checking.py     # 데이터셋 무결성 검사 및 복구 (병렬 NPY 추출)
+│   │   ├── metadata.py     # CSV 메타데이터 생성/업데이트
+│   │   └── cleanup.py      # 오래된 데이터셋 정리 (백그라운드 자동/수동)
 │   │
 │   ├── analysis/           # 📊 핵심 분석
 │   │   ├── __init__.py
@@ -50,8 +51,8 @@ project/
 │   │
 │   ├── pipeline/           # 🔄 파이프라인
 │   │   ├── __init__.py
-│   │   ├── monitor.py      # 실시간 감시 시퀀서 (MonitorSequencer)
-│   │   └── pipeline.py     # 배치 분석 파이프라인 (run_pipeline)
+│   │   ├── monitor.py      # 실시간 감시 시퀀서 (MonitorSequencer, 다중 쌍 병렬 처리)
+│   │   └── pipeline.py     # 배치 분석 파이프라인 (run_pipeline, ThreadPoolExecutor 병렬)
 │   │
 │   └── tools/              # 🛠️ 운영 도구
 │       ├── __init__.py
@@ -62,7 +63,8 @@ project/
 ├── tests/                  # 🧪 테스트
 │   ├── __init__.py
 │   ├── test_threshold.py   # Threshold 시뮬레이션 테스트
-│   └── test_overlay.py     # 오버레이 생성 테스트
+│   ├── test_overlay.py     # 오버레이 생성 통합 테스트
+│   └── test_data_workflows.py # 데이터 워크플로우 단위 테스트
 │
 ├── config.json             # 통합 설정 파일 (gitignore, 자동 생성)
 ├── .env.example            # 환경변수 템플릿 (BOT_TOKEN, CHAT_ID)
@@ -84,7 +86,7 @@ from thermal_monitoring import load_config, setup_encoding
 
 # 서브패키지별 API
 from thermal_monitoring.capture import CaptureSession, extract_from_jpeg
-from thermal_monitoring.data import run_check, run_metadata
+from thermal_monitoring.data import run_check, run_metadata, run_cleanup
 from thermal_monitoring.analysis import extract_roi_from_npy, evaluate_threshold, create_overlay, send_alarm
 from thermal_monitoring.pipeline import MonitorSequencer, run_pipeline
 ```
@@ -99,7 +101,7 @@ conda activate test
 pip install -r requirements.txt
 
 #    (리눅스 환경일 경우 exiftool도 별도 설치 필요)
-#    sudo apt install exiftool
+#    sudo apt install exiftool python3-tk libgl1
 
 # 2. 환경변수 설정 (Telegram 알림용)
 cp .env.example .env
@@ -193,11 +195,12 @@ python -m tests.test_overlay
 | 모듈 | 설명 |
 |------|------|
 | `config.py` | **통합 설정 모듈** — 모든 설정의 단일 진실 공급원, config.json 읽기/쓰기, 구버전 파일 자동 이관 |
-| `tools.py` | 통합 모니터링 대시보드 GUI — 환경 설정(카메라 IP, 연결 상태, 디렉토리, 저장 주기), 실시간 감지 화면(Thermal/Visual 오버레이 이미지 + 핫스팟 마커), 로그 테이블(감지 시간/위치/온도/경고/알림), ROI 설정·캘리브레이션 연동 |
+| `tools.py` | 통합 모니터링 대시보드 GUI — 환경 설정(카메라 IP, 연결 상태, ExifTool 경로, Mode 선택), System Status(Not Ready/Ready/Monitoring/Error), 실시간 감지 화면(Thermal/Visual 오버레이 + 핫스팟 마커), Detection Log / Activity Log 분리 탭, 데이터 운영 버튼(Check Dataset, Generate Metadata, Cleanup Dataset), ROI 설정·캘리브레이션 연동 |
 | `capture.py` | FLIR A50에서 Thermal + RGB 이미지 수집 (`CaptureSession` 클래스, GUI/스크립트 겸용) |
 | `thermal_utils.py` | Radiometric JPEG에서 exiftool로 Raw Thermal 추출, Planck 변환으로 실제 °C 환산 |
-| `checking.py` | 데이터셋 무결성 검사 — NPY 누락 시 JPG에서 복구, 고아 NPY 정리 (`run_check()` 함수) |
-| `metadata.py` | JPG-NPY 파일쌍 스캔 후 `metadata.csv` 자동 생성, 실험 설정 연동 (`run_metadata()` 함수) |
+| `checking.py` | 데이터셋 무결성 검사 — NPY 누락 시 JPG에서 복구 (병렬), 고아 NPY 정리 (`run_check()` 함수) |
+| `metadata.py` | JPG-NPY 파일쌍 스캔 후 `metadata.csv` 자동 생성, ROI 온도 분석·판정 결과 포함 (`run_metadata()` 함수) |
+| `cleanup.py` | 오래된 데이터셋 자동 정리 — 보존 기간 지난 JPG+NPY 쌍, 고아 NPY/JPG/오버레이 삭제, 디스크 공간 확보 (`run_cleanup()`, `run_cleanup_if_due()`) |
 | `calibration.py` | OpenCV GUI로 Thermal ↔ RGB 대응점 지정, Homography 행렬 계산 |
 | `roi_selector.py` | Thermal 이미지에 마우스 드래그로 ROI 지정, `config.json` 자동 저장 |
 
@@ -205,11 +208,11 @@ python -m tests.test_overlay
 
 | 모듈 | 설명 |
 |------|------|
-| `monitor.py` | **실시간 감시 시퀀서 (CLI)** — 백그라운드 캡처 + 신규 이미지 자동 분석 + 무결성 검사 + 메타데이터 + 알림 |
+| `monitor.py` | **실시간 감시 시퀀서 (CLI)** — 백그라운드 캡처 + 신규 이미지 자동 분석 (다중 쌍 병렬 처리) + 무결성 검사 + 메타데이터 + 오래된 데이터 정리 + 알림 |
 | `roi.py` | `.npy`에서 ROI 영역 온도 통계(max, mean, 95th) 추출 + connected components 클러스터 분석 + **모든 핫스팟 중심좌표 추출** |
 | `threshold.py` | 이중 경로 상태 판정 (95th percentile + max 온도) + 클러스터 크기 기반 노이즈 필터링, 상태 변화 시 알림 쿨다운 |
 | `overlay.py` | Thermal/RGB 이미지에 ROI 박스 + 온도 정보 + **모든 핫스팟 마커** 표시, Homography 기반 좌표 변환 |
-| `pipeline.py` | 배치 분석 파이프라인: ROI → Threshold → Overlay → Telegram 알림 (기존 데이터셋 순회) |
+| `pipeline.py` | 배치 분석 파이프라인: ROI → Threshold → Overlay → Telegram 알림, ThreadPoolExecutor로 전체 쌍 병렬 처리 |
 
 ### 알림
 
@@ -240,6 +243,8 @@ python -m tests.test_overlay
 - **웹 대시보드** — 실시간 온도 트렌드, ROI 오버레이, 알림 상태 표시 (동료 작업 대기)
 - **실시간 모니터링 루프** — DB + 대시보드 완료 후 `pipeline.py`를 실시간 모드로 전환 예정
 - **공장 라인 실증 테스트** — 실제 로봇 발열 데이터 확보 시 검증
+- **오래된 데이터 자동 정리** — 1시간마다 보존 기간(기본 7일) 경과 데이터 정리
+- **ARM64 Ubuntu 지원** — AGX Orin 등 ARM64 환경에서 exiftool, python3-tk, libgl1 설치 필요
 
 ## 📋 앞으로 작업할 내용
 

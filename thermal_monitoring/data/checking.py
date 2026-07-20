@@ -10,6 +10,7 @@ checking.py - 데이터셋 무결성 검사 및 복구
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -17,6 +18,7 @@ from ..capture.thermal_utils import extract_from_jpeg
 from ..config import load_config
 
 SAVE_DIR = load_config().paths.dataset_dir
+MAX_RECOVERY_WORKERS = max(2, (os.cpu_count() or 4) // 2)
 
 
 class CheckResult:
@@ -77,22 +79,30 @@ def run_check(
          f"Pairs: {result.paired}  Missing NPY: {result.missing_npy}  "
          f"Orphan NPY: {result.orphan_npy}", log_callback, result.messages)
 
-    # 1. NPY 누락 복구
+    # 1. NPY 누락 복구 (병렬)
     if missing:
         _log(f"\n[Recovering {len(missing)} missing NPY files...]", log_callback, result.messages)
-        for base in sorted(missing):
+        sorted_missing = sorted(missing)
+
+        def _recover_one(base: str) -> tuple[str, bool, str]:
             jpg_path = os.path.join(save_dir, jpg_bases[base])
             npy_path = os.path.join(save_dir, base + "_thermal.npy")
             try:
                 thermal, _ = extract_from_jpeg(jpg_path)
                 np.save(npy_path, thermal)
-                _log(f"  OK {npy_path} "
-                     f"(min={np.nanmin(thermal):.1f}C, max={np.nanmax(thermal):.1f}C)",
-                     log_callback, result.messages)
-                result.fixed += 1
+                return base, True, f"OK {npy_path} (min={np.nanmin(thermal):.1f}C, max={np.nanmax(thermal):.1f}C)"
             except Exception as e:
-                _log(f"  FAIL {jpg_bases[base]} - {e}", log_callback, result.messages)
-                result.failed += 1
+                return base, False, f"FAIL {jpg_bases[base]} - {e}"
+
+        with ThreadPoolExecutor(max_workers=MAX_RECOVERY_WORKERS) as executor:
+            futures = {executor.submit(_recover_one, base): base for base in sorted_missing}
+            for future in as_completed(futures):
+                base, ok, msg = future.result()
+                _log(f"  {msg}", log_callback, result.messages)
+                if ok:
+                    result.fixed += 1
+                else:
+                    result.failed += 1
 
     # 2. 고아 NPY 삭제
     if orphan:

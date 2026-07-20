@@ -13,7 +13,9 @@ thermal_dataset의 모든 파일쌍을 순회하며:
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from threading import Lock
 
 import numpy as np
 
@@ -30,6 +32,7 @@ from ..analysis.notifier import send_alarm as send_telegram
 _cfg = load_config()
 DATASET_DIR = _cfg.paths.dataset_dir
 OVERLAY_DIR = _cfg.paths.overlay_dir
+MAX_WORKERS = os.cpu_count() or 4
 
 
 def scan_pairs() -> list[dict]:
@@ -63,14 +66,91 @@ def scan_pairs() -> list[dict]:
     return pairs
 
 
+def _process_single_pair(
+    pair: dict,
+    config,
+    state: MonitorState,
+    lock: Lock,
+    idx: int,
+    total: int,
+) -> dict:
+    """단일 쌍 처리 — ThreadPoolExecutor에서 병렬 호출됨."""
+    base = pair["base"]
+    try:
+        result = extract_roi_from_npy(pair["npy"], config)
+        new_status, do_alarm = evaluate_with_state(
+            hot_temp=result.hot_temp_95,
+            max_temp=result.max_temp,
+            mean_temp=result.mean_temp,
+            baseline=config.baseline_temp,
+            warning_delta=config.warning_delta,
+            critical_delta=config.critical_delta,
+            state=state,
+            over_temp_pixels=result.over_temp_pixels,
+            max_hotspot_size=result.max_hotspot_size,
+        )
+
+        prev_status = state.status
+        with lock:
+            state.status = new_status
+
+        overlay_path = None
+        if new_status != Status.NORMAL:
+            overlay = create_overlay(
+                thermal_jpg_path=pair["thermal_jpg"],
+                visual_jpg_path=pair["visual_jpg"],
+                roi_bounds=result.roi_bounds,
+                max_temp=result.max_temp,
+                mean_temp=result.mean_temp,
+                hot_temp=result.hot_temp_95,
+                status=new_status.value,
+                hotspot_centroids=result.hotspot_centroids,
+            )
+            overlay_path = save_overlay(base, overlay)
+
+        alarm_sent = False
+        if do_alarm:
+            try:
+                sent = send_telegram(
+                    image_path=overlay_path or pair["thermal_jpg"],
+                    temp=result.hot_temp_95,
+                    status=new_status.value,
+                )
+                if sent:
+                    state.last_alarm_time = time.time()
+                    alarm_sent = True
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+
+        return {
+            "idx": idx,
+            "base": base,
+            "hot_temp": result.hot_temp_95,
+            "max_temp": result.max_temp,
+            "status": new_status,
+            "prev_status": prev_status,
+            "do_alarm": do_alarm,
+            "alarm_sent": alarm_sent,
+        }
+    except Exception as e:
+        return {
+            "idx": idx,
+            "base": base,
+            "error": str(e),
+        }
+
+
 def run_pipeline():
-    """전체 파이프라인 실행"""
+    """전체 파이프라인 실행 (병렬 처리)"""
     from .._encoding import setup_encoding
     setup_encoding()
 
     print("=" * 60)
     print("  Robot Thermal Monitoring - Pipeline")
-    print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Started  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Workers  : {MAX_WORKERS}")
     print("=" * 60)
 
     config = load_roi_config()
@@ -88,68 +168,34 @@ def run_pipeline():
 
     alarm_count = 0
     status_counts = {s.value: 0 for s in Status}
+    lock = Lock()
+    completed = 0
 
-    for i, pair in enumerate(pairs):
-        base = pair["base"]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _process_single_pair, pair, config, state, lock, i, len(pairs)
+            ): i
+            for i, pair in enumerate(pairs)
+        }
 
-        # 1. ROI 추출
-        result = extract_roi_from_npy(pair["npy"], config)
+        results = []
+        for future in as_completed(futures):
+            r = future.result()
+            results.append(r)
+            completed += 1
 
-        # 2. Threshold + 상태 판정
-        new_status, do_alarm = evaluate_with_state(
-            hot_temp=result.hot_temp_95,
-            max_temp=result.max_temp,
-            mean_temp=result.mean_temp,
-            baseline=config.baseline_temp,
-            warning_delta=config.warning_delta,
-            critical_delta=config.critical_delta,
-            state=state,
-            over_temp_pixels=result.over_temp_pixels,
-            max_hotspot_size=result.max_hotspot_size,
-        )
-
-        prev_status = state.status
-        state.status = new_status
-        status_counts[new_status.value] += 1
-
-        # 3. Overlay 생성 (Warning, Critical일 때만)
-        overlay_path = None
-        if new_status != Status.NORMAL:
-            overlay = create_overlay(
-                thermal_jpg_path=pair["thermal_jpg"],
-                visual_jpg_path=pair["visual_jpg"],
-                roi_bounds=result.roi_bounds,
-                max_temp=result.max_temp,
-                mean_temp=result.mean_temp,
-                hot_temp=result.hot_temp_95,
-                status=new_status.value,
-                hotspot_centroids=result.hotspot_centroids,
-            )
-            overlay_path = save_overlay(base, overlay)
-
-        # 진행 상황 출력
-        progress = f"[{i + 1}/{len(pairs)}]"
-        transition = ""
-        if do_alarm:
-            transition = f"  <<< {prev_status.value} -> {new_status.value} >>>"
-            alarm_count += 1
-
-        print(f"{progress} {base} | 95th={result.hot_temp_95:.1f}C "
-              f"max={result.max_temp:.1f}C | {new_status.value}{transition}")
-
-        # 4. 알림 전송
-        if do_alarm:
-            try:
-                send_telegram(
-                    image_path=overlay_path or pair["thermal_jpg"],
-                    temp=result.hot_temp_95,
-                    status=new_status.value,
-                )
-                state.last_alarm_time = time.time()
-            except RuntimeError:
-                print("  ▲ Alarm skipped (Telegram not configured)")
-            except Exception as e:
-                print(f"  ▲ Alarm error: {e}")
+            if "error" in r:
+                print(f"[{completed}/{len(pairs)}] {r['base']} | ERROR: {r['error']}")
+            else:
+                status_counts[r["status"].value] += 1
+                transition = ""
+                if r["do_alarm"]:
+                    transition = f"  <<< {r['prev_status'].value} -> {r['status'].value} >>>"
+                    alarm_count += 1
+                print(f"[{completed}/{len(pairs)}] {r['base']} "
+                      f"| 95th={r['hot_temp']:.1f}C max={r['max_temp']:.1f}C "
+                      f"| {r['status'].value}{transition}")
 
     # 요약
     print()

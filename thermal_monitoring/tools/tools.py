@@ -36,6 +36,7 @@ from ..capture.capture import CaptureSession
 # GUI-UPDATE: 계획서의 데이터 검사·메타데이터 기능을 버튼에서 호출한다.
 from ..data.checking import run_check, CheckResult
 from ..data.metadata import run_metadata, MetadataResult
+from ..data.cleanup import run_cleanup, CleanupResult
 from ..analysis.roi import load_roi_config, extract_roi_from_npy, RoiResult
 from ..analysis.threshold import (
     Status, MonitorState, evaluate_with_state,
@@ -84,6 +85,7 @@ class MonitoringDashboard:
         self._calib_running = False
         self._check_running = False
         self._metadata_running = False
+        self._cleanup_running = False
         self._photo_ref: Optional[ImageTk.PhotoImage] = None
 
         self._build_ui()
@@ -162,7 +164,11 @@ class MonitoringDashboard:
 
         self._metadata_btn = ttk.Button(tool_frame, text="Generate Metadata",
                                         command=self._run_metadata_generation)
-        self._metadata_btn.pack(fill="x", pady=(0, 10))
+        self._metadata_btn.pack(fill="x", pady=(0, 6))
+
+        self._cleanup_btn = ttk.Button(tool_frame, text="Cleanup Dataset",
+                                       command=self._run_cleanup)
+        self._cleanup_btn.pack(fill="x", pady=(0, 10))
 
         self._roi_btn = ttk.Button(tool_frame, text="Set ROI",
                                    command=self._launch_roi_selector)
@@ -587,6 +593,76 @@ class MonitoringDashboard:
         self._append_activity_log(message)
         self._log_to_status(message)
 
+    def _maybe_run_cleanup_in_background(self):
+        """주기적 정리를 조용히 백그라운드에서 수행 (버튼과 무관)."""
+        if self._cleanup_running:
+            return
+        self._cleanup_running = True
+        save_dir = self._config.paths.dataset_dir
+
+        def _run():
+            try:
+                result = run_cleanup(save_dir=save_dir, log_callback=self._append_activity_log)
+                if result.removed_pairs > 0 or result.freed_bytes > 0:
+                    freed_mb = result.freed_bytes / (1024 * 1024)
+                    self._append_activity_log(
+                        f"Background cleanup — removed {result.removed_pairs} pairs, "
+                        f"freed {freed_mb:.1f} MB")
+            except Exception:
+                pass
+            finally:
+                self._cleanup_running = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _run_cleanup(self):
+        """GUI-UPDATE: 불필요 데이터 정리를 백그라운드에서 실행한다."""
+        if self._cleanup_running:
+            self._log_to_status("Cleanup is already running.")
+            return
+
+        self._cleanup_running = True
+        self._cleanup_btn.configure(state="disabled")
+        self._log_to_status("Cleaning up old datasets...")
+        self._append_activity_log("=== Dataset cleanup started ===")
+        save_dir = self._config.paths.dataset_dir
+
+        def _run():
+            try:
+                result = run_cleanup(
+                    save_dir=save_dir,
+                    log_callback=self._append_activity_log,
+                )
+                self.root.after(0, lambda: self._finish_cleanup(result, None))
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc: self._finish_cleanup(None, exc))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _finish_cleanup(
+        self,
+        result: Optional[CleanupResult],
+        error: Optional[Exception],
+    ):
+        self._cleanup_running = False
+        self._cleanup_btn.configure(state="normal")
+        if error is not None:
+            message = f"Cleanup failed: {error}"
+            self._append_activity_log(message)
+            self._log_to_status(message)
+            return
+
+        freed_mb = result.freed_bytes / (1024 * 1024)
+        message = (
+            f"Cleanup complete — Pairs {result.removed_pairs}, "
+            f"Orphan NPY {result.removed_orphan_npy}, "
+            f"Orphan JPG {result.removed_orphan_jpg}, "
+            f"Orphan overlay {result.removed_overlay}, "
+            f"Freed {freed_mb:.1f} MB"
+        )
+        self._append_activity_log(message)
+        self._log_to_status(message)
+
     # ════════════════════════════════════════════════════════════
     # 모니터링 시작/중지
     # ════════════════════════════════════════════════════════════
@@ -667,6 +743,10 @@ class MonitoringDashboard:
         try:
             if self._tick_count % 10 == 0:
                 self._check_camera_connection()
+
+            # 주기적 오래된 데이터 정리 (1800 ticks ≈ 1시간 at 2s interval)
+            if self._tick_count > 0 and self._tick_count % 1800 == 0:
+                self._maybe_run_cleanup_in_background()
 
             new_pairs = self._scan_new_pairs()
             for pair in new_pairs:
