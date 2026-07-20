@@ -18,6 +18,9 @@ import numpy as np
 from ..analysis.roi import load_roi_config, extract_roi_from_npy
 from ..analysis.threshold import evaluate_threshold
 from ..config import load_config
+from ..logger import get_logger
+
+_log = get_logger("data.metadata")
 
 SAVE_DIR = load_config().paths.dataset_dir
 

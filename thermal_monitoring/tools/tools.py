@@ -43,6 +43,9 @@ from ..analysis.threshold import (
 )
 from ..analysis.overlay import create_overlay, _load_homography
 from ..analysis.notifier import send_alarm
+from ..logger import get_logger
+
+_log = get_logger("tools")
 
 DATASET_DIR = load_config().paths.dataset_dir
 HOMOGRAPHY_PATH = load_config().paths.homography_path
@@ -654,11 +657,12 @@ class MonitoringDashboard:
 
         freed_mb = result.freed_bytes / (1024 * 1024)
         message = (
-            f"Cleanup complete — Pairs {result.removed_pairs}, "
-            f"Orphan NPY {result.removed_orphan_npy}, "
-            f"Orphan JPG {result.removed_orphan_jpg}, "
-            f"Orphan overlay {result.removed_overlay}, "
-            f"Freed {freed_mb:.1f} MB"
+            f"Cleanup complete — Normal pairs removed: {result.removed_pairs}, "
+            f"Alarm history preserved: {result.preserved_alarms}, "
+            f"Orphan NPY: {result.removed_orphan_npy}, "
+            f"Orphan JPG: {result.removed_orphan_jpg}, "
+            f"Orphan overlay: {result.removed_overlay}, "
+            f"Freed: {freed_mb:.1f} MB"
         )
         self._append_activity_log(message)
         self._log_to_status(message)
@@ -703,6 +707,17 @@ class MonitoringDashboard:
         self._running = True
         self._tick_count = 0
 
+        # 프로브 콜백: 캡처 대기 중 1초마다 경량 Thermal 체크
+        roi = self._config.roi
+        baseline = roi.baseline_temp
+        warning_delta = roi.warning_delta
+
+        def _probe_callback(max_temp: float) -> bool:
+            if max_temp >= baseline + warning_delta:
+                self._capture_session.set_warning_mode(True)
+                return True
+            return False
+
         self._capture_session = CaptureSession(
             cam_ip=cam_ip,
             mode=mode,
@@ -710,6 +725,7 @@ class MonitoringDashboard:
             save_dir=self._config.paths.dataset_dir,
             # GUI-UPDATE: 캡처 성공·실패를 콘솔 대신 Activity Log에도 표시한다.
             log_callback=self._append_activity_log,
+            probe_callback=_probe_callback,
         )
         self._capture_session.start()
 

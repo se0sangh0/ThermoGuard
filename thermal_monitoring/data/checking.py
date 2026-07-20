@@ -16,6 +16,9 @@ import numpy as np
 
 from ..capture.thermal_utils import extract_from_jpeg
 from ..config import load_config
+from ..logger import get_logger
+
+_log = get_logger("data.checking")
 
 SAVE_DIR = load_config().paths.dataset_dir
 MAX_RECOVERY_WORKERS = max(2, (os.cpu_count() or 4) // 2)
@@ -82,6 +85,7 @@ def run_check(
     # 1. NPY 누락 복구 (병렬)
     if missing:
         _log(f"\n[Recovering {len(missing)} missing NPY files...]", log_callback, result.messages)
+        _log.info("Recovering %d missing NPY files (workers=%d)", len(missing), MAX_RECOVERY_WORKERS)
         sorted_missing = sorted(missing)
 
         def _recover_one(base: str) -> tuple[str, bool, str]:

@@ -8,6 +8,10 @@ import numpy as np
 from PIL import Image
 import io
 
+from ..logger import get_logger
+
+_log = get_logger("capture.thermal_utils")
+
 # exiftool 경로 — config.json에서 설정하거나, 없으면 DJI SDK 경로 → PATH fallback
 def _get_default_exiftool() -> str:
     from ..config import load_config
@@ -136,3 +140,64 @@ def extract_from_jpeg(jpg_path, exiftool=None):
     }
 
     return thermal.astype(np.float32), capture_meta
+
+
+def probe_thermal_from_url(url: str, timeout: float = 10.0) -> float | None:
+    """
+    경량 프로브: 카메라에서 Thermal JPEG를 다운로드하고 XMP 메타데이터에서
+    프레임 최고 온도만 추출합니다.
+
+    Raw Thermal 추출이나 Planck 변환 없이 exiftool로 텍스트 메타데이터만 읽습니다.
+    디스크에 JPEG를 저장하지 않습니다 (subprocess stdin 파이프 사용).
+    실패 시 None 반환.
+
+    Args:
+        url: 카메라 Thermal JPEG API URL
+        timeout: HTTP 타임아웃
+
+    Returns:
+        최고 온도(°C) 또는 None
+    """
+    import requests
+    import subprocess
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200:
+            _log.warning("probe: HTTP %d", r.status_code)
+            return None
+
+        content_type = r.headers.get("Content-Type", "")
+        if "image" not in content_type.lower() and content_type != "octet-stream":
+            _log.warning("probe: unexpected Content-Type: %s", content_type)
+            return None
+
+        exiftool = _get_default_exiftool()
+
+        # RAW 데이터 대신 XMP 메타데이터만 추출 (가벼움)
+        meta_proc = subprocess.run(
+            [exiftool, "-j", "-Main:MaxValue", "-"],
+            input=r.content,
+            capture_output=True,
+            timeout=15,
+        )
+        if meta_proc.returncode != 0:
+            _log.warning("probe: exiftool failed (rc=%d)", meta_proc.returncode)
+            return None
+
+        meta = json.loads(meta_proc.stdout.decode())[0]
+        max_val = meta.get("Main:MaxValue")
+        if max_val is not None:
+            result = extract_float(max_val)
+            return result
+
+        # Fallback: MaxValue가 없으면 ApparentTemperature
+        apparent = meta.get("ApparentTemperature")
+        if apparent is not None:
+            return extract_float(apparent)
+
+        _log.warning("probe: no temperature tag in XMP metadata")
+        return None
+
+    except Exception as e:
+        _log.warning("probe failed: %s", e)
+        return None

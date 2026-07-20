@@ -1,3 +1,6 @@
+# 기본 GUI 파이프라인 요구사항
+
+## GUI 구성
 ```
 프로그램 실행
 ├ 환경 설정
@@ -12,7 +15,8 @@
 		├ 현재 지정되어 있는 디렉토리 정보
 		└ 저장 디렉토리 변경 기능
 	└ 저장 주기 설정
-		├ 현재 지정되어 있는 저장 주기 정보
+		├ 평상시 캡처 주기 (capture_interval_sec, 기본 30초)
+		├ 과열 시 캡처 주기 (warning_interval_sec, 기본 1초)
 		└ 저장 주기 변경 기능 
 ├ 감지 화면
 	├ 가장 최근 캡쳐된 이미지 노출
@@ -24,7 +28,7 @@
 	├ 데이터 운영 버튼
 		├ Check Dataset → 무결성 검사 및 NPY 복구 (병렬)
 		├ Generate Metadata → metadata.csv 생성
-		└ Cleanup Dataset → 보존 기간 지난 데이터 정리
+		└ Cleanup Dataset → Normal 데이터만 삭제, 알람 이력 보존
 	├ ROI 설정 버튼
 		├ 버튼 클릭 시 ROI 설정 화면 실행 (메인 스레드)
 			├ 이전에 캘리브레이션 진행한 이력 없는 경우 캘리브레이션 설정 화면 노출
@@ -38,3 +42,48 @@
 	└ Activity Log 탭
 		└ 운영 로그, 오류 메시지, 백그라운드 작업 상태
 ```
+
+## 감시 시퀀스 흐름
+
+### 2-트랙 캡처 (Dual-Track)
+```
+평상시 (30초 주기)
+  ├── 풀캡처: 30초마다 Thermal + Visual JPEG 저장
+  └── 프로브: 대기 시간 동안 매 1초마다 경량 Thermal 체크
+                (JPEG → exiftool stdin → XMP Main:MaxValue 추출, 디스크 I/O 없음)
+                │
+                ▼ max_temp ≥ baseline + warning_delta 감지 시
+과열 모드 (1초 주기)
+  └── 풀캡처: 1초마다 Thermal + Visual JPEG 저장 (정밀 추적)
+                │
+                ▼ Normal 복귀 시
+평상시 (30초 주기) ← 복귀
+```
+
+### 상태 전이
+```
+Normal ──(baseline 초과)──→ Warning ──(critical 초과)──→ Critical
+  ↑                             │                           │
+  └────(정상 복귀)──────────────└───────────────────────────┘
+```
+
+### 데이터 보존 정책
+```
+Cleanup (1시간마다 자동)
+  ├── Normal 쌍: 7일 경과 시 삭제
+  ├── Warning/Critical 쌍: 영구 보존 (metadata.csv alarm_level 참조)
+  ├── 고아 NPY/JPG: 즉시 삭제
+  └── 고아 오버레이: 즉시 삭제
+```
+
+### 운영 로그 (logs/app.log)
+```
+2026-07-20 14:32:15.123 [INFO ] [capture] Camera connection restored: 192.168.0.51
+2026-07-20 14:32:20.456 [WARN ] [capture] Camera unreachable for 5 consecutive attempts
+2026-07-20 14:32:25.789 [ERROR] [pipeline.monitor] Unexpected error: Permission denied
+  Traceback (most recent call last):
+    ...
+```
+- 자정 롤링, 30일 보존
+- 콘솔에는 INFO 레벨 이상 출력
+- 카메라 연결 끊김/복구, 캡처 주기 전환, 과열 감지/복귀, 텔레그램 전송 결과, 데이터 정리 결과 기록

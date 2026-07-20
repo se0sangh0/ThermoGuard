@@ -16,11 +16,16 @@ monitor.py 실시간 감시나 tools.py GUI에서 백그라운드로 동작합�
     config.json의 monitoring.cleanup_retention_days (기본 7일)
 """
 
+import csv
 import os
 import time
 import glob
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+
+from ..logger import get_logger
+
+_log = get_logger("data.cleanup")
 
 _RELATIVE_SAVE_DIR = "thermal_dataset"
 _DEFAULT_RETENTION_DAYS = 7
@@ -28,7 +33,8 @@ _DEFAULT_RETENTION_DAYS = 7
 
 @dataclass
 class CleanupResult:
-    removed_pairs: int = 0          # JPG+NPY 쌍
+    removed_pairs: int = 0          # 삭제된 Normal JPG+NPY 쌍
+    preserved_alarms: int = 0       # Warning/Critical 이력으로 보존된 쌍
     removed_orphan_npy: int = 0     # JPG 없는 NPY
     removed_orphan_jpg: int = 0     # NPY 없는 JPG
     removed_overlay: int = 0        # 대응 쌍 없는 오버레이
@@ -58,6 +64,33 @@ def _parse_timestamp_from_filename(filename: str) -> datetime | None:
         except ValueError:
             pass
     return None
+
+
+def _load_alarm_bases(save_dir: str) -> set[str]:
+    """metadata.csv에서 Warning/Critical 이력이 있는 image_id 집합을 반환."""
+    csv_path = os.path.join(save_dir, "metadata.csv")
+    if not os.path.isfile(csv_path):
+        return set()
+    alarm_bases = set()
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            headers = next(reader, None)
+            if headers is None:
+                return set()
+            try:
+                idx_id = headers.index("image_id")
+                idx_alarm = headers.index("alarm_level")
+            except ValueError:
+                return set()
+            for row in reader:
+                if len(row) <= max(idx_id, idx_alarm):
+                    continue
+                if row[idx_alarm] in ("Warning", "Critical"):
+                    alarm_bases.add(row[idx_id])
+    except Exception:
+        pass
+    return alarm_bases
 
 
 def _get_file_size(path: str) -> int:
@@ -91,6 +124,7 @@ def run_cleanup(
             save_dir = _RELATIVE_SAVE_DIR
 
     if not os.path.isdir(save_dir):
+        _log.info("Skip cleanup: '%s' not found", save_dir)
         _log(f"[cleanup] '{save_dir}' not found — skipping.", log_callback, result.messages)
         return result
 
@@ -109,17 +143,30 @@ def run_cleanup(
     visual_jpgs = {f.replace("_visual.jpg", ""): f for f in files if f.endswith("_visual.jpg")}
     overlays = [f for f in files if f.endswith("_overlay.jpg")]
 
-    # 1. 오래된 쌍 삭제
+    # 1. 오래된 Normal 쌍만 삭제 (Warning/Critical 이력 보존)
+    alarm_bases = _load_alarm_bases(save_dir)
     paired = set(thermal_jpgs.keys()) & set(npys.keys())
-    old_bases = []
+    old_normal = []
     for base in paired:
         ts = _parse_timestamp_from_filename(base)
-        if ts and ts < cutoff:
-            old_bases.append(base)
+        if ts and ts < cutoff and base not in alarm_bases:
+            old_normal.append(base)
 
-    if old_bases:
-        _log(f"[cleanup] Removing {len(old_bases)} expired pair(s)...", log_callback, result.messages)
-        for base in old_bases:
+    old_alarm_skipped = 0
+    for base in paired:
+        ts = _parse_timestamp_from_filename(base)
+        if ts and ts < cutoff and base in alarm_bases:
+            old_alarm_skipped += 1
+
+    if old_alarm_skipped > 0:
+        result.preserved_alarms = old_alarm_skipped
+        _log(f"[cleanup] Skipped {old_alarm_skipped} expired pair(s) with Warning/Critical history",
+             log_callback, result.messages)
+        _log.info("cleanup: skipped %d expired pair(s) with alarm history", old_alarm_skipped)
+
+    if old_normal:
+        _log(f"[cleanup] Removing {len(old_normal)} expired Normal pair(s)...", log_callback, result.messages)
+        for base in old_normal:
             paths = [
                 os.path.join(save_dir, thermal_jpgs[base]),
                 os.path.join(save_dir, npys[base]),
@@ -185,7 +232,8 @@ def run_cleanup(
 
     freed_mb = result.freed_bytes / (1024 * 1024)
     summary = (
-        f"[cleanup] Done — pairs: {result.removed_pairs}, "
+        f"[cleanup] Done — Normal pairs removed: {result.removed_pairs}, "
+        f"alarm history preserved: {result.preserved_alarms}, "
         f"orphan NPY: {result.removed_orphan_npy}, "
         f"orphan JPG: {result.removed_orphan_jpg}, "
         f"orphan overlay: {result.removed_overlay}, "

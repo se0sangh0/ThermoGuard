@@ -29,18 +29,19 @@ project/
 ├── thermal_monitoring/     # 메인 패키지
 │   ├── __init__.py
 │   ├── config.py           # 통합 설정 모듈 (모든 설정의 단일 진실 공급원)
+│   ├── logger.py           # 중앙 로깅 모듈 (일자별 롤링, 스레드 안전)
 │   ├── _encoding.py        # Windows UTF-8 인코딩 유틸
 │   │
 │   ├── capture/            # 🎥 데이터 수집
 │   │   ├── __init__.py
-│   │   ├── capture.py      # FLIR A50 이미지 캡처 (CaptureSession)
-│   │   └── thermal_utils.py # Planck 변환, exiftool 유틸
+│   │   ├── capture.py      # FLIR A50 이미지 캡처 (동시 요청, 2-트랙 프로브, 연결 끊김/복구 로깅)
+│   │   └── thermal_utils.py # Planck 변환, exiftool 유틸, 경량 프로브 (XMP 메타데이터 추출)
 │   │
 │   ├── data/               # 🗄️ 데이터 관리
 │   │   ├── __init__.py
 │   │   ├── checking.py     # 데이터셋 무결성 검사 및 복구 (병렬 NPY 추출)
 │   │   ├── metadata.py     # CSV 메타데이터 생성/업데이트
-│   │   └── cleanup.py      # 오래된 데이터셋 정리 (백그라운드 자동/수동)
+│   │   └── cleanup.py      # 오래된 데이터셋 정리 (Normal만 삭제, Warning/Critical 이력 보존)
 │   │
 │   ├── analysis/           # 📊 핵심 분석
 │   │   ├── __init__.py
@@ -70,6 +71,8 @@ project/
 ├── .env.example            # 환경변수 템플릿 (BOT_TOKEN, CHAT_ID)
 ├── requirements.txt        # 의존성 패키지
 ├── product_design.md       # 제품 설계 계획안
+├── logs/                   # 운영 로그 (일자별 롤링, 30일 보존)
+│   └── app.log            #  │  예: app.log.2026-07-20
 └── thermal_dataset/        # 수집된 데이터셋
     ├── *.jpg               # Thermal 원본 이미지
     ├── *_thermal.npy       # 픽셀별 온도 행렬
@@ -82,7 +85,7 @@ project/
 
 ```python
 # 최상위 API
-from thermal_monitoring import load_config, setup_encoding
+from thermal_monitoring import load_config, setup_encoding, get_logger
 
 # 서브패키지별 API
 from thermal_monitoring.capture import CaptureSession, extract_from_jpeg
@@ -132,6 +135,15 @@ python pipeline.py
 
 # 8. 단일 이미지 오버레이 확인
 python -m tests.test_overlay
+
+# 9. 데이터 워크플로우 단위 테스트
+python -m unittest tests.test_data_workflows -v
+
+# 10. 데이터 정리 수동 실행
+python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup()"
+
+# 11. 운영 로그 확인
+tail -f logs/app.log
 ```
 
 ## 통합 설정 (config.json)
@@ -142,7 +154,8 @@ python -m tests.test_overlay
 {
   "camera": {
     "ip": "192.168.0.51",           // FLIR 카메라 IP
-    "capture_interval_sec": 1.0      // 캡처 주기 (초)
+    "capture_interval_sec": 30.0,    // 평상시 캡처 주기 (초)
+    "warning_interval_sec": 1.0      // 과열 감지 시 캡처 주기 (초)
   },
   "identity": {
     "camera_id": "CAM-01",           // 카메라 식별자 (metadata.csv)
@@ -188,6 +201,36 @@ python -m tests.test_overlay
 - 설정은 `monitor.py`, `tools.py`, `pipeline.py` 실행 시 자동으로 반영됨
 - Telegram 시크릿(BOT_TOKEN, CHAT_ID)은 `.env`에 별도 관리
 
+## 운영 로그 (logs/)
+
+모든 모듈의 동작을 `logs/app.log`에 일자별로 자동 기록합니다. 자정마다 롤링되며 30일간 보존됩니다.
+
+```bash
+# 오늘 로그 확인
+tail -f logs/app.log
+
+# 특정 모듈 로그만 필터
+grep "\[capture\]" logs/app.log       # 카메라 연결/캡처 로그
+grep "\[pipeline.monitor\]" logs/app.log  # 감시 시퀀스 로그
+grep "ERROR" logs/app.log             # 오류만 확인
+
+# 연결 끊김/복구 로그 확인
+grep "unreachable\|restored" logs/app.log
+```
+
+**주요 로깅 이벤트:**
+
+| 이벤트 | 레벨 | 설명 |
+|--------|------|------|
+| 카메라 연결 복구 | INFO | `Camera connection restored` |
+| 연속 5회 캡처 실패 | WARNING | `Camera unreachable for 5 consecutive attempts` |
+| 연속 30회 캡처 실패 | ERROR | `Camera unreachable for 30 consecutive attempts` |
+| HTTP 오류 | WARNING | `[thermal] HTTP 503` 등 |
+| 연결 타임아웃 | ERROR | `[thermal] Timeout connecting to` |
+| 시퀀서 예외 | ERROR | 스택 트레이스 포함 |
+| Telegram 전송 실패 | ERROR | `sendPhoto failed: HTTP 403` |
+| 데이터 정리 결과 | INFO | 제거된 쌍 수, 확보된 디스크 용량, 보존된 알람 이력 수 |
+
 ## ✅ 완료된 작업
 
 ### 데이터 수집
@@ -200,7 +243,7 @@ python -m tests.test_overlay
 | `thermal_utils.py` | Radiometric JPEG에서 exiftool로 Raw Thermal 추출, Planck 변환으로 실제 °C 환산 |
 | `checking.py` | 데이터셋 무결성 검사 — NPY 누락 시 JPG에서 복구 (병렬), 고아 NPY 정리 (`run_check()` 함수) |
 | `metadata.py` | JPG-NPY 파일쌍 스캔 후 `metadata.csv` 자동 생성, ROI 온도 분석·판정 결과 포함 (`run_metadata()` 함수) |
-| `cleanup.py` | 오래된 데이터셋 자동 정리 — 보존 기간 지난 JPG+NPY 쌍, 고아 NPY/JPG/오버레이 삭제, 디스크 공간 확보 (`run_cleanup()`, `run_cleanup_if_due()`) |
+| `cleanup.py` | 오래된 데이터셋 자동 정리 — Normal 상태의 보존 기간 지난 쌍 삭제, Warning/Critical 이력 있는 데이터는 metadata.csv 참조하여 보존, 고아 NPY/JPG/오버레이는 무조건 삭제 (`run_cleanup()`, `run_cleanup_if_due()`) |
 | `calibration.py` | OpenCV GUI로 Thermal ↔ RGB 대응점 지정, Homography 행렬 계산 |
 | `roi_selector.py` | Thermal 이미지에 마우스 드래그로 ROI 지정, `config.json` 자동 저장 |
 
@@ -300,6 +343,30 @@ python -m tests.test_overlay
 - `.npy` 파일은 픽셀별 실제 온도 정보(°C)를 포함하여 별도 변환 불필요
 - 실시간 스트리밍 대신 Snapshot 방식 채택 (네트워크 품질/방화벽 제약 고려)
 
+### 2-트랙 캡처 (Dual-Track)
+
+평상시와 과열 시 캡처 주기를 분리하여 디스크 사용량과 응답성을 모두 확보합니다.
+
+```
+평상시 (30초 주기)
+  ├── 풀캡처: 30초마다 Thermal + Visual JPEG 저장
+  └── 프로브: 대기 시간 동안 매 1초마다 경량 Thermal 체크 (JPEG 다운로드 → 최고 온도만 추출)
+                │
+                ▼ threshold 초과 감지 시
+과열 모드 (1초 주기)
+  └── 풀캡처: 1초마다 Thermal + Visual JPEG 저장 (정밀 추적)
+                │
+                ▼ Normal 복귀 시
+평상시 (30초 주기) ← 복귀
+```
+
+| 모드 | 캡처 주기 | 설정 키 | 동작 |
+|------|-----------|---------|------|
+| Normal | 30초 | `camera.capture_interval_sec` | 프로브가 백그라운드에서 1초마다 온도 체크, 임계값 초과 시 즉시 전환 |
+| Warning/Critical | 1초 | `camera.warning_interval_sec` | 고속 풀캡처로 정밀 추적, Normal 복귀 시 자동 해제 |
+
+프로브는 JPEG를 메모리에서만 처리하고 NPY로 저장하지 않아 디스크 I/O 없이 경량 동작합니다.
+
 ## 알림 규칙
 
 | 상태 | 메시지 전송 | 전송 정보 |
@@ -310,6 +377,26 @@ python -m tests.test_overlay
 
 - 상태 변화 시에만 메시지 전송 (Normal → Warning → Critical → Normal)
 - 연속 발송 방지를 위한 쿨다운: 10분
+
+## 데이터 보존 정책 (Cleanup)
+
+`cleanup.py`는 1시간마다 자동 실행되며, `metadata.csv`의 `alarm_level`을 기준으로 다음과 같이 처리합니다.
+
+| 데이터 구분 | 보존 기한 경과 시 처리 |
+|-------------|----------------------|
+| Normal 상태 쌍 (JPG + NPY + Visual) | 7일 경과 시 **삭제** |
+| Warning/Critical 이력 쌍 | 보존 기한 무시, **영구 보존** |
+| JPG 없는 고아 NPY | **즉시 삭제** |
+| NPY 없는 고아 JPG | **즉시 삭제** |
+| 대응 쌍 없는 오버레이 이미지 | **즉시 삭제** |
+
+```bash
+# 수동 실행
+python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(retention_days=7)"
+
+# 보존 기한 조정
+python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(retention_days=30)"
+```
 
 ## 🔒 보안 및 개인정보 규칙
 

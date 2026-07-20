@@ -38,11 +38,13 @@ from ..analysis.threshold import (
 )
 from ..analysis.overlay import create_overlay, save_overlay
 from ..analysis.notifier import send_alarm
+from ..logger import get_logger
 
 _cfg = load_config()
 DATASET_DIR = _cfg.paths.dataset_dir
 OVERLAY_DIR = _cfg.paths.overlay_dir
 MAX_PARALLEL_PAIRS = max(2, (os.cpu_count() or 4) // 2)
+_log_monitor = get_logger("pipeline.monitor")
 
 # 처리 루프가 새 파일을 확인하는 주기 (초)
 PROCESS_INTERVAL = _cfg.monitoring.process_interval_sec
@@ -243,6 +245,18 @@ class MonitorSequencer:
             prev_status = self.state.status
             self.state.status = new_status
 
+            # 상태 변화 시 캡처 주기 전환
+            if prev_status == Status.NORMAL and new_status != Status.NORMAL:
+                if self.capture:
+                    self.capture.set_warning_mode(True)
+                _log_monitor.info("Capture interval switched to warning mode (%.1fs) — status: %s",
+                                  _cfg.camera.warning_interval_sec, new_status.value)
+            elif prev_status != Status.NORMAL and new_status == Status.NORMAL:
+                if self.capture:
+                    self.capture.set_warning_mode(False)
+                _log_monitor.info("Capture interval restored to normal (%.1fs) — status: Normal",
+                                  _cfg.camera.capture_interval_sec)
+
             with self._lock:
                 self._status_counts[new_status.value] += 1
 
@@ -301,12 +315,15 @@ class MonitorSequencer:
             return True
 
         except FileNotFoundError as e:
+            _log_monitor.warning("[%s] File missing: %s", base, e)
             self._log(f"[{base}] File missing: {e}")
             return False
         except ValueError as e:
+            _log_monitor.warning("[%s] Data error: %s", base, e)
             self._log(f"[{base}] Data error: {e}")
             return False
         except Exception as e:
+            _log_monitor.error("[%s] Unexpected error: %s", base, e, exc_info=True)
             self._log(f"[{base}] Unexpected error: {e}")
             import traceback
             traceback.print_exc()
@@ -315,6 +332,9 @@ class MonitorSequencer:
     # ── 메인 감시 루프 ───────────────────────────────────────
     def _monitoring_loop(self):
         """메인 처리 루프: 스캔 → 처리 → 대기. 예외 발생 시에도 재개"""
+        _log_monitor.info("=" * 50)
+        _log_monitor.info("Sequencer started: camera=%s capture_interval=%.1fs process_interval=%.1fs",
+                          self.cam_ip, self.capture_interval, self.process_interval)
         self._log("=" * 50)
         self._log("  Robot Thermal Monitor — Sequencer Started")
         self._log(f"  Camera : {self.cam_ip}")
@@ -368,6 +388,7 @@ class MonitorSequencer:
                             self._mark_processed(pair["base"])
 
             except Exception as e:
+                _log_monitor.error("Monitoring loop error (recovering): %s", e, exc_info=True)
                 self._log(f"Loop error (recovering): {e}")
                 import traceback
                 traceback.print_exc()
@@ -382,6 +403,7 @@ class MonitorSequencer:
     def start(self):
         """캡처 시작 + 감시 루프 진입"""
         if self._running:
+            _log_monitor.warning("start() called but already running")
             self._log("Already running.")
             return
 
@@ -389,6 +411,7 @@ class MonitorSequencer:
         try:
             self.roi_config = load_roi_config()
         except Exception as e:
+            _log_monitor.error("Failed to load ROI config: %s — using full frame default", e)
             self._log(f"Failed to load ROI config: {e}")
             self._log("Using default ROI (full frame)")
             from ..analysis.roi import RoiConfig
@@ -410,6 +433,18 @@ class MonitorSequencer:
 
         self._running = True
 
+        # 프로브 콜백: 캡처 대기 중 1초마다 경량 Thermal 체크
+        baseline = self.roi_config.baseline_temp
+        warning = self.roi_config.warning_delta
+
+        def _probe_callback(max_temp: float) -> bool:
+            if max_temp >= baseline + warning:
+                _log_monitor.info("Probe triggered: %.1f°C >= %.1f°C (baseline %.0f + %d)",
+                                  max_temp, baseline + warning, baseline, warning)
+                self.capture.set_warning_mode(True)
+                return True
+            return False
+
         # 백그라운드 캡처 시작 (논스톱, 독립 스레드)
         self.capture = CaptureSession(
             cam_ip=self.cam_ip,
@@ -417,6 +452,7 @@ class MonitorSequencer:
             interval=self.capture_interval,
             save_dir=DATASET_DIR,
             log_callback=self._log,
+            probe_callback=_probe_callback,
         )
         self.capture.start()
 
@@ -430,6 +466,7 @@ class MonitorSequencer:
 
     def stop(self):
         """캡처 + 감시 루프 종료"""
+        _log_monitor.info("Sequencer stop requested (alarms=%d)", self._alarm_count)
         self._running = False
         if self.capture:
             self.capture.stop()

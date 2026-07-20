@@ -15,6 +15,10 @@ import sys
 
 import requests
 
+from ..logger import get_logger
+
+_log = get_logger("analysis.notifier")
+
 # ------------------------------------------------------------
 # .env 파일 로드 (python-dotenv 없이 직접 파싱)
 # ------------------------------------------------------------
@@ -111,7 +115,12 @@ def send_alarm(
     #     return True
 
     if not _is_configured():
+        _log.warning("send_alarm skipped: Telegram not configured (BOT_TOKEN=%s, CHAT_ID=%s)",
+                     "***" if BOT_TOKEN else "(empty)", "***" if CHAT_ID else "(empty)")
         raise RuntimeError("BOT_TOKEN and CHAT_ID not configured. Set them in .env file.")
+
+    _log.info("send_alarm: robot=%s status=%s temp=%.1fC image=%s",
+              robot_id, status, temp, image_path)
 
     # 1. 이미지 + 캡션 전송 시도
     photo_sent = False
@@ -127,10 +136,13 @@ def send_alarm(
             if resp.status_code == 200:
                 photo_sent = True
             else:
+                _log.error("sendPhoto failed: HTTP %d %s", resp.status_code, resp.text)
                 print(f"[Telegram] sendPhoto failed: {resp.status_code} {resp.text}")
-        except Exception:
+        except Exception as e:
+            _log.error("sendPhoto exception: %s", e)
             print(f"[Telegram] sendPhoto error - falling back to text")
     else:
+        _log.warning("Image not found for alarm: %s", image_path)
         print(f"[Telegram] image not found: {image_path}")
 
     # 2. 이미지 전송 실패 시 텍스트만 전송
@@ -144,8 +156,10 @@ def send_alarm(
             if resp.status_code == 200:
                 photo_sent = True
             else:
+                _log.error("sendMessage fallback failed: HTTP %d %s", resp.status_code, resp.text)
                 print(f"[Telegram] sendMessage failed: {resp.status_code} {resp.text}")
-        except Exception:
+        except Exception as e:
+            _log.error("sendMessage exception: %s", e)
             print(f"[Telegram] sendMessage error")
 
     return photo_sent
