@@ -299,19 +299,19 @@ grep "unreachable\|restored" logs/app.log
 
 ### Phase 1 — MVP (현재 단계)
 
-| 작업 | 상태 | 설명 |
-|------|------|------|
-| ROI 설정 (GUI) | ✅ | `roi_selector.py` — 이미지 드래그로 ROI 지정 |
-| 온도 분석 파이프라인 | ✅ | `roi.py` — max/mean/95th + 클러스터 분석 |
-| Threshold 판단 로직 | ✅ | `threshold.py` — 이중 경로 (95th + max), 클러스터 크기 기반 노이즈 필터링 |
-| 상태 머신 | ✅ | Normal → Warning → Critical → Normal 상태 전이 |
-| Telegram 알림 | ✅ | `notifier.py` — 이미지+캡션 전송, `.env` 토큰 관리 |
-| Overlay 시각화 | ✅ | `overlay.py` — Thermal/RGB 이미지에 온도 정보 + 핫스팟 마커 표시, Homography 좌표 변환 |
-| 통합 파이프라인 | ✅ | `pipeline.py` — ROI → Threshold → Overlay → 알림 |
-| 통합 모니터링 GUI | ✅ | `tools.py` — 환경 설정 + 실시간 감지 화면 + 로그 테이블, ROI 설정·캘리브레이션 연동 |
-| 이력 관리 | ⬜ | 온도 트렌드 DB 저장 — DB 설계 완료 후 진행 |
-| 웹 대시보드 | ⬜ | 실시간 상태/트렌드/알림 표시 — 동료 작업 대기 |
-| 실시간 모니터링 | ⬜ | DB + 대시보드 연동 후 `pipeline.py` 실시간 전환 |
+| 작업              | 상태  | 설명                                                                  |
+| --------------- | --- | ------------------------------------------------------------------- |
+| ROI 설정 (GUI)    | ✅   | `roi_selector.py` — 이미지 드래그로 ROI 지정                                 |
+| 온도 분석 파이프라인     | ✅   | `roi.py` — max/mean/95th + 클러스터 분석                                  |
+| Threshold 판단 로직 | ✅   | `threshold.py` — 이중 경로 (95th + max), 클러스터 크기 기반 노이즈 필터링             |
+| 상태 머신           | ✅   | Normal → Warning → Critical → Normal 상태 전이                          |
+| Telegram 알림     | ✅   | `notifier.py` — 이미지+캡션 전송, `.env` 토큰 관리                             |
+| Overlay 시각화     | ✅   | `overlay.py` — Thermal/RGB 이미지에 온도 정보 + 핫스팟 마커 표시, Homography 좌표 변환 |
+| 통합 파이프라인        | ✅   | `pipeline.py` — ROI → Threshold → Overlay → 알림                      |
+| 통합 모니터링 GUI     | ✅   | `tools.py` — 환경 설정 + 실시간 감지 화면 + 로그 테이블, ROI 설정·캘리브레이션 연동           |
+| 이력 관리           | ⬜   | 온도 트렌드 DB 저장 — DB 설계 완료 후 진행                                        |
+| 웹 대시보드          | ⬜   | 실시간 상태/트렌드/알림 표시 — 동료 작업 대기                                         |
+| 실시간 모니터링        | ⬜   | DB + 대시보드 연동 후 `pipeline.py` 실시간 전환                                 |
 
 ### Phase 2 — 고도화
 

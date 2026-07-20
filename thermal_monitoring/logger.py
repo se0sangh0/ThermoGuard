@@ -86,6 +86,10 @@ def _init_root_logger():
         root.addHandler(file_handler)
         root.addHandler(console_handler)
 
+        # 외부 라이브러리 DEBUG 로그 노이즈 제거
+        for noisy in ["urllib3", "PIL", "requests"]:
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
         _initialized = True
 
 
