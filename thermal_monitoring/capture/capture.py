@@ -199,6 +199,7 @@ class CaptureSession:
 
             # 대기 시간 동안 1초 간격으로 경량 프로브 수행
             deadline = time.monotonic() + self.interval
+            probe_backoff = 0  # 프로브 실패 시 대기 시간 (초)
             while self._running:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -208,12 +209,17 @@ class CaptureSession:
                 with self._interval_lock:
                     is_normal = self.interval == self._normal_interval
 
-                if is_normal and self.probe_callback and self._was_connected:
+                if is_normal and self.probe_callback and self._was_connected and probe_backoff <= 0:
                     temp = probe_thermal_from_url(self._urls["thermal"], timeout=5.0)
                     if temp is not None and self.probe_callback(temp):
                         _log.info("Probe detected elevated temp (%.1f°C) — triggering immediate capture", temp)
                         self._log(f"[capture] Probe: {temp:.1f}°C — immediate capture triggered")
                         break  # → 즉시 루프 재진입하여 풀캡처
+                    elif temp is None:
+                        probe_backoff = 5  # 실패 시 5초간 프로브 중단
+
+                if probe_backoff > 0:
+                    probe_backoff -= 1
 
                 time.sleep(min(1.0, remaining))
 
