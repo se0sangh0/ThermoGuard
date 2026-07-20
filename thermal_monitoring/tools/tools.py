@@ -909,8 +909,6 @@ class MonitoringDashboard:
                 roi_bounds_list=_get_roi_bounds_list(roi_config),
                 roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
             )
-                hotspot_centroids=roi_result.hotspot_centroids,
-            )
 
             self._current_overlay = overlay
             # GUI-UPDATE: thermal-only 모드에서는 Visual 화면이 없어도 정상 처리한다.
@@ -964,6 +962,8 @@ class MonitoringDashboard:
     # ════════════════════════════════════════════════════════════
     def _try_notify(self, roi_result: RoiResult, new_status: Status) -> bool:
         try:
+            if self._current_overlay is None:
+                return False
             overlay_dir = self._config.paths.overlay_dir
             os.makedirs(overlay_dir, exist_ok=True)
             overlay_path = os.path.join(overlay_dir, f"{datetime.now().strftime('%Y%m%d%H%M%S')}_overlay.jpg")
