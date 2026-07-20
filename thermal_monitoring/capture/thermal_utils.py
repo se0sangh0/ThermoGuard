@@ -144,11 +144,11 @@ def extract_from_jpeg(jpg_path, exiftool=None):
 
 def probe_thermal_from_url(url: str, timeout: float = 10.0) -> float | None:
     """
-    경량 프로브: 카메라에서 Thermal JPEG를 다운로드하고 XMP/EXIF 메타데이터에서
-    프레임 최고 온도를 추출합니다.
+    경량 프로브: 카메라에서 Thermal JPEG를 다운로드하고,
+    Raw Thermal 추출 + Planck 변환으로 프레임 최고 온도(°C)를 반환합니다.
 
-    Raw Thermal 추출이나 Planck 변환 없이 exiftool로 텍스트 메타데이터만 읽습니다.
     디스크에 JPEG를 저장하지 않습니다 (subprocess stdin 파이프 사용).
+    exiftool을 두 번 호출합니다 (Planck 파라미터 JSON + Raw Thermal 바이너리).
     실패 시 None 반환.
 
     Args:
