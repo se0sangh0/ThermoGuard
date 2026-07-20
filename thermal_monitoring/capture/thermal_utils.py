@@ -173,7 +173,32 @@ def probe_thermal_from_url(url: str, timeout: float = 10.0) -> float | None:
 
         exiftool = _get_default_exiftool()
 
-        # Raw Thermal을 stdout 파이프로만 추출 (디스크 저장 없음)
+        # Planck 파라미터 + Raw Thermal을 한 번의 exiftool 호출로 동시 추출
+        meta_proc = subprocess.run(
+            [exiftool, "-j",
+             "-Emissivity", "-SubjectDistance",
+             "-AtmosphericTemperature", "-ReflectedApparentTemperature",
+             "-IRWindowTemperature", "-IRWindowTransmission",
+             "-RelativeHumidity",
+             "-PlanckR1", "-PlanckB", "-PlanckF", "-PlanckO", "-PlanckR2",
+             "-AtmosphericTransAlpha1", "-AtmosphericTransAlpha2",
+             "-AtmosphericTransBeta1", "-AtmosphericTransBeta2", "-AtmosphericTransX",
+             "-"],
+            input=r.content,
+            capture_output=True,
+            timeout=15,
+        )
+        if meta_proc.returncode != 0:
+            _log.warning("probe: metadata extraction failed (rc=%d)", meta_proc.returncode)
+            return None
+
+        try:
+            meta = json.loads(meta_proc.stdout.decode())[0]
+        except (json.JSONDecodeError, IndexError) as e:
+            _log.warning("probe: metadata parse failed: %s", e)
+            return None
+
+        # Raw Thermal 이미지 추출
         raw_proc = subprocess.run(
             [exiftool, "-RawThermalImage", "-b", "-"],
             input=r.content,
@@ -188,7 +213,33 @@ def probe_thermal_from_url(url: str, timeout: float = 10.0) -> float | None:
         raw_stream = io.BytesIO(raw_proc.stdout)
         thermal_img = Image.open(raw_stream)
         raw_np = np.array(thermal_img, dtype=np.uint16).astype(np.float64)
-        result = float(np.nanmax(raw_np))
+
+        # Planck 변환 파라미터
+        E = extract_float(meta.get("Emissivity", 1.0))
+        OD = extract_float(meta.get("SubjectDistance", 1.0))
+        RTemp = extract_float(meta.get("ReflectedApparentTemperature", 20.0))
+        ATemp = extract_float(meta.get("AtmosphericTemperature", 20.0))
+        IRWTemp = extract_float(meta.get("IRWindowTemperature", 20.0))
+        IRT = extract_float(meta.get("IRWindowTransmission", 1.0))
+        RH = extract_float(meta.get("RelativeHumidity", 50.0))
+        PR1 = extract_float(meta.get("PlanckR1", 21106.77))
+        PB = extract_float(meta.get("PlanckB", 1501.0))
+        PF = extract_float(meta.get("PlanckF", 1.0))
+        PO = extract_float(meta.get("PlanckO", -7340.0))
+        PR2 = extract_float(meta.get("PlanckR2", 0.012545258))
+        ATA1 = extract_float(meta.get("AtmosphericTransAlpha1", 0.006569))
+        ATA2 = extract_float(meta.get("AtmosphericTransAlpha2", 0.01262))
+        ATB1 = extract_float(meta.get("AtmosphericTransBeta1", -0.002276))
+        ATB2 = extract_float(meta.get("AtmosphericTransBeta2", -0.00667))
+        ATX = extract_float(meta.get("AtmosphericTransX", 1.9))
+
+        thermal = raw2temp(raw_np,
+                           E=E, OD=OD, RTemp=RTemp, ATemp=ATemp,
+                           IRWTemp=IRWTemp, IRT=IRT, RH=RH,
+                           PR1=PR1, PB=PB, PF=PF, PO=PO, PR2=PR2,
+                           ATA1=ATA1, ATA2=ATA2, ATB1=ATB1, ATB2=ATB2, ATX=ATX)
+
+        result = float(np.nanmax(thermal))
         return result
 
     except Exception as e:
