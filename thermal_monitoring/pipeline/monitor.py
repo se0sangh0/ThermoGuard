@@ -30,7 +30,7 @@ from ..capture.capture import CaptureSession
 from ..data.checking import run_check
 from ..data.metadata import run_metadata
 from ..data.cleanup import run_cleanup_if_due
-from ..analysis.roi import load_roi_config, extract_roi_from_npy
+from ..analysis.roi import load_roi_config, extract_roi_from_npy, extract_all_rois_from_npy, _get_roi_bounds_list
 from ..analysis.threshold import (
     Status,
     MonitorState,
@@ -226,8 +226,26 @@ class MonitorSequencer:
                 self._log(f"[{base}] ROI config not loaded — skipping")
                 return False
 
-            # 1. ROI 추출
-            roi_result = extract_roi_from_npy(pair["npy"], self.roi_config)
+            # 1. ROI 추출 (다중 ROI 지원)
+            roi_results = extract_all_rois_from_npy(pair["npy"], self.roi_config)
+            # 가장 높은 95th를 가진 ROI를 대표로 사용
+            roi_result = max(roi_results, key=lambda r: r.hot_temp_95)
+            all_hotspots = []
+            for rr in roi_results:
+                all_hotspots.extend(rr.hotspot_centroids)
+            # 중복 핫스팟 제거 (5px 이내 동일 위치)
+            unique_hotspots = []
+            for spot in all_hotspots:
+                is_dup = False
+                for u in unique_hotspots:
+                    if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
+                        if spot[2] > u[2]:
+                            unique_hotspots[unique_hotspots.index(u)] = spot
+                        is_dup = True
+                        break
+                if not is_dup:
+                    unique_hotspots.append(spot)
+            roi_result.hotspot_centroids = unique_hotspots
 
             # 2. Threshold + 상태 판정
             new_status, do_alarm = evaluate_with_state(
@@ -287,6 +305,8 @@ class MonitorSequencer:
                         hot_temp=roi_result.hot_temp_95,
                         status=new_status.value,
                         hotspot_centroids=roi_result.hotspot_centroids,
+                        roi_bounds_list=_get_roi_bounds_list(self.roi_config),
+                        roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
                     )
                     overlay_path = save_overlay(base, overlay)
                 except Exception as e:

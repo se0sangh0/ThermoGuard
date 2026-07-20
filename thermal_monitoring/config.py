@@ -41,8 +41,18 @@ class IdentityConfig:
 
 
 @dataclass
+class RoiEntry:
+    """개별 ROI 영역 정의"""
+    name: str = "ROI-1"
+    x1: int = 0
+    y1: int = 0
+    x2: int = 640
+    y2: int = 480
+
+
+@dataclass
 class RoiConfig:
-    """ROI 설정 — roi.py의 RoiConfig와 호환되는 필드명 유지"""
+    """ROI 설정 — 다중 영역 지원 (rois 리스트). 비어있으면 x1/y1/x2/y2 폴백."""
     x1: int = 0
     y1: int = 0
     x2: int = 640
@@ -50,6 +60,7 @@ class RoiConfig:
     baseline_temp: float = 35.0
     warning_delta: float = 15.0
     critical_delta: float = 25.0
+    rois: list = field(default_factory=list)  # list[RoiEntry]
 
 
 @dataclass
@@ -114,10 +125,25 @@ def _dict_to_dataclass(d: dict, dc: type):
 
 
 def _from_dict(raw: dict) -> AppConfig:
+    roi_raw = raw.get("roi", {})
+    rois_list = []
+    for entry in roi_raw.get("rois", []):
+        if isinstance(entry, dict):
+            rois_list.append(RoiEntry(
+                name=entry.get("name", "ROI"),
+                x1=int(entry.get("x1", 0)),
+                y1=int(entry.get("y1", 0)),
+                x2=int(entry.get("x2", 640)),
+                y2=int(entry.get("y2", 480)),
+            ))
+
+    roi_config = _dict_to_dataclass(roi_raw, RoiConfig)
+    roi_config.rois = rois_list
+
     return AppConfig(
         camera=_dict_to_dataclass(raw.get("camera", {}), CameraConfig),
         identity=_dict_to_dataclass(raw.get("identity", {}), IdentityConfig),
-        roi=_dict_to_dataclass(raw.get("roi", {}), RoiConfig),
+        roi=roi_config,
         monitoring=_dict_to_dataclass(raw.get("monitoring", {}), MonitoringConfig),
         hotspot=_dict_to_dataclass(raw.get("hotspot", {}), HotspotConfig),
         paths=_dict_to_dataclass(raw.get("paths", {}), PathsConfig),

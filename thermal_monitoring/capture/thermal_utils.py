@@ -144,8 +144,8 @@ def extract_from_jpeg(jpg_path, exiftool=None):
 
 def probe_thermal_from_url(url: str, timeout: float = 10.0) -> float | None:
     """
-    경량 프로브: 카메라에서 Thermal JPEG를 다운로드하고 XMP 메타데이터에서
-    프레임 최고 온도만 추출합니다.
+    경량 프로브: 카메라에서 Thermal JPEG를 다운로드하고 XMP/EXIF 메타데이터에서
+    프레임 최고 온도를 추출합니다.
 
     Raw Thermal 추출이나 Planck 변환 없이 exiftool로 텍스트 메타데이터만 읽습니다.
     디스크에 JPEG를 저장하지 않습니다 (subprocess stdin 파이프 사용).
@@ -173,9 +173,21 @@ def probe_thermal_from_url(url: str, timeout: float = 10.0) -> float | None:
 
         exiftool = _get_default_exiftool()
 
-        # RAW 데이터 대신 XMP 메타데이터만 추출 (가벼움)
+        # FLIR 카메라가 사용하는 최고 온도 관련 태그들을 한 번에 모두 조회
+        probe_args = [exiftool, "-j", "-s"]
+        probe_tags = [
+            "Main:MaxValue",
+            "ApparentTemperature",
+            "CameraTemperatureMaximum",
+            "CameraTemperatureRangeMax",
+            "XMP:ApparentTemperature",
+        ]
+        for tag in probe_tags:
+            probe_args.append(f"-{tag}")
+        probe_args.append("-")
+
         meta_proc = subprocess.run(
-            [exiftool, "-j", "-Main:MaxValue", "-"],
+            probe_args,
             input=r.content,
             capture_output=True,
             timeout=15,
@@ -184,18 +196,20 @@ def probe_thermal_from_url(url: str, timeout: float = 10.0) -> float | None:
             _log.warning("probe: exiftool failed (rc=%d)", meta_proc.returncode)
             return None
 
-        meta = json.loads(meta_proc.stdout.decode())[0]
-        max_val = meta.get("Main:MaxValue")
-        if max_val is not None:
-            result = extract_float(max_val)
-            return result
+        try:
+            meta = json.loads(meta_proc.stdout.decode())[0]
+        except (json.JSONDecodeError, IndexError) as e:
+            _log.warning("probe: JSON parse failed: %s", e)
+            return None
 
-        # Fallback: MaxValue가 없으면 ApparentTemperature
-        apparent = meta.get("ApparentTemperature")
-        if apparent is not None:
-            return extract_float(apparent)
+        # 수집된 모든 값에서 실온 범위 온도 찾기
+        for key, val in meta.items():
+            if isinstance(val, (int, float, str)) and val != "":
+                temp = extract_float(val)
+                if -100 < temp < 2000:
+                    return temp
 
-        _log.warning("probe: no temperature tag in XMP metadata")
+        _log.warning("probe: no temperature value found in %d tags", len(meta))
         return None
 
     except Exception as e:

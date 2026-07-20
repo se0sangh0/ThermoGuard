@@ -231,9 +231,14 @@ def create_overlay(
     status: str,
     homography: np.ndarray | None = None,
     hotspot_centroids: list | None = None,
+    roi_bounds_list: list[tuple] | None = None,
+    roi_names: list[str] | None = None,
 ) -> np.ndarray:
     """
     오버레이 이미지 생성.
+
+    roi_bounds_list가 제공되면 모든 ROI 박스를 그립니다.
+    roi_names가 제공되면 각 박스에 이름 라벨을 표시합니다.
     """
     if homography is None:
         homography = _load_homography()
@@ -259,7 +264,51 @@ def create_overlay(
     elif hotspot_centroids:
         transformed_centroids = hotspot_centroids
 
-    return draw_overlay(canvas, canvas_roi, max_temp, mean_temp, hot_temp, status, sx, sy, transformed_centroids)
+    img = draw_overlay(canvas, canvas_roi, max_temp, mean_temp, hot_temp, status, sx, sy, transformed_centroids)
+
+    # 다중 ROI 박스 그리기 (주 ROI 외 추가 영역)
+    if roi_bounds_list and len(roi_bounds_list) > 1:
+        _draw_multi_roi_boxes(img, roi_bounds_list, roi_names, sx, sy, homography, thermal_jpg_path)
+
+    return img
+
+
+def _draw_multi_roi_boxes(
+    img: np.ndarray,
+    roi_bounds_list: list[tuple],
+    roi_names: list[str] | None,
+    sx: float, sy: float,
+    homography: np.ndarray | None,
+    thermal_jpg_path: str,
+):
+    """캔버스 위에 다중 ROI 박스와 이름 라벨을 그립니다."""
+    h, w = img.shape[:2]
+    for i, bounds in enumerate(roi_bounds_list):
+        tx1, ty1, tx2, ty2 = bounds
+        if homography is not None:
+            corners_thermal = np.array([
+                [tx1, ty1], [tx2, ty1], [tx2, ty2], [tx1, ty2],
+            ], dtype=np.float32).reshape(-1, 1, 2)
+            projected = cv2.perspectiveTransform(corners_thermal, homography)
+            pts = projected.reshape(4, 2)
+            vx1, vy1 = int(pts[:, 0].min()), int(pts[:, 1].min())
+            vx2, vy2 = int(pts[:, 0].max()), int(pts[:, 1].max())
+        else:
+            vx1, vy1 = int(tx1 * sx), int(ty1 * sy)
+            vx2, vy2 = int(tx2 * sx), int(ty2 * sy)
+
+        vx1, vy1 = max(0, vx1), max(0, vy1)
+        vx2, vy2 = min(w, vx2), min(h, vy2)
+
+        if vx2 <= vx1 or vy2 <= vy1:
+            continue
+
+        color = (255, 200, 0)  # 주황-노랑 점선 느낌
+        cv2.rectangle(img, (vx1, vy1), (vx2, vy2), color, 1)
+
+        if roi_names and i < len(roi_names):
+            label = roi_names[i]
+            cv2.putText(img, label, (vx1 + 3, vy2 - 5), FONT, 0.4, color, 1)
 
 
 def save_overlay(

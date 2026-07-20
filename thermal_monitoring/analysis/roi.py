@@ -12,7 +12,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from ..config import load_config, RoiConfig as AppRoiConfig
+from ..config import load_config, RoiConfig as AppRoiConfig, RoiEntry
 
 # Thermal 이미지 vs .npy 해상도 차이 보정
 DISPLAY_W = load_config().display.roi_display_width
@@ -24,19 +24,32 @@ RoiConfig = AppRoiConfig
 
 @dataclass
 class RoiResult:
-    roi_thermal: np.ndarray
-    max_temp: float
-    mean_temp: float
-    hot_temp_95: float
-    roi_bounds: tuple  # (x1, y1, x2, y2) - thermal image 기준
+    roi_name: str = ""
+    roi_thermal: np.ndarray = field(default_factory=lambda: np.zeros((1, 1)))
+    max_temp: float = 0.0
+    mean_temp: float = 0.0
+    hot_temp_95: float = 0.0
+    roi_bounds: tuple = (0, 0, 0, 0)  # (x1, y1, x2, y2) - thermal image 기준
     over_temp_pixels: int = 0       # 기준 온도 초과 픽셀 수
     max_hotspot_size: int = 0       # 가장 큰 초과 클러스터 크기 (connected component)
     hotspot_centroids: list = field(default_factory=list)  # [(x, y, temp), ...] in 640x480 좌표계
 
 
 def load_roi_config() -> RoiConfig:
-    """config.json 에서 ROI 설정 불러오기 (하위 호환 wrapper)"""
+    """config.json 에서 ROI 설정 불러오기 (다중 ROI 지원)"""
     cfg = load_config()
+    rois_list = []
+    for entry in cfg.roi.rois:
+        if isinstance(entry, dict):
+            rois_list.append(entry)
+        else:
+            rois_list.append({
+                "name": entry.name if hasattr(entry, 'name') else "ROI",
+                "x1": entry.x1 if hasattr(entry, 'x1') else 0,
+                "y1": entry.y1 if hasattr(entry, 'y1') else 0,
+                "x2": entry.x2 if hasattr(entry, 'x2') else 640,
+                "y2": entry.y2 if hasattr(entry, 'y2') else 480,
+            })
     return RoiConfig(
         x1=cfg.roi.x1,
         y1=cfg.roi.y1,
@@ -45,6 +58,7 @@ def load_roi_config() -> RoiConfig:
         baseline_temp=cfg.roi.baseline_temp,
         warning_delta=cfg.roi.warning_delta,
         critical_delta=cfg.roi.critical_delta,
+        rois=rois_list,
     )
 
 
@@ -162,6 +176,64 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
         max_hotspot_size=max_cluster,
         hotspot_centroids=centroids,
     )
+
+
+def extract_all_rois_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> list[RoiResult]:
+    """
+    .npy 파일에서 모든 ROI 영역의 온도 통계를 추출.
+
+    rois 리스트가 설정되어 있으면 각 영역별로 분석하고,
+    없으면 기존 단일 ROI 방식으로 fallback.
+
+    Args:
+        npy_path: .npy 파일 경로
+        config: ROI 설정 (None이면 자동 로드)
+
+    Returns:
+        RoiResult 리스트 (rois가 없으면 길이 1)
+    """
+    if config is None:
+        config = load_roi_config()
+
+    rois = config.rois if config.rois else []
+    if not rois:
+        # 하위 호환: rois 리스트가 없으면 기존 단일 ROI 방식
+        result = extract_roi_from_npy(npy_path, config)
+        return [result]
+
+    results = []
+    for entry_data in rois:
+        if isinstance(entry_data, dict):
+            entry = RoiEntry(
+                name=entry_data.get("name", "ROI"),
+                x1=int(entry_data.get("x1", 0)),
+                y1=int(entry_data.get("y1", 0)),
+                x2=int(entry_data.get("x2", 640)),
+                y2=int(entry_data.get("y2", 480)),
+            )
+        else:
+            entry = entry_data
+
+        single_config = RoiConfig(
+            x1=entry.x1, y1=entry.y1, x2=entry.x2, y2=entry.y2,
+            baseline_temp=config.baseline_temp,
+            warning_delta=config.warning_delta,
+            critical_delta=config.critical_delta,
+        )
+        result = extract_roi_from_npy(npy_path, single_config)
+        result.roi_name = entry.name
+        results.append(result)
+
+    return results
+
+
+def _get_roi_bounds_list(config: RoiConfig) -> list[tuple]:
+    """설정에서 모든 ROI 박스 좌표 리스트를 추출."""
+    if config.rois:
+        return [(e.x1, e.y1, e.x2, e.y2) if not isinstance(e, dict)
+                else (e.get("x1", 0), e.get("y1", 0), e.get("x2", 640), e.get("y2", 480))
+                for e in config.rois]
+    return [(config.x1, config.y1, config.x2, config.y2)]
 
 
 # ------------------------------------------------------------

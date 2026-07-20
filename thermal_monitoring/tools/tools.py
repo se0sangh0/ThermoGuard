@@ -37,7 +37,7 @@ from ..capture.capture import CaptureSession
 from ..data.checking import run_check, CheckResult
 from ..data.metadata import run_metadata, MetadataResult
 from ..data.cleanup import run_cleanup, CleanupResult
-from ..analysis.roi import load_roi_config, extract_roi_from_npy, RoiResult
+from ..analysis.roi import load_roi_config, extract_roi_from_npy, RoiResult, extract_all_rois_from_npy, _get_roi_bounds_list
 from ..analysis.threshold import (
     Status, MonitorState, evaluate_with_state,
 )
@@ -863,7 +863,24 @@ class MonitoringDashboard:
     def _process_pair(self, pair: dict):
         try:
             roi_config = load_roi_config()
-            roi_result = extract_roi_from_npy(pair["npy"], roi_config)
+            roi_results = extract_all_rois_from_npy(pair["npy"], roi_config)
+            roi_result = max(roi_results, key=lambda r: r.hot_temp_95)
+            # 핫스팟 통합
+            all_hotspots = []
+            for rr in roi_results:
+                all_hotspots.extend(rr.hotspot_centroids)
+            unique_hotspots = []
+            for spot in all_hotspots:
+                is_dup = False
+                for u in unique_hotspots:
+                    if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
+                        if spot[2] > u[2]:
+                            unique_hotspots[unique_hotspots.index(u)] = spot
+                        is_dup = True
+                        break
+                if not is_dup:
+                    unique_hotspots.append(spot)
+            roi_result.hotspot_centroids = unique_hotspots
 
             new_status, do_alarm = evaluate_with_state(
                 hot_temp=roi_result.hot_temp_95,
@@ -888,6 +905,10 @@ class MonitoringDashboard:
                 mean_temp=roi_result.mean_temp,
                 hot_temp=roi_result.hot_temp_95,
                 status=new_status.value,
+                hotspot_centroids=roi_result.hotspot_centroids,
+                roi_bounds_list=_get_roi_bounds_list(roi_config),
+                roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
+            )
                 hotspot_centroids=roi_result.hotspot_centroids,
             )
 

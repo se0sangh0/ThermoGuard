@@ -20,7 +20,7 @@ from threading import Lock
 import numpy as np
 
 from ..config import load_config
-from ..analysis.roi import load_roi_config, extract_roi_from_npy
+from ..analysis.roi import load_roi_config, extract_roi_from_npy, extract_all_rois_from_npy, _get_roi_bounds_list
 from ..analysis.threshold import (
     Status,
     MonitorState,
@@ -77,7 +77,24 @@ def _process_single_pair(
     """단일 쌍 처리 — ThreadPoolExecutor에서 병렬 호출됨."""
     base = pair["base"]
     try:
-        result = extract_roi_from_npy(pair["npy"], config)
+        roi_results = extract_all_rois_from_npy(pair["npy"], config)
+        result = max(roi_results, key=lambda r: r.hot_temp_95)
+        # 핫스팟 통합
+        all_hotspots = []
+        for rr in roi_results:
+            all_hotspots.extend(rr.hotspot_centroids)
+        unique_hotspots = []
+        for spot in all_hotspots:
+            is_dup = False
+            for u in unique_hotspots:
+                if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
+                    if spot[2] > u[2]:
+                        unique_hotspots[unique_hotspots.index(u)] = spot
+                    is_dup = True
+                    break
+            if not is_dup:
+                unique_hotspots.append(spot)
+        result.hotspot_centroids = unique_hotspots
         new_status, do_alarm = evaluate_with_state(
             hot_temp=result.hot_temp_95,
             max_temp=result.max_temp,
@@ -105,6 +122,8 @@ def _process_single_pair(
                 hot_temp=result.hot_temp_95,
                 status=new_status.value,
                 hotspot_centroids=result.hotspot_centroids,
+                roi_bounds_list=_get_roi_bounds_list(config),
+                roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
             )
             overlay_path = save_overlay(base, overlay)
 

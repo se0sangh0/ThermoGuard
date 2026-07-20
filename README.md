@@ -118,7 +118,8 @@ python -c "from thermal_monitoring.config import load_config; load_config()"
 #    config.json에서 카메라IP, ROI좌표, 임계값, 쿨다운 등 모든 설정 관리
 code config.json   # 또는 nano config.json
 
-# 5. ROI 영역 설정 (GUI)
+# 5. ROI 영역 설정 (GUI, 다중 ROI 지원)
+#    마우스 드래그로 영역 지정, N키로 새 ROI 추가, Tab으로 전환
 python -m thermal_monitoring.tools.roi_selector
 
 # 6. 캘리브레이션 (Thermal ↔ RGB 매핑, 공장 설치 시 필수)
@@ -162,11 +163,15 @@ tail -f logs/app.log
     "robot_id": "Robot-01"           // 로봇 식별자 (metadata.csv, 알림)
   },
   "roi": {
-    "x1": 0, "y1": 0,               // Thermal 이미지(640x480) 기준 ROI 좌상단
-    "x2": 640, "y2": 480,           // ROI 우하단
+    "x1": 0, "y1": 0,               // Thermal 이미지(640x480) 기준 ROI 좌상단 (하위 호환)
+    "x2": 640, "y2": 480,           // ROI 우하단 (하위 호환)
     "baseline_temp": 35.0,           // 정상 기준 온도 (°C)
     "warning_delta": 15.0,           // baseline + warning = Warning 임계값
-    "critical_delta": 25.0           // baseline + critical = Critical 임계값
+    "critical_delta": 25.0,          // baseline + critical = Critical 임계값
+    "rois": [                        // 다중 ROI 영역 (비어있으면 x1~y2 폴백)
+      { "name": "Joint-1", "x1": 0, "y1": 0, "x2": 300, "y2": 250 },
+      { "name": "Joint-2", "x1": 310, "y1": 200, "x2": 640, "y2": 480 }
+    ]
   },
   "monitoring": {
     "process_interval_sec": 2.0,     // 신규 파일 스캔 주기
@@ -198,6 +203,7 @@ tail -f logs/app.log
 
 **설정 변경이 필요할 때:**
 - `config.json`을 직접 편집하거나 `python -m thermal_monitoring.tools.roi_selector`로 ROI 좌표 변경
+- **다중 ROI**: `roi_selector.py`에서 N키로 새 영역 추가, Tab으로 전환, Del로 삭제 — 모든 ROI가 자동 저장
 - 설정은 `monitor.py`, `tools.py`, `pipeline.py` 실행 시 자동으로 반영됨
 - Telegram 시크릿(BOT_TOKEN, CHAT_ID)은 `.env`에 별도 관리
 
@@ -245,7 +251,7 @@ grep "unreachable\|restored" logs/app.log
 | `metadata.py` | JPG-NPY 파일쌍 스캔 후 `metadata.csv` 자동 생성, ROI 온도 분석·판정 결과 포함 (`run_metadata()` 함수) |
 | `cleanup.py` | 오래된 데이터셋 자동 정리 — Normal 상태의 보존 기간 지난 쌍 삭제, Warning/Critical 이력 있는 데이터는 metadata.csv 참조하여 보존, 고아 NPY/JPG/오버레이는 무조건 삭제 (`run_cleanup()`, `run_cleanup_if_due()`) |
 | `calibration.py` | OpenCV GUI로 Thermal ↔ RGB 대응점 지정, Homography 행렬 계산 |
-| `roi_selector.py` | Thermal 이미지에 마우스 드래그로 ROI 지정, `config.json` 자동 저장 |
+| `roi_selector.py` | GUI ROI 영역 설정 도구 — **다중 ROI 지원** (N키 추가, Tab 전환, Del 삭제, 색상 구분), `config.json` 자동 저장 |
 
 ### 분석 파이프라인
 
