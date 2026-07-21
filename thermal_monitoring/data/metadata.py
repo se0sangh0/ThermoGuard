@@ -20,7 +20,7 @@ from ..analysis.threshold import evaluate_threshold
 from ..config import load_config
 from ..logger import get_logger
 
-_log = get_logger("data.metadata")
+_logger = get_logger("data.metadata")
 
 SAVE_DIR = load_config().paths.dataset_dir
 

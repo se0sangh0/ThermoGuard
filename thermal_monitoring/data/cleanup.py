@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 from ..logger import get_logger
 
-_log = get_logger("data.cleanup")
+_logger = get_logger("data.cleanup")
 
 _RELATIVE_SAVE_DIR = "thermal_dataset"
 _DEFAULT_RETENTION_DAYS = 7
@@ -124,7 +124,7 @@ def run_cleanup(
             save_dir = _RELATIVE_SAVE_DIR
 
     if not os.path.isdir(save_dir):
-        _log.info("Skip cleanup: '%s' not found", save_dir)
+        _logger.info("Skip cleanup: '%s' not found", save_dir)
         _log(f"[cleanup] '{save_dir}' not found — skipping.", log_callback, result.messages)
         return result
 
@@ -162,7 +162,7 @@ def run_cleanup(
         result.preserved_alarms = old_alarm_skipped
         _log(f"[cleanup] Skipped {old_alarm_skipped} expired pair(s) with Warning/Critical history",
              log_callback, result.messages)
-        _log.info("cleanup: skipped %d expired pair(s) with alarm history", old_alarm_skipped)
+        _logger.info("cleanup: skipped %d expired pair(s) with alarm history", old_alarm_skipped)
 
     if old_normal:
         _log(f"[cleanup] Removing {len(old_normal)} expired Normal pair(s)...", log_callback, result.messages)
