@@ -1,333 +1,262 @@
-"""Thermal-RGB 대응점 기반 Homography 캘리브레이션 GUI."""
+"""
+calibration.py - Thermal-RGB Homography 캘리브레이션 도구
 
-from __future__ import annotations
+Thermal 이미지와 RGB 이미지에서 대응점을 선택하여 Homography 행렬을 계산합니다.
+계산된 행렬은 thermal_to_rgb.npy로 저장됩니다.
 
-import glob
-import os
-import sys
-import tkinter as tk
-from pathlib import Path
-from tkinter import messagebox, ttk
+조작:
+    마우스 클릭 (좌우 교차) : Thermal → RGB 대응점 선택
+    S             : 현재까지의 점으로 Homography 계산 및 저장
+    R             : 모든 선택점 초기화
+    Z             : 마지막 선택점 취소 (Undo)
+    ESC / Q       : 종료 (변경사항 저장 안 함)
+"""
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+import sys
+import os
+import glob
 
 from ..config import load_config
 
+thermal_pts = []
+rgb_pts = []
+pair_state = "thermal"  # "thermal" or "rgb"
+t_mouse_x, t_mouse_y = -1, -1  # Thermal 창 마우스 (원본 해상도)
+r_mouse_x, r_mouse_y = -1, -1  # RGB 창 마우스 (원본 해상도)
 
-class CalibrationDialog:
-    """두 영상을 한 창에서 대응점으로 연결하는 버튼 기반 도구."""
+ZOOM_SIZE = 80      # 확대경 영역 크기 (px)
+ZOOM_SCALE = 3.0    # 확대 배율
 
-    MAX_W = 590
-    MAX_H = 470
-    MAX_MEAN_ERROR_PX = 5.0
-    MAX_POINT_ERROR_PX = 10.0
 
-    def __init__(self, thermal_path: str, rgb_path: str, output_path: str):
-        self.thermal_path = thermal_path
-        self.rgb_path = rgb_path
-        self.output_path = output_path
-        self.thermal_pts: list[list[int]] = []
-        self.rgb_pts: list[list[int]] = []
-        self.next_side = "thermal"
-        self.saved = False
+def draw_crosshair(img, x, y, color, size=4, thickness=1, gap=2):
+    """정밀 마커: 십자선 + 얇은 원 (중심점이 빈 공간으로 보임)"""
+    cv2.line(img, (x - size, y), (x - gap, y), color, thickness)
+    cv2.line(img, (x + gap, y), (x + size, y), color, thickness)
+    cv2.line(img, (x, y - size), (x, y - gap), color, thickness)
+    cv2.line(img, (x, y + gap), (x, y + size), color, thickness)
+    cv2.circle(img, (x, y), size, color, 1)
 
-        thermal_bgr = cv2.imread(thermal_path)
-        rgb_bgr = cv2.imread(rgb_path)
-        if thermal_bgr is None:
-            raise FileNotFoundError(f"Thermal 이미지를 불러올 수 없습니다: {thermal_path}")
-        if rgb_bgr is None:
-            raise FileNotFoundError(f"가시광 이미지를 불러올 수 없습니다: {rgb_path}")
 
-        self.thermal_rgb = cv2.cvtColor(thermal_bgr, cv2.COLOR_BGR2RGB)
-        self.visible_rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-
-        parent = tk._default_root
-        if parent is None:
-            self.window = tk.Tk()
-            self._owns_root = True
+def click_thermal(event, x, y, flags, param):
+    global pair_state, t_mouse_x, t_mouse_y
+    if event == cv2.EVENT_MOUSEMOVE or event == cv2.EVENT_LBUTTONDOWN:
+        t_mouse_x, t_mouse_y = x, y
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if pair_state == "thermal":
+            thermal_pts.append([x, y])
+            pair_state = "rgb"
+            print(f"[{len(thermal_pts)}] Thermal : {x}, {y} -> RGB 클릭 대기")
         else:
-            self.window = tk.Toplevel(parent)
-            self._owns_root = False
-            self.window.transient(parent)
+            print("[경고] RGB 포인트를 먼저 클릭하세요.")
 
-        self.window.title("Thermal-RGB 캘리브레이션")
-        self.window.configure(bg="#f3f6f9")
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
-        self._build_ui()
-        self._bind_shortcuts()
-        self._redraw()
-
-    @staticmethod
-    def _fit_image(array: np.ndarray, max_w: int, max_h: int):
-        h, w = array.shape[:2]
-        scale = min(max_w / w, max_h / h, 1.0)
-        size = (max(1, int(w * scale)), max(1, int(h * scale)))
-        image = Image.fromarray(array).resize(size, Image.Resampling.LANCZOS)
-        return image, scale
-
-    def _build_ui(self):
-        header = tk.Frame(self.window, bg="#0b2038", padx=18, pady=12)
-        header.pack(fill="x")
-        tk.Label(header, text="Thermal-RGB 위치 보정", bg="#0b2038", fg="white",
-                 font=("맑은 고딕", 16, "bold")).pack(anchor="w")
-        tk.Label(header, text="동일한 위치를 Thermal → 가시광 순서로 클릭하세요. 최소 4쌍이 필요합니다.",
-                 bg="#0b2038", fg="#c7d6e5", font=("맑은 고딕", 10)).pack(anchor="w", pady=(3, 0))
-
-        images = tk.Frame(self.window, bg="#f3f6f9", padx=12, pady=12)
-        images.pack(fill="both", expand=True)
-
-        self.thermal_canvas, self.thermal_photo, self.thermal_scale = self._image_panel(
-            images, "① Thermal 이미지", self.thermal_rgb, "thermal")
-        self.visible_canvas, self.visible_photo, self.visible_scale = self._image_panel(
-            images, "② 가시광 이미지", self.visible_rgb, "rgb")
-
-        status_frame = tk.Frame(self.window, bg="white", highlightbackground="#d9e2ea",
-                                highlightthickness=1, padx=14, pady=9)
-        status_frame.pack(fill="x", padx=12, pady=(0, 8))
-        self.status_var = tk.StringVar()
-        tk.Label(status_frame, textvariable=self.status_var, bg="white", fg="#1f2e3d",
-                 font=("맑은 고딕", 10, "bold")).pack(side="left")
-        self.count_var = tk.StringVar()
-        tk.Label(status_frame, textvariable=self.count_var, bg="white", fg="#647587",
-                 font=("맑은 고딕", 10)).pack(side="right")
-
-        buttons = tk.Frame(self.window, bg="#f3f6f9", padx=12, pady=(0, 12))
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="종료  (Esc)", command=self.close).pack(side="right", padx=4)
-        ttk.Button(buttons, text="전체 리셋  (R)", command=self.reset).pack(side="right", padx=4)
-        ttk.Button(buttons, text="마지막 점 취소  (Z)", command=self.undo).pack(side="right", padx=4)
-        ttk.Button(buttons, text="저장  (Ctrl+S)", command=self.save).pack(side="right", padx=4)
-
-    def _image_panel(self, parent, title: str, array: np.ndarray, side: str):
-        panel = tk.Frame(parent, bg="white", highlightbackground="#d9e2ea", highlightthickness=1)
-        panel.pack(side="left", fill="both", expand=True, padx=(0, 6) if side == "thermal" else (6, 0))
-        tk.Label(panel, text=title, bg="white", fg="#1f2e3d",
-                 font=("맑은 고딕", 11, "bold")).pack(anchor="w", padx=10, pady=8)
-        pil, scale = self._fit_image(array, self.MAX_W, self.MAX_H)
-        photo = ImageTk.PhotoImage(pil)
-        canvas = tk.Canvas(panel, width=pil.width, height=pil.height, bg="#151b22",
-                           highlightthickness=0, cursor="cross")
-        canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        canvas.create_image(0, 0, image=photo, anchor="nw", tags="base")
-        canvas.bind("<Button-1>", lambda event, selected=side: self._click(selected, event.x, event.y))
-        return canvas, photo, scale
-
-    def _bind_shortcuts(self):
-        self.window.bind("<Control-s>", lambda _event: self.save())
-        self.window.bind("<Control-S>", lambda _event: self.save())
-        self.window.bind("z", lambda _event: self.undo())
-        self.window.bind("Z", lambda _event: self.undo())
-        self.window.bind("r", lambda _event: self.reset())
-        self.window.bind("R", lambda _event: self.reset())
-        self.window.bind("<Escape>", lambda _event: self.close())
-
-    def _click(self, side: str, display_x: int, display_y: int):
-        if side != self.next_side:
-            expected = "Thermal" if self.next_side == "thermal" else "가시광"
-            self.status_var.set(f"순서 확인: 먼저 {expected} 이미지의 대응점을 선택하세요.")
-            return
-
-        scale = self.thermal_scale if side == "thermal" else self.visible_scale
-        point = [round(display_x / scale), round(display_y / scale)]
-        if side == "thermal":
-            self.thermal_pts.append(point)
-            self.next_side = "rgb"
+def click_rgb(event, x, y, flags, param):
+    global pair_state, r_mouse_x, r_mouse_y
+    if event == cv2.EVENT_MOUSEMOVE or event == cv2.EVENT_LBUTTONDOWN:
+        r_mouse_x, r_mouse_y = x, y
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if pair_state == "rgb":
+            rgb_pts.append([x, y])
+            pair_state = "thermal"
+            print(f"[{len(rgb_pts)}] RGB : {x}, {y} -> Thermal 클릭 대기")
         else:
-            self.rgb_pts.append(point)
-            self.next_side = "thermal"
-        self._redraw()
-
-    def _redraw(self):
-        self._draw_points(self.thermal_canvas, self.thermal_pts, self.thermal_scale)
-        self._draw_points(self.visible_canvas, self.rgb_pts, self.visible_scale)
-        expected = "Thermal 이미지 클릭" if self.next_side == "thermal" else "가시광 이미지 클릭"
-        self.status_var.set(f"다음 작업: {expected}")
-        complete = min(len(self.thermal_pts), len(self.rgb_pts))
-        pending = " · Thermal 점 선택 후 가시광 대기" if len(self.thermal_pts) != len(self.rgb_pts) else ""
-        self.count_var.set(f"완성된 대응점 {complete}쌍 / 최소 4쌍{pending}")
-
-    @staticmethod
-    def _draw_points(canvas: tk.Canvas, points: list[list[int]], scale: float):
-        canvas.delete("point")
-        for index, (x, y) in enumerate(points, start=1):
-            dx, dy = x * scale, y * scale
-            canvas.create_oval(dx - 7, dy - 7, dx + 7, dy + 7,
-                               fill="#ff4040", outline="white", width=2, tags="point")
-            canvas.create_text(dx + 13, dy - 12, text=str(index), fill="#00ff55",
-                               font=("맑은 고딕", 11, "bold"), tags="point")
-
-    def undo(self):
-        if self.next_side == "rgb" and self.thermal_pts:
-            self.thermal_pts.pop()
-            self.next_side = "thermal"
-        elif self.next_side == "thermal" and self.rgb_pts:
-            self.rgb_pts.pop()
-            self.next_side = "rgb"
-        else:
-            self.status_var.set("취소할 선택점이 없습니다.")
-            return
-        self._redraw()
-
-    def reset(self):
-        if not self.thermal_pts and not self.rgb_pts:
-            self.status_var.set("초기화할 선택점이 없습니다.")
-            return
-        if messagebox.askyesno("전체 리셋", "선택한 모든 대응점을 삭제할까요?", parent=self.window):
-            self.thermal_pts.clear()
-            self.rgb_pts.clear()
-            self.next_side = "thermal"
-            self._redraw()
-
-    def _legacy_save(self):
-        if len(self.thermal_pts) != len(self.rgb_pts):
-            messagebox.showwarning("저장할 수 없음", "Thermal과 가시광 대응점을 한 쌍으로 완성하세요.", parent=self.window)
-            return
-        if len(self.thermal_pts) < 4:
-            messagebox.showwarning("저장할 수 없음", f"최소 4쌍이 필요합니다. 현재 {len(self.thermal_pts)}쌍입니다.", parent=self.window)
-            return
-
-        thermal = np.asarray(self.thermal_pts, dtype=np.float32)
-        visible = np.asarray(self.rgb_pts, dtype=np.float32)
-        matrix, _ = cv2.findHomography(thermal, visible)
-        if matrix is None:
-            messagebox.showerror("계산 실패", "Homography를 계산할 수 없습니다. 점이 한 직선에 몰리지 않도록 다시 선택하세요.", parent=self.window)
-            return
-
-        output = Path(self.output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(output, matrix)
-        projected = cv2.perspectiveTransform(thermal.reshape(-1, 1, 2), matrix).reshape(-1, 2)
-        error = np.linalg.norm(projected - visible, axis=1)
-        self.saved = True
-        messagebox.showinfo(
-            "캘리브레이션 저장 완료",
-            f"대응점 {len(thermal)}쌍을 저장했습니다.\n평균 재투영 오차: {error.mean():.2f}px\n저장 위치: {output}",
-            parent=self.window,
-        )
-        self.window.destroy()
-
-    def save(self):
-        """Validate reprojection error before saving the homography matrix."""
-        if len(self.thermal_pts) != len(self.rgb_pts):
-            messagebox.showwarning(
-                "저장할 수 없음",
-                "Thermal과 가시광 대응점을 같은 개수로 선택하세요.",
-                parent=self.window,
-            )
-            return
-        if len(self.thermal_pts) < 4:
-            messagebox.showwarning(
-                "저장할 수 없음",
-                f"최소 4쌍의 대응점이 필요합니다. 현재 {len(self.thermal_pts)}쌍입니다.",
-                parent=self.window,
-            )
-            return
-
-        thermal = np.asarray(self.thermal_pts, dtype=np.float32)
-        visible = np.asarray(self.rgb_pts, dtype=np.float32)
-        matrix, _ = cv2.findHomography(thermal, visible)
-        if matrix is None:
-            messagebox.showerror(
-                "캘리브레이션 계산 실패",
-                "Homography를 계산할 수 없습니다. 대응점이 한쪽에 몰리거나 일직선이 되지 않도록 다시 선택하세요.",
-                parent=self.window,
-            )
-            return
-
-        projected = cv2.perspectiveTransform(
-            thermal.reshape(-1, 1, 2), matrix
-        ).reshape(-1, 2)
-        errors = np.linalg.norm(projected - visible, axis=1)
-        mean_error = float(errors.mean())
-        max_error = float(errors.max())
-        rmse = float(np.sqrt(np.mean(np.square(errors))))
-        accepted = (
-            mean_error <= self.MAX_MEAN_ERROR_PX
-            and max_error <= self.MAX_POINT_ERROR_PX
-        )
-        metrics = (
-            f"대응점: {len(thermal)}쌍\n"
-            f"평균 오차: {mean_error:.2f}px\n"
-            f"최대 오차: {max_error:.2f}px\n"
-            f"RMSE: {rmse:.2f}px\n\n"
-            f"허용 기준: 평균 {self.MAX_MEAN_ERROR_PX:.1f}px 이하, "
-            f"최대 {self.MAX_POINT_ERROR_PX:.1f}px 이하"
-        )
-
-        if not accepted:
-            messagebox.showwarning(
-                "캘리브레이션 보정 필요",
-                "캘리브레이션 오차가 허용 기준보다 큽니다.\n"
-                "현재 결과는 저장하지 않았습니다.\n\n"
-                f"{metrics}\n\n"
-                "[전체 리셋] 버튼을 누른 뒤, 특징이 분명하고 화면 전체에 "
-                "고르게 분포된 대응점을 선택하여 다시 진행하세요.",
-                parent=self.window,
-            )
-            self.status_var.set(
-                f"보정 필요 - 평균 {mean_error:.2f}px / 최대 {max_error:.2f}px. "
-                "전체 리셋 후 다시 진행하세요."
-            )
-            return
-
-        output = Path(self.output_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(output, matrix)
-        self.saved = True
-        messagebox.showinfo(
-            "캘리브레이션 정상 완료",
-            "오차가 허용 기준 이내여서 보정값을 저장했습니다.\n\n"
-            f"{metrics}\n\n저장 위치: {output}",
-            parent=self.window,
-        )
-        self.window.destroy()
-
-    def close(self):
-        if (self.thermal_pts or self.rgb_pts) and not self.saved:
-            if not messagebox.askyesno("저장하지 않고 종료", "선택한 대응점을 저장하지 않고 종료할까요?", parent=self.window):
-                return
-        self.window.destroy()
-
-    def show(self):
-        self.window.update_idletasks()
-        x = max(0, (self.window.winfo_screenwidth() - self.window.winfo_reqwidth()) // 2)
-        y = max(0, (self.window.winfo_screenheight() - self.window.winfo_reqheight()) // 2)
-        self.window.geometry(f"+{x}+{y}")
-        if self._owns_root:
-            self.window.mainloop()
-        else:
-            self.window.grab_set()
-            self.window.wait_window()
-        return self.saved
+            print("[경고] Thermal 포인트를 먼저 클릭하세요.")
 
 
-def _resolve_paths(thermal_path=None, rgb_path=None):
-    cfg = load_config()
-    if thermal_path:
-        return thermal_path, rgb_path or os.path.splitext(thermal_path)[0] + "_visual.jpg", cfg
-    if len(sys.argv) >= 2:
-        thermal = sys.argv[1]
-        visible = sys.argv[2] if len(sys.argv) >= 3 else os.path.splitext(thermal)[0] + "_visual.jpg"
-        return thermal, visible, cfg
-    thermal_files = sorted(p for p in glob.glob(os.path.join(cfg.paths.dataset_dir, "*.jpg")) if "_visual" not in p)
-    if not thermal_files:
-        return None, None, cfg
-    thermal = thermal_files[-1]
-    return thermal, os.path.splitext(thermal)[0] + "_visual.jpg", cfg
+def resize_for_display(img, width):
+    h, w = img.shape[:2]
+    height = int(h * width / w)
+    return cv2.resize(img, (width, height))
 
 
 def run_calibration(thermal_path=None, rgb_path=None):
-    thermal_path, rgb_path, cfg = _resolve_paths(thermal_path, rgb_path)
-    if not thermal_path or not os.path.isfile(thermal_path):
-        messagebox.showerror("캘리브레이션", "Thermal 이미지를 찾을 수 없습니다.")
-        return False
-    if not rgb_path or not os.path.isfile(rgb_path):
-        messagebox.showerror("캘리브레이션", "대응하는 가시광 이미지를 찾을 수 없습니다.")
-        return False
-    return CalibrationDialog(thermal_path, rgb_path, cfg.paths.homography_path).show()
+    """GUI 또는 CLI에서 호출 가능한 캘리브레이션 진입점."""
+    global thermal_pts, rgb_pts, pair_state, t_mouse_x, t_mouse_y, r_mouse_x, r_mouse_y
+    thermal_pts.clear()
+    rgb_pts.clear()
+    pair_state = "thermal"
+    t_mouse_x = t_mouse_y = r_mouse_x = r_mouse_y = -1
+
+    cfg = load_config()
+    DATASET_DIR = cfg.paths.dataset_dir
+    DISPLAY_WIDTH = cfg.display.display_width
+
+    if thermal_path is None:
+        if len(sys.argv) >= 3:
+            thermal_path = sys.argv[1]
+            rgb_path = sys.argv[2]
+        elif len(sys.argv) == 2:
+            thermal_path = sys.argv[1]
+            rgb_path = os.path.splitext(thermal_path)[0] + "_visual.jpg"
+        else:
+            jpg_files = sorted(glob.glob(os.path.join(DATASET_DIR, "*.jpg")))
+            visual_files = [f for f in jpg_files if "_visual" in f]
+            thermal_files = [f for f in jpg_files if "_visual" not in f]
+            if thermal_files:
+                thermal_path = thermal_files[-1]
+                matching_visual = os.path.splitext(thermal_path)[0] + "_visual.jpg"
+                rgb_path = matching_visual if matching_visual in visual_files else (visual_files[-1] if visual_files else None)
+
+    thermal = cv2.imread(thermal_path) if thermal_path else None
+    rgb = cv2.imread(rgb_path) if rgb_path else None
+
+    if thermal is None:
+        print(f"Thermal 이미지를 불러올 수 없습니다: {thermal_path}")
+        return
+    if rgb is None:
+        print(f"RGB 이미지를 불러올 수 없습니다: {rgb_path}")
+        return
+
+    print(f"Thermal: {thermal_path}")
+    print(f"RGB: {rgb_path}")
+    print("  Click alternating: Thermal -> RGB -> Thermal -> ...")
+    print("  S = compute & save   R = reset   Z = undo   ESC/Q = quit without saving")
+
+    cv2.namedWindow("Thermal")
+    cv2.namedWindow("RGB")
+
+    thermal_disp = resize_for_display(thermal, DISPLAY_WIDTH)
+    rgb_disp = resize_for_display(rgb, DISPLAY_WIDTH)
+
+    thermal_scale = thermal.shape[1] / thermal_disp.shape[1]
+    rgb_scale = rgb.shape[1] / rgb_disp.shape[1]
+
+    def make_scaled_callback(original_callback, scale):
+        def wrapper(event, x, y, flags, param):
+            return original_callback(event, int(x * scale), int(y * scale), flags, param)
+        return wrapper
+
+    cv2.setMouseCallback("Thermal", make_scaled_callback(click_thermal, thermal_scale))
+    cv2.setMouseCallback("RGB", make_scaled_callback(click_rgb, rgb_scale))
+
+    while True:
+        t = thermal_disp.copy()
+        r = rgb_disp.copy()
+
+        # ── 마커: 십자선 + 얇은 원 (중심점 보임) ──
+        for i, pt in enumerate(thermal_pts):
+            dp = (int(pt[0] / thermal_scale), int(pt[1] / thermal_scale))
+            draw_crosshair(t, *dp, (0, 0, 255), size=4)
+            cv2.putText(t, str(i + 1), (dp[0] + 6, dp[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        for i, pt in enumerate(rgb_pts):
+            dp = (int(pt[0] / rgb_scale), int(pt[1] / rgb_scale))
+            draw_crosshair(r, *dp, (0, 0, 255), size=4)
+            cv2.putText(r, str(i + 1), (dp[0] + 6, dp[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # ── 확대경 (우하단, 현재 마우스 위치 주변) ──
+        # Thermal 확대경
+        if t_mouse_x >= 0 and t_mouse_y >= 0:
+            hs = ZOOM_SIZE // 2
+            ox, oy = t_mouse_x, t_mouse_y
+            x1, y1 = max(0, ox - hs), max(0, oy - hs)
+            x2, y2 = min(thermal.shape[1], ox + hs), min(thermal.shape[0], oy + hs)
+            if x2 > x1 and y2 > y1:
+                roi = thermal[y1:y2, x1:x2]
+                zoomed = cv2.resize(roi, None, fx=ZOOM_SCALE, fy=ZOOM_SCALE,
+                                    interpolation=cv2.INTER_NEAREST)
+                cx = int((ox - x1) * ZOOM_SCALE)
+                cy = int((oy - y1) * ZOOM_SCALE)
+                draw_crosshair(zoomed, cx, cy, (0, 255, 255), size=3, thickness=1, gap=1)
+                zh, zw = zoomed.shape[:2]
+                margin = 8
+                px = t.shape[1] - zw - margin
+                py = t.shape[0] - zh - margin
+                if px >= 0 and py >= 0:
+                    zoomed = cv2.rectangle(zoomed, (0, 0), (zw - 1, zh - 1), (255, 255, 0), 1)
+                    t[py:py + zh, px:px + zw] = zoomed
+
+        # RGB 확대경
+        if r_mouse_x >= 0 and r_mouse_y >= 0:
+            hs = ZOOM_SIZE // 2
+            ox, oy = r_mouse_x, r_mouse_y
+            x1, y1 = max(0, ox - hs), max(0, oy - hs)
+            x2, y2 = min(rgb.shape[1], ox + hs), min(rgb.shape[0], oy + hs)
+            if x2 > x1 and y2 > y1:
+                roi = rgb[y1:y2, x1:x2]
+                zoomed = cv2.resize(roi, None, fx=ZOOM_SCALE, fy=ZOOM_SCALE,
+                                    interpolation=cv2.INTER_NEAREST)
+                cx = int((ox - x1) * ZOOM_SCALE)
+                cy = int((oy - y1) * ZOOM_SCALE)
+                draw_crosshair(zoomed, cx, cy, (0, 255, 255), size=3, thickness=1, gap=1)
+                zh, zw = zoomed.shape[:2]
+                margin = 8
+                px = r.shape[1] - zw - margin
+                py = r.shape[0] - zh - margin
+                if px >= 0 and py >= 0:
+                    zoomed = cv2.rectangle(zoomed, (0, 0), (zw - 1, zh - 1), (255, 255, 0), 1)
+                    r[py:py + zh, px:px + zw] = zoomed
+
+        cv2.putText(t, "Thermal | S: save  R: reset  Z: undo  Q: quit",
+                    (10, t.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(r, "RGB | S: save  R: reset  Z: undo  Q: quit",
+                    (10, r.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        cv2.imshow("Thermal", t)
+        cv2.imshow("RGB", r)
+
+        key = cv2.waitKey(1)
+
+        if key == ord('q') or key == 27:
+            print("Quit without saving.")
+            cv2.destroyAllWindows()
+            return
+        elif key == ord('r'):
+            thermal_pts.clear()
+            rgb_pts.clear()
+            pair_state = "thermal"
+            print("[Reset] All points cleared.")
+        elif key == ord('z'):
+            if pair_state == "rgb" and thermal_pts:
+                thermal_pts.pop()
+                pair_state = "thermal"
+                print(f"[Undo] Last thermal point removed ({len(thermal_pts)} remaining)")
+            elif pair_state == "thermal" and rgb_pts:
+                rgb_pts.pop()
+                pair_state = "rgb"
+                print(f"[Undo] Last RGB point removed ({len(rgb_pts)} remaining)")
+            else:
+                print("[Undo] Nothing to undo.")
+        elif key == ord('s'):
+            if len(thermal_pts) < 4:
+                print(f"[Save] Need at least 4 point pairs, currently have {len(thermal_pts)}")
+            elif len(thermal_pts) != len(rgb_pts):
+                print(f"[Save] Point count mismatch: thermal={len(thermal_pts)} vs rgb={len(rgb_pts)}")
+            else:
+                break
+
+    cv2.destroyAllWindows()
+
+    thermal_arr = np.array(thermal_pts, dtype=np.float32)
+    rgb_arr = np.array(rgb_pts, dtype=np.float32)
+
+    if len(thermal_arr) != len(rgb_arr):
+        print(f"Thermal({len(thermal_arr)})과 RGB({len(rgb_arr)}) 포인트 개수가 일치하지 않습니다.")
+    elif len(thermal_arr) < 4:
+        print(f"최소 4개의 대응점이 필요합니다. 현재: {len(thermal_arr)}개")
+    else:
+        H, _ = cv2.findHomography(thermal_arr, rgb_arr)
+        if H is None:
+            print("Homography 계산 실패 (점들이 동일선상에 있을 수 있습니다).")
+        else:
+            output_path = cfg.paths.homography_path
+            np.save(output_path, H)
+            print(f"Homography saved: {output_path}")
+            print("Homography matrix:")
+            print(H)
+            projected = cv2.perspectiveTransform(thermal_arr.reshape(-1, 1, 2), H)
+            error = np.linalg.norm(projected.reshape(-1, 2) - rgb_arr, axis=1)
+            print(f"평균 재투영 오차: {error.mean():.4f}")
+            print(f"최대 재투영 오차: {error.max():.4f}")
+            for i, e in enumerate(error):
+                print(i, e)
+
+            pt = np.array([[[320, 240]]], dtype=np.float32)
+            rgb_pt = cv2.perspectiveTransform(pt, H)
+            print(rgb_pt)
 
 
 if __name__ == "__main__":
