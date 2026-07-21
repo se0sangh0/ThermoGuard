@@ -33,6 +33,9 @@ ZOOM_SCALE = 3.0    # 확대 배율
 MAX_MEAN_ERROR_PX = 5.0
 MAX_POINT_ERROR_PX = 10.0
 
+class CalibrationDialog:
+    """Thermal-RGB 대응점을 선택하고 오차를 검증하는 GUI."""
+
     MAX_W = 590
     MAX_H = 470
     MAX_MEAN_ERROR_PX = 5.0
