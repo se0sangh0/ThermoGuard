@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +20,7 @@ from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
 from ..analysis.overlay import create_overlay
-from ..analysis.roi import RoiResult, extract_roi_from_npy, load_roi_config
+from ..analysis.roi import RoiResult, extract_roi_from_npy, load_roi_config, extract_all_rois_from_npy, _get_roi_bounds_list
 from ..analysis.threshold import MonitorState, Status, evaluate_with_state
 from ..capture.capture import CaptureSession
 from ..capture.thermal_utils import extract_from_jpeg
@@ -73,6 +75,11 @@ class ProductDashboard:
         self.thermal_photo = None
         self.events: list[tuple] = []
         self.operating_logs: list[tuple[str, str, str, str]] = []
+
+        self._analysis_executor = ThreadPoolExecutor(max_workers=1)
+        self._analysis_running = False
+        self._analysis_pending = False
+        self._analysis_generation = 0
 
         self._configure_style()
         self._build_ui()
@@ -263,57 +270,168 @@ class ProductDashboard:
         if self.lifecycle != "running":
             return
         self.timer_id = None
+        self._schedule_analysis()
+        self._update_metric_text()
+        self._schedule_refresh()
+
+    def _schedule_analysis(self):
+        if self._analysis_running:
+            self._analysis_pending = True
+            return
+        self._analysis_running = True
+        self._analysis_pending = False
+        gen = self._analysis_generation + 1
+        self._analysis_generation = gen
+        self._analysis_executor.submit(self._run_analysis_worker, gen)
+
+    def _run_analysis_worker(self, generation: int):
         try:
             pair = self._latest_pair()
-            if pair:
-                self._process_pair(pair)
+            if not pair:
+                self.root.after(0, lambda: self._finish_analysis(generation))
+                return
+            result = self._process_pair_to_dict(pair)
+            self.root.after(0, lambda: self._apply_analysis_result(result, generation))
         except Exception as exc:
-            self.metrics.exception_count += 1
-            self._add_operating_log("시퀀스", "예외 처리", str(exc))
-            self._append_event("Error", 0.0, f"분석 예외: {exc}")
-        finally:
-            self._update_metric_text()
-            self._schedule_refresh()
+            message = str(exc)
+            self.root.after(
+                0,
+                lambda msg=message: self._handle_analysis_error(msg, generation),
+            )
+
+    def _handle_analysis_error(self, message: str, generation: int):
+        """Worker 오류를 Tk 메인 스레드에서 로그와 화면에 반영한다."""
+        if self.lifecycle != "running":
+            self._finish_analysis(generation)
+            return
+        self.metrics.exception_count += 1
+        self._add_operating_log("시퀀스", "예외 처리", message)
+        self._append_event("Error", 0.0, f"분석 예외: {message}")
+        self._update_metric_text()
+        self._finish_analysis(generation)
 
     def _latest_pair(self):
+        """Return the newest thermal, visual and NPY paths for analysis."""
         dataset = Path(self.cfg.paths.dataset_dir)
         if not dataset.exists():
             return None
-        thermal_files = sorted(p for p in dataset.glob("*.jpg") if "_visual" not in p.name)
+
+        thermal_files = sorted(
+            path for path in dataset.glob("*.jpg")
+            if "_visual" not in path.name
+        )
         if not thermal_files:
             return None
-        thermal = thermal_files[-1]; base = thermal.stem
+
+        thermal = thermal_files[-1]
+        base = thermal.stem
         visual = dataset / f"{base}_visual.jpg"
         npy = dataset / f"{base}_thermal.npy"
         if not npy.exists():
-            matrix, _ = extract_from_jpeg(str(thermal)); np.save(npy, matrix)
+            matrix, _ = extract_from_jpeg(str(thermal))
+            np.save(npy, matrix)
         return base, thermal, visual if visual.exists() else None, npy
 
-    def _process_pair(self, pair):
+    def _process_pair_to_dict(self, pair) -> dict:
         base, thermal, visual, npy = pair
         roi_cfg = load_roi_config()
-        result = extract_roi_from_npy(str(npy), roi_cfg)
-        status, alarm = evaluate_with_state(result.hot_temp_95, result.max_temp, result.mean_temp,
-                                             roi_cfg.baseline_temp, roi_cfg.warning_delta,
-                                             roi_cfg.critical_delta, self.state,
-                                             result.over_temp_pixels, result.max_hotspot_size)
-        previous = self.state.status; self.state.status = status
+        roi_results = extract_all_rois_from_npy(str(npy), roi_cfg)
+        roi_result = max(roi_results, key=lambda r: r.hot_temp_95 if r.hot_temp_95 is not None else -1)
+
+        all_hotspots = []
+        for rr in roi_results:
+            all_hotspots.extend(rr.hotspot_centroids)
+        unique_hotspots = []
+        for spot in all_hotspots:
+            is_dup = False
+            for u in unique_hotspots:
+                if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
+                    if spot[2] > u[2]:
+                        unique_hotspots[unique_hotspots.index(u)] = spot
+                    is_dup = True
+                    break
+            if not is_dup:
+                unique_hotspots.append(spot)
+        roi_result.hotspot_centroids = unique_hotspots
+
+        status, alarm = evaluate_with_state(
+            roi_result.hot_temp_95, roi_result.max_temp, roi_result.mean_temp,
+            roi_cfg.baseline_temp, roi_cfg.warning_delta,
+            roi_cfg.critical_delta, self.state,
+            roi_result.over_temp_pixels, roi_result.max_hotspot_size,
+        )
+
+        overlay = create_overlay(
+            str(thermal), str(visual) if visual else "", roi_result.roi_bounds,
+            roi_result.max_temp, roi_result.mean_temp, roi_result.hot_temp_95,
+            status.value, hotspot_centroids=roi_result.hotspot_centroids,
+            roi_bounds_list=_get_roi_bounds_list(roi_cfg),
+            roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
+        )
+
+        visual_img = None
+        if visual and visual.exists():
+            visual_img = cv2.imread(str(visual))
+        elif thermal.exists():
+            visual_img = cv2.imread(str(thermal))
+
+        return {
+            "base": base, "overlay": overlay, "visual_img": visual_img,
+            "max_temp": roi_result.max_temp, "mean_temp": roi_result.mean_temp,
+            "hot_temp_95": roi_result.hot_temp_95,
+            "hotspot_count": len(roi_result.hotspot_centroids),
+            "status": status, "alarm": alarm,
+            "roi_bounds": roi_result.roi_bounds,
+            "roi_results": roi_results,
+        }
+
+    def _apply_analysis_result(self, result: dict, generation: int):
+        if self.lifecycle != "running":
+            self._finish_analysis(generation)
+            return
+        if generation < self._analysis_generation:
+            return
+
+        status = result["status"]
+        previous = self.state.status
+        self.state.status = status
         if status != Status.NORMAL and previous == Status.NORMAL:
             self.metrics.anomaly_today += 1
-            self._append_event(status.value, result.max_temp, "확인 필요")
+            self._append_event(status.value, result["max_temp"], "확인 필요")
 
-        overlay = create_overlay(str(thermal), str(visual) if visual else "", result.roi_bounds,
-                                 result.max_temp, result.mean_temp, result.hot_temp_95,
-                                 status.value, hotspot_centroids=result.hotspot_centroids)
-        visual_img = cv2.imread(str(visual)) if visual else cv2.imread(str(thermal))
-        if visual_img is not None:
-            self._draw_visible_roi(visual_img, result.roi_bounds)
-        self._show_image(self.thermal_label, overlay, "thermal")
-        self._show_image(self.visual_label, visual_img, "visual")
-        self.latest_result = result; self.latest_status = status; self.last_update = datetime.now()
+        self._show_image(self.thermal_label, result["overlay"], "thermal")
+        if result["visual_img"] is not None:
+            self._draw_visible_roi(result["visual_img"], result["roi_bounds"])
+        self._show_image(self.visual_label, result["visual_img"], "visual")
+        self.latest_status = status
+        self.last_update = datetime.now()
         self.metrics.sequence_successes += 1
-        self._add_operating_log("시퀀스", "정상 완료", f"{base} · {status.value} · Max {result.max_temp:.1f}°C")
-        self._update_values()
+        self._add_operating_log("시퀀스", "정상 완료",
+                                f"{result['base']} · {status.value} · Max {result['max_temp']:.1f}°C")
+        self._update_values_with_result(result)
+        self._finish_analysis(generation)
+
+    def _update_values_with_result(self, result: dict):
+        s = result["status"]
+        korean = {Status.NORMAL: "정상", Status.WARNING: "경고", Status.CRITICAL: "위험"}[s]
+        color = {Status.NORMAL: COLORS["green"], Status.WARNING: COLORS["orange"], Status.CRITICAL: COLORS["red"]}[s]
+        self.kpi_values[0].configure(text=korean, fg=color)
+        self.kpi_values[1].configure(text=f"{result['max_temp']:.1f} °C")
+        self.kpi_values[2].configure(text=f"{self.metrics.anomaly_today}건")
+        self.kpi_values[3].configure(text=f"{self.metrics.rate(self.metrics.capture_successes, self.metrics.capture_attempts):.1f}%")
+        vals = (f"{result['max_temp']:.1f} °C", f"{result['mean_temp']:.1f} °C",
+                f"{result['hot_temp_95']:.1f} °C", f"{result['hotspot_count']}개")
+        for lab, value in zip(self.temp_labels, vals):
+            lab.configure(text=value)
+        stamp = self.last_update.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
+        self.visual_stamp.configure(text=stamp)
+        self.thermal_stamp.configure(text=stamp)
+        self.header_time.configure(text=self.last_update.strftime("마지막 갱신 %H:%M:%S"))
+
+    def _finish_analysis(self, generation: int):
+        self._analysis_running = False
+        if self._analysis_pending:
+            self.root.after(0, self._schedule_analysis)
 
     def _draw_visible_roi(self, img, roi):
         x1, y1, x2, y2 = roi; h, w = img.shape[:2]
@@ -330,21 +448,6 @@ class ProductDashboard:
         label.configure(image=photo, text="")
         if kind == "thermal": self.thermal_photo = photo
         else: self.visual_photo = photo
-
-    def _update_values(self):
-        r = self.latest_result; s = self.latest_status
-        if not r: return
-        korean = {Status.NORMAL: "정상", Status.WARNING: "경고", Status.CRITICAL: "위험"}[s]
-        color = {Status.NORMAL: COLORS["green"], Status.WARNING: COLORS["orange"], Status.CRITICAL: COLORS["red"]}[s]
-        self.kpi_values[0].configure(text=korean, fg=color)
-        self.kpi_values[1].configure(text=f"{r.max_temp:.1f} °C")
-        self.kpi_values[2].configure(text=f"{self.metrics.anomaly_today}건")
-        self.kpi_values[3].configure(text=f"{self.metrics.rate(self.metrics.capture_successes, self.metrics.capture_attempts):.1f}%")
-        vals = (f"{r.max_temp:.1f} °C", f"{r.mean_temp:.1f} °C", f"{r.hot_temp_95:.1f} °C", f"{len(r.hotspot_centroids)}개")
-        for lab, value in zip(self.temp_labels, vals): lab.configure(text=value)
-        stamp = self.last_update.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
-        self.visual_stamp.configure(text=stamp); self.thermal_stamp.configure(text=stamp)
-        self.header_time.configure(text=self.last_update.strftime("마지막 갱신 %H:%M:%S"))
 
     def _append_event(self, state, temp, action):
         row = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -407,10 +510,11 @@ class ProductDashboard:
         if self.timer_id:
             self.root.after_cancel(self.timer_id); self.timer_id = None
         if self.capture:
-            self.capture.stop(); self.capture = None
+            self.capture.request_stop()
         self.monitoring = False
         self.lifecycle = "closed"
         self._add_operating_log("프로그램", "종료 완료", "closing → closed")
+        self._analysis_executor.shutdown(wait=False)
         self.root.destroy()
 
 
@@ -453,7 +557,20 @@ class SettingsDialog:
         visuals = sorted(dataset.glob("*_visual.jpg")) if dataset.exists() else []
         if not visuals:
             messagebox.showwarning("ROI 설정", "가시광 이미지가 없습니다. 먼저 이미지를 수집하세요.", parent=self.win); return
-        RoiEditor(self.d, visuals[-1])
+        self.d._add_operating_log("ROI 설정", "시작", str(visuals[-1]))
+        self.win.grab_release()
+        try:
+            from .roi_selector import main as roi_main
+            sys.argv = ["roi_selector", str(visuals[-1])]
+            roi_main()
+            self.d.cfg = load_config(force_reload=True)
+            self.d._add_operating_log("ROI 설정", "완료", f"{len(self.d.cfg.roi.rois)}개 영역 저장됨")
+        except Exception as exc:
+            self.d._add_operating_log("ROI 설정", "예외 처리", str(exc))
+            messagebox.showerror("ROI 설정", str(exc), parent=self.win)
+        finally:
+            if self.win.winfo_exists():
+                self.win.grab_set()
 
     def open_calibration(self):
         dataset = Path(self.d.cfg.paths.dataset_dir)
@@ -477,7 +594,8 @@ class SettingsDialog:
             self.d._add_operating_log("캘리브레이션", "예외 처리", str(exc))
             messagebox.showerror("캘리브레이션", str(exc), parent=self.win)
         finally:
-            if self.win.winfo_exists(): self.win.grab_set()
+            if self.win.winfo_exists():
+                self.win.grab_set()
 
     def save(self):
         try:
@@ -489,45 +607,6 @@ class SettingsDialog:
             save_config(self.d.cfg); self.d._check_connection_async(); self.win.destroy()
         except ValueError:
             messagebox.showerror("입력 오류", "숫자 설정값을 확인하세요.", parent=self.win)
-
-
-class RoiEditor:
-    def __init__(self, dashboard: ProductDashboard, image_path: Path):
-        self.d = dashboard; self.path = image_path
-        bgr = cv2.imread(str(image_path)); self.original = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        self.scale = min(900/self.original.shape[1], 560/self.original.shape[0])
-        self.display = Image.fromarray(self.original).resize((int(self.original.shape[1]*self.scale), int(self.original.shape[0]*self.scale)))
-        self.win = tk.Toplevel(dashboard.root); self.win.title("가시광 이미지 ROI 설정"); self.win.transient(dashboard.root); self.win.grab_set()
-        self.photo = ImageTk.PhotoImage(self.display)
-        self.canvas = tk.Canvas(self.win, width=self.display.width, height=self.display.height, cursor="cross")
-        self.canvas.pack(padx=12,pady=12); self.canvas.create_image(0,0,image=self.photo,anchor="nw")
-        self.start = None; self.rect = None; self.selection = None
-        self.canvas.bind("<ButtonPress-1>", self.press); self.canvas.bind("<B1-Motion>", self.drag); self.canvas.bind("<ButtonRelease-1>", self.release)
-        bar = ttk.Frame(self.win); bar.pack(fill="x", padx=12, pady=(0,12))
-        ttk.Label(bar, text="마우스로 감시 영역을 드래그하세요.  단축키: Ctrl+S 저장 · R 리셋 · Esc 종료").pack(side="left")
-        ttk.Button(bar,text="종료",command=self.win.destroy).pack(side="right",padx=4)
-        ttk.Button(bar,text="리셋",command=self.reset).pack(side="right",padx=4)
-        ttk.Button(bar,text="저장",style="Action.TButton",command=self.save).pack(side="right",padx=4)
-        self.win.bind("<Control-s>",lambda _e:self.save()); self.win.bind("r",lambda _e:self.reset()); self.win.bind("<Escape>",lambda _e:self.win.destroy())
-
-    def press(self,e): self.start=(e.x,e.y)
-    def drag(self,e):
-        if not self.start:return
-        if self.rect:self.canvas.delete(self.rect)
-        self.rect=self.canvas.create_rectangle(*self.start,e.x,e.y,outline="#00ff44",width=3)
-    def release(self,e):
-        if self.start:self.selection=(*self.start,e.x,e.y)
-    def reset(self):
-        if self.rect:self.canvas.delete(self.rect)
-        self.rect=None; self.selection=None; self.start=None
-    def save(self):
-        if not self.selection:
-            messagebox.showwarning("ROI 설정","먼저 영역을 드래그하세요.",parent=self.win);return
-        x1,y1,x2,y2=self.selection; x1,x2=sorted((x1,x2)); y1,y2=sorted((y1,y2))
-        ow,oh=self.original.shape[1],self.original.shape[0]
-        self.d.cfg.roi.x1=round((x1/self.scale)*640/ow); self.d.cfg.roi.x2=round((x2/self.scale)*640/ow)
-        self.d.cfg.roi.y1=round((y1/self.scale)*480/oh); self.d.cfg.roi.y2=round((y2/self.scale)*480/oh)
-        save_config(self.d.cfg); messagebox.showinfo("ROI 설정","감시 영역을 저장했습니다.",parent=self.win); self.win.destroy()
 
 
 def main():
