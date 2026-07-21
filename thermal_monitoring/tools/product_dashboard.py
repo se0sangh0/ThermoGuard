@@ -58,6 +58,7 @@ class RuntimeMetrics:
 
 class ProductDashboard:
     REFRESH_SECONDS = 20
+    REFRESH_FAST_SECONDS = 5    # Warning/Critical 상태일 때 분석 간격
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -251,9 +252,24 @@ class ProductDashboard:
         if self.monitoring or self.lifecycle != "running":
             return
         self.monitoring = True
-        self.capture = CaptureSession(cam_ip=self.cfg.camera.ip, mode=self.cfg.tools.mode,
-                                      interval=max(10.0, float(self.cfg.camera.capture_interval_sec)),
-                                      save_dir=self.cfg.paths.dataset_dir, log_callback=self._capture_log)
+        roi = self.cfg.roi
+        baseline = roi.baseline_temp
+        warning_delta = roi.warning_delta
+
+        def _probe_callback(max_temp: float) -> bool:
+            if max_temp >= baseline + warning_delta:
+                self.capture.set_warning_mode(True)
+                self._schedule_refresh(100)  # 즉시 분석 가속
+                self._add_operating_log("프로브", "과열 감지", f"{max_temp:.1f}°C — 캡처 주기 1초로 전환")
+                return True
+            return False
+
+        self.capture = CaptureSession(
+            cam_ip=self.cfg.camera.ip, mode=self.cfg.tools.mode,
+            interval=max(10.0, float(self.cfg.camera.capture_interval_sec)),
+            save_dir=self.cfg.paths.dataset_dir, log_callback=self._capture_log,
+            probe_callback=_probe_callback,
+        )
         self.capture.start()
 
     def _capture_log(self, message: str):
@@ -278,7 +294,9 @@ class ProductDashboard:
         self.timer_id = None
         self._schedule_analysis()
         self._update_metric_text()
-        self._schedule_refresh()
+        # Warning/Critical 상태면 가속 분석, 아니면 기본 주기
+        interval = self.REFRESH_FAST_SECONDS * 1000 if self.state.status != Status.NORMAL else self.REFRESH_SECONDS * 1000
+        self._schedule_refresh(interval)
 
     def _schedule_analysis(self):
         if self._analysis_running:
