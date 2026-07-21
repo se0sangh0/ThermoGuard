@@ -23,6 +23,8 @@ class CalibrationDialog:
     MAX_H = 470
     MAX_MEAN_ERROR_PX = 5.0
     MAX_POINT_ERROR_PX = 10.0
+    ZOOM_SOURCE_SIZE = 60
+    ZOOM_DISPLAY_SIZE = 180
 
     def __init__(self, thermal_path: str, rgb_path: str, output_path: str):
         self.thermal_path = thermal_path
@@ -32,6 +34,8 @@ class CalibrationDialog:
         self.rgb_pts: list[list[int]] = []
         self.next_side = "thermal"
         self.saved = False
+        self._zoom_photos: dict[str, ImageTk.PhotoImage] = {}
+        self._panel_sizes: dict[str, tuple[int, int]] = {}
 
         thermal_bgr = cv2.imread(thermal_path)
         rgb_bgr = cv2.imread(rgb_path)
@@ -113,7 +117,80 @@ class CalibrationDialog:
         canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         canvas.create_image(0, 0, image=photo, anchor="nw", tags="base")
         canvas.bind("<Button-1>", lambda event, selected=side: self._click(selected, event.x, event.y))
+        canvas.bind("<Motion>", lambda event, selected=side: self._show_magnifier(selected, event.x, event.y))
+        canvas.bind("<Leave>", lambda _event, selected=side: self._hide_magnifier(selected))
+        self._panel_sizes[side] = (pil.width, pil.height)
         return canvas, photo, scale
+
+    def _show_magnifier(self, side: str, display_x: int, display_y: int):
+        """Show a pixel-preserving magnifier without covering the click target."""
+        scale = self.thermal_scale if side == "thermal" else self.visible_scale
+        source = self.thermal_rgb if side == "thermal" else self.visible_rgb
+        panel_w, panel_h = self._panel_sizes[side]
+        canvas = self.thermal_canvas if side == "thermal" else self.visible_canvas
+
+        if not (0 <= display_x < panel_w and 0 <= display_y < panel_h):
+            self._hide_magnifier(side)
+            return
+
+        original_x = int(display_x / scale)
+        original_y = int(display_y / scale)
+        half = self.ZOOM_SOURCE_SIZE // 2
+        x1 = max(0, original_x - half)
+        y1 = max(0, original_y - half)
+        x2 = min(source.shape[1], original_x + half)
+        y2 = min(source.shape[0], original_y + half)
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        crop = Image.fromarray(source[y1:y2, x1:x2]).resize(
+            (self.ZOOM_DISPLAY_SIZE, self.ZOOM_DISPLAY_SIZE),
+            Image.Resampling.NEAREST,
+        )
+        photo = ImageTk.PhotoImage(crop)
+        self._zoom_photos[side] = photo
+
+        margin = 10
+        zoom_x = panel_w - self.ZOOM_DISPLAY_SIZE - margin
+        zoom_y = panel_h - self.ZOOM_DISPLAY_SIZE - margin
+        # Move the magnifier to the opposite side when the pointer approaches it.
+        if display_x >= panel_w / 2 and display_y >= panel_h / 2:
+            zoom_x = margin
+            zoom_y = margin
+
+        canvas.delete("magnifier")
+        canvas.create_image(zoom_x, zoom_y, image=photo, anchor="nw", tags="magnifier")
+        canvas.create_rectangle(
+            zoom_x, zoom_y,
+            zoom_x + self.ZOOM_DISPLAY_SIZE,
+            zoom_y + self.ZOOM_DISPLAY_SIZE,
+            outline="#00d7ff", width=2, tags="magnifier",
+        )
+        center_x = zoom_x + self.ZOOM_DISPLAY_SIZE // 2
+        center_y = zoom_y + self.ZOOM_DISPLAY_SIZE // 2
+        gap = 4
+        arm = 14
+        for x_start, y_start, x_end, y_end in (
+            (center_x - arm, center_y, center_x - gap, center_y),
+            (center_x + gap, center_y, center_x + arm, center_y),
+            (center_x, center_y - arm, center_x, center_y - gap),
+            (center_x, center_y + gap, center_x, center_y + arm),
+        ):
+            canvas.create_line(
+                x_start, y_start, x_end, y_end,
+                fill="#ffff00", width=1, tags="magnifier",
+            )
+        canvas.create_text(
+            zoom_x + 6, zoom_y + 6,
+            text="확대 보기",
+            anchor="nw", fill="#00ffff",
+            font=("맑은 고딕", 9, "bold"), tags="magnifier",
+        )
+
+    def _hide_magnifier(self, side: str):
+        canvas = self.thermal_canvas if side == "thermal" else self.visible_canvas
+        canvas.delete("magnifier")
+        self._zoom_photos.pop(side, None)
 
     def _bind_shortcuts(self):
         self.window.bind("<Control-s>", lambda _event: self.save())
@@ -154,10 +231,14 @@ class CalibrationDialog:
         canvas.delete("point")
         for index, (x, y) in enumerate(points, start=1):
             dx, dy = x * scale, y * scale
-            canvas.create_oval(dx - 7, dy - 7, dx + 7, dy + 7,
-                               fill="#ff4040", outline="white", width=2, tags="point")
-            canvas.create_text(dx + 13, dy - 12, text=str(index), fill="#00ff55",
-                               font=("맑은 고딕", 11, "bold"), tags="point")
+            # A small, hollow crosshair keeps the exact selected pixel visible.
+            gap, arm = 2, 6
+            canvas.create_line(dx - arm, dy, dx - gap, dy, fill="#ff3030", width=1, tags="point")
+            canvas.create_line(dx + gap, dy, dx + arm, dy, fill="#ff3030", width=1, tags="point")
+            canvas.create_line(dx, dy - arm, dx, dy - gap, fill="#ff3030", width=1, tags="point")
+            canvas.create_line(dx, dy + gap, dx, dy + arm, fill="#ff3030", width=1, tags="point")
+            canvas.create_text(dx + 8, dy - 8, text=str(index), fill="#00ff55",
+                               font=("맑은 고딕", 9, "bold"), tags="point")
 
     def undo(self):
         if self.next_side == "rgb" and self.thermal_pts:
