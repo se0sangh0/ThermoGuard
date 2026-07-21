@@ -269,9 +269,12 @@ class ProductDashboard:
             if max_temp >= baseline + warning_delta:
                 self.capture.set_warning_mode(True)
                 self._schedule_refresh(100)  # 즉시 분석 가속
-                self._add_operating_log("프로브", "과열 감지", f"{max_temp:.1f}°C — 캡처 주기 1초로 전환")
+                w_interval = getattr(self.capture, '_warning_interval', 5.0)
+                self._add_operating_log("프로브", "과열 감지", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
                 return True
-            return False
+            else:
+                self.capture.set_warning_mode(False)
+                return False
 
         self.capture = CaptureSession(
             cam_ip=self.cfg.camera.ip, mode=self.cfg.tools.mode,
@@ -488,6 +491,12 @@ class ProductDashboard:
         if status != Status.NORMAL and previous == Status.NORMAL:
             self.metrics.anomaly_today += 1
             self._append_event(status.value, result["max_temp"], "확인 필요")
+        elif status == Status.NORMAL and previous != Status.NORMAL:
+            if self.capture:
+                self.capture.set_warning_mode(False)
+            self._add_operating_log("과열 해제", "정상 복귀",
+                                    f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
+                                    else "정상 복귀")
 
         self._show_image(self.thermal_label, result["overlay"], "thermal")
         self._show_image(self.visual_label, result["visual_img"], "visual")

@@ -212,7 +212,7 @@ class CaptureSession:
                 if remaining <= 0:
                     break
 
-                # 정상 모드일 때만 프로브 (이미 warning 모드면 풀캡처로 충분)
+                # 정상 모드일 때만 경량 프로브로 과열 감시
                 with self._interval_lock:
                     is_normal = self.interval == self._normal_interval
 
@@ -227,13 +227,13 @@ class CaptureSession:
                             self._log(f"[capture] Probe: {temp:.1f}°C — immediate capture triggered")
                             break
                     else:
-                        _log.warning("probe #%d: failed — backing off 5s", probe_tick)
-                        probe_backoff = 5
+                        _log.warning("probe #%d: failed — backing off ~6s", probe_tick)
+                        probe_backoff = 2
 
                 if probe_backoff > 0:
                     probe_backoff -= 1
 
-                time.sleep(min(1.0, remaining))
+                time.sleep(min(3.0, remaining))
 
 
 # ------------------------------------------------------------
