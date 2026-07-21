@@ -51,6 +51,8 @@ class RuntimeMetrics:
     capture_successes: int = 0
     analysis_ok: int = 0          # 분석 정상 완료 (저장된 파일 기반)
     analysis_fail: int = 0        # 분석 실패
+    image_quality_checks: int = 0
+    image_quality_successes: int = 0
     exception_count: int = 0
     anomaly_today: int = 0
 
@@ -85,6 +87,9 @@ class ProductDashboard:
         self.thermal_photo = None
         self.events: list[tuple] = []
         self.operating_logs: list[tuple[str, str, str, str]] = []
+        # 최근 화면 품질을 기준으로 정상률을 계산한다. 누적 전체 기준보다
+        # 현재 발생한 영상 이상이 즉시 수치에 반영된다.
+        self._image_quality_window: list[bool] = []
 
         self._analysis_executor = ThreadPoolExecutor(max_workers=1)
         self._analysis_running = False
@@ -151,17 +156,18 @@ class ProductDashboard:
         val = tk.Label(frame, text=value, bg="white", fg=color,
                        font=("맑은 고딕", 22, "bold"))
         val.pack(anchor="w", pady=(2, 0))
-        tk.Label(frame, text=caption, bg="white", fg=COLORS["muted"],
-                 font=("맑은 고딕", 9)).pack(anchor="w")
+        if caption:
+            tk.Label(frame, text=caption, bg="white", fg=COLORS["muted"],
+                     font=("맑은 고딕", 9)).pack(anchor="w")
         return frame, val
 
     def _build_kpis(self, parent):
         row = tk.Frame(parent, bg=COLORS["bg"]); row.pack(fill="x")
         cards = [
-            ("현재 상태", "정상", "설비 상태가 안전합니다", COLORS["green"]),
+            ("현재 상태", "정상", "", COLORS["green"]),
             ("최고 온도", "-- °C", f"경고 기준 {self.cfg.roi.baseline_temp + self.cfg.roi.warning_delta:.1f}°C", COLORS["blue"]),
             ("금일 이상 감지", "0건", "미확인 0건", COLORS["orange"]),
-            ("모니터링 정상률", "100.0%", "캡처 성공 기준", COLORS["blue"]),
+            ("모니터링 정상률", "100.0%", "최근 영상 품질 기준", COLORS["blue"]),
         ]
         self.kpi_values = []
         for i, args in enumerate(cards):
@@ -350,7 +356,28 @@ class ProductDashboard:
         if not thermal_files:
             return None
 
-        thermal = thermal_files[-1]
+        # Thermal과 Visual은 병렬 요청 후 각각 저장되므로 아주 짧은 시간
+        # 동안 Thermal 파일만 존재할 수 있다. 5초까지는 직전 완성 쌍을
+        # 사용하고, 그 이후에도 Visual이 없으면 최신 쌍을 품질 이상으로
+        # 전달해 정상률과 운영 로그에 즉시 반영한다.
+        if self.cfg.tools.mode == "both":
+            newest = thermal_files[-1]
+            newest_visual = dataset / f"{newest.stem}_visual.jpg"
+            newest_age = max(0.0, time.time() - newest.stat().st_mtime)
+            if newest_visual.exists() or newest_age >= 5.0:
+                thermal = newest
+            else:
+                thermal = next(
+                    (
+                        path for path in reversed(thermal_files[:-1])
+                        if (dataset / f"{path.stem}_visual.jpg").exists()
+                    ),
+                    None,
+                )
+            if thermal is None:
+                return None
+        else:
+            thermal = thermal_files[-1]
         base = thermal.stem
         visual = dataset / f"{base}_visual.jpg"
         npy = dataset / f"{base}_thermal.npy"
@@ -361,6 +388,14 @@ class ProductDashboard:
 
     def _process_pair_to_dict(self, pair) -> dict:
         base, thermal, visual, npy = pair
+        thermal_img = cv2.imread(str(thermal))
+        visual_img = None
+        if visual and visual.exists():
+            visual_img = cv2.imread(str(visual))
+        image_quality_ok, image_quality_reason = self._assess_image_quality(
+            thermal_img, visual_img
+        )
+
         roi_cfg = load_roi_config()
         roi_results = extract_all_rois_from_npy(str(npy), roi_cfg)
         roi_result = max(roi_results, key=lambda r: r.hot_temp_95 if r.hot_temp_95 is not None else -1)
@@ -399,10 +434,6 @@ class ProductDashboard:
             roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
         )
 
-        visual_img = None
-        if visual and visual.exists():
-            visual_img = cv2.imread(str(visual))
-
         return {
             "base": base, "overlay": overlay, "visual_img": visual_img,
             "max_temp": roi_result.max_temp, "mean_temp": roi_result.mean_temp,
@@ -411,7 +442,38 @@ class ProductDashboard:
             "status": status, "alarm": alarm,
             "roi_bounds": roi_result.roi_bounds,
             "roi_results": roi_results,
+            "image_quality_ok": image_quality_ok,
+            "image_quality_reason": image_quality_reason,
         }
+
+    def _assess_image_quality(self, thermal_img, visual_img) -> tuple[bool, str]:
+        """화면에 표시할 Thermal/Visual 한 쌍이 서로 유효한지 검사한다."""
+        if thermal_img is None or thermal_img.size == 0:
+            return False, "열화상 이미지 누락 또는 읽기 실패"
+
+        if self.cfg.tools.mode != "both":
+            return True, "정상"
+
+        if visual_img is None or visual_img.size == 0:
+            return False, "가시광 이미지 누락 또는 읽기 실패"
+
+        thermal_shape = thermal_img.shape[:2]
+        visual_shape = visual_img.shape[:2]
+        if thermal_shape == visual_shape:
+            return False, "가시광·열화상 영상 종류 중복 의심(동일 해상도)"
+
+        # 현재 카메라 데이터 규격은 Visual이 Thermal보다 고해상도다.
+        # 역전되면 파일 종류가 뒤바뀌었을 가능성이 높다.
+        if thermal_img.size >= visual_img.size:
+            return False, "가시광·열화상 영상 종류 혼동 의심(해상도 역전)"
+
+        thermal_small = cv2.resize(thermal_img, (160, 120))
+        visual_small = cv2.resize(visual_img, (160, 120))
+        mean_difference = float(cv2.absdiff(thermal_small, visual_small).mean())
+        if mean_difference < 3.0:
+            return False, "가시광·열화상 동일 영상 감지"
+
+        return True, "정상"
 
     def _apply_analysis_result(self, result: dict, generation: int):
         if self.lifecycle != "running":
@@ -429,6 +491,16 @@ class ProductDashboard:
 
         self._show_image(self.thermal_label, result["overlay"], "thermal")
         self._show_image(self.visual_label, result["visual_img"], "visual")
+        quality_ok = bool(result.get("image_quality_ok", False))
+        self.metrics.image_quality_checks += 1
+        if quality_ok:
+            self.metrics.image_quality_successes += 1
+        else:
+            self._add_operating_log(
+                "영상 품질", "비정상", result.get("image_quality_reason", "영상 확인 필요")
+            )
+        self._image_quality_window.append(quality_ok)
+        del self._image_quality_window[:-20]
         self.latest_status = status
         self.last_update = datetime.now()
         self.metrics.analysis_ok += 1
@@ -444,7 +516,16 @@ class ProductDashboard:
         self.kpi_values[0].configure(text=korean, fg=color)
         self.kpi_values[1].configure(text=f"{result['max_temp']:.1f} °C")
         self.kpi_values[2].configure(text=f"{self.metrics.anomaly_today}건")
-        self.kpi_values[3].configure(text=f"{self.metrics.rate(self.metrics.capture_successes, self.metrics.capture_attempts):.1f}%")
+        quality_rate = (
+            100.0 * sum(self._image_quality_window) / len(self._image_quality_window)
+            if self._image_quality_window else 100.0
+        )
+        quality_color = (
+            COLORS["green"] if quality_rate == 100.0
+            else COLORS["orange"] if quality_rate >= 80.0
+            else COLORS["red"]
+        )
+        self.kpi_values[3].configure(text=f"{quality_rate:.1f}%", fg=quality_color)
         vals = (f"{result['max_temp']:.1f} °C", f"{result['mean_temp']:.1f} °C",
                 f"{result['hot_temp_95']:.1f} °C", f"{result['hotspot_count']}개")
         for lab, value in zip(self.temp_labels, vals):
