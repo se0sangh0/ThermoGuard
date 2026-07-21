@@ -87,6 +87,12 @@ class CaptureSession:
         _log.info("Capture stopped (consecutive_failures=%d)", self._consecutive_failures)
         self._log("[capture] Stopped.")
 
+    def request_stop(self):
+        """캡처 중단 요청만 하고 join은 하지 않는다 (UI 블로킹 방지)."""
+        _log.info("Capture stop requested (non-blocking)")
+        self._running = False
+        self._log("[capture] Stop requested (non-blocking).")
+
     @property
     def running(self) -> bool:
         return self._running

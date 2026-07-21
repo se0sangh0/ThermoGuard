@@ -25,6 +25,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 from datetime import datetime
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -71,15 +72,27 @@ class MonitoringDashboard:
         self._tick_count = 0
         self._scan_timer_id: Optional[str] = None
 
+        # 분석 전용 작업 스레드 (UI 블로킹 방지)
+        self._analysis_executor = ThreadPoolExecutor(max_workers=1)
+        self._analysis_running = False
+        self._analysis_pending = False
+        self._analysis_generation = 0
+
         self._current_view = "thermal"
         self._current_overlay: Optional[np.ndarray] = None
         self._current_visual_overlay: Optional[np.ndarray] = None
         self._current_status: str = "Normal"
-        self._current_roi_result: Optional[RoiResult] = None
+        self._current_hotspot_count: int = 0
         self._current_thermal_jpg: Optional[str] = None
         self._current_visual_jpg: Optional[str] = None
+        # display-only data (백그라운드 작업에서 UI로 전달)
+        self._display_max: float = 0.0
+        self._display_mean: float = 0.0
+        self._display_hot_95: float = 0.0
 
         self._processed_bases: set = set()
+        self._processed_bases_lock = threading.Lock()
+        self._capture_mode = "both"  # tkinter var 대신 캐시 (백그라운드 스레드 안전)
         self._camera_connected = False
         # GUI-UPDATE: 장시간 작업의 중복 실행을 막는 상태 플래그.
         self._connection_check_running = False
@@ -699,6 +712,7 @@ class MonitoringDashboard:
         self._config.camera.ip = cam_ip
         self._config.camera.capture_interval_sec = interval
         self._config.tools.mode = mode
+        self._capture_mode = mode
         save_config(self._config)
 
         self._monitor_state = MonitorState()
@@ -706,6 +720,7 @@ class MonitoringDashboard:
         self._prime_processed_cache()
         self._running = True
         self._tick_count = 0
+        self._analysis_generation = 0
 
         # 프로브 콜백: 캡처 대기 중 1초마다 경량 Thermal 체크
         roi = self._config.roi
@@ -743,11 +758,10 @@ class MonitoringDashboard:
             self.root.after_cancel(self._scan_timer_id)
             self._scan_timer_id = None
         if self._capture_session:
-            self._capture_session.stop()
-            self._capture_session = None
+            self._capture_session.request_stop()
         self._monitor_btn.configure(text="Start Monitoring")
-        self._log_to_status("Monitoring stopped.")
-        self._append_activity_log("Monitoring stopped")
+        self._log_to_status("Monitoring stop requested...")
+        self._append_activity_log("Monitoring stop requested")
         self._refresh_readiness()
 
     # ════════════════════════════════════════════════════════════
@@ -760,14 +774,11 @@ class MonitoringDashboard:
             if self._tick_count % 10 == 0:
                 self._check_camera_connection()
 
-            # 주기적 오래된 데이터 정리 (1800 ticks ≈ 1시간 at 2s interval)
             if self._tick_count > 0 and self._tick_count % 1800 == 0:
                 self._maybe_run_cleanup_in_background()
 
-            new_pairs = self._scan_new_pairs()
-            for pair in new_pairs:
-                self._process_pair(pair)
-                self._mark_processed(pair["base"])
+            # 분석 작업 스케줄링 (UI 스레드에서는 요청만)
+            self._schedule_analysis()
 
             self._refresh_display()
             self._refresh_readiness()
@@ -781,8 +792,193 @@ class MonitoringDashboard:
         self._scan_timer_id = self.root.after(interval_ms, self._monitoring_tick)
 
     # ════════════════════════════════════════════════════════════
-    # 파일 스캔
+    # 분석 작업 스케줄링 (백그라운드)
     # ════════════════════════════════════════════════════════════
+    def _schedule_analysis(self):
+        """UI 스레드에서 분석 요청만 제출하고 즉시 반환."""
+        if not self._running:
+            return
+        if self._analysis_running:
+            self._analysis_pending = True
+            return
+
+        self._analysis_running = True
+        self._analysis_pending = False
+        gen = self._analysis_generation + 1
+        self._analysis_generation = gen
+
+        self._analysis_executor.submit(self._run_analysis_worker, gen)
+
+    def _run_analysis_worker(self, generation: int):
+        """백그라운드 스레드에서 실행: 파일 스캔 + NPY 생성 + 분석 + 오버레이."""
+        try:
+            new_pairs = self._scan_new_pairs()
+            results = []
+            for pair in new_pairs:
+                result = self._process_pair_to_dict(pair)
+                results.append((result, pair["base"]))
+
+            self.root.after(0, lambda: self._apply_analysis_result(results, generation))
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, lambda: self._finish_analysis_worker(generation))
+
+    def _process_pair_to_dict(self, pair: dict) -> dict:
+        """_process_pair 결과를 UI-safe dict로 변환 (백그라운드 스레드용)."""
+        roi_config = load_roi_config()
+        roi_results = extract_all_rois_from_npy(pair["npy"], roi_config)
+        roi_result = max(roi_results, key=lambda r: r.hot_temp_95
+                         if r.hot_temp_95 is not None else -1)
+
+        all_hotspots = []
+        for rr in roi_results:
+            all_hotspots.extend(rr.hotspot_centroids)
+        unique_hotspots = []
+        for spot in all_hotspots:
+            is_dup = False
+            for u in unique_hotspots:
+                if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
+                    if spot[2] > u[2]:
+                        unique_hotspots[unique_hotspots.index(u)] = spot
+                    is_dup = True
+                    break
+            if not is_dup:
+                unique_hotspots.append(spot)
+        roi_result.hotspot_centroids = unique_hotspots
+
+        new_status, do_alarm = evaluate_with_state(
+            hot_temp=roi_result.hot_temp_95,
+            max_temp=roi_result.max_temp,
+            mean_temp=roi_result.mean_temp,
+            baseline=roi_config.baseline_temp,
+            warning_delta=roi_config.warning_delta,
+            critical_delta=roi_config.critical_delta,
+            state=self._monitor_state,
+            over_temp_pixels=roi_result.over_temp_pixels,
+            max_hotspot_size=roi_result.max_hotspot_size,
+        )
+
+        overlay = create_overlay(
+            thermal_jpg_path=pair["thermal_jpg"],
+            visual_jpg_path=pair["visual_jpg"],
+            roi_bounds=roi_result.roi_bounds,
+            max_temp=roi_result.max_temp,
+            mean_temp=roi_result.mean_temp,
+            hot_temp=roi_result.hot_temp_95,
+            status=new_status.value,
+            hotspot_centroids=roi_result.hotspot_centroids,
+            roi_bounds_list=_get_roi_bounds_list(roi_config),
+            roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
+        )
+
+        visual_overlay = None
+        if pair["visual_jpg"] and os.path.isfile(pair["visual_jpg"]):
+            visual_overlay = cv2.imread(pair["visual_jpg"])
+            if visual_overlay is not None:
+                visual_overlay = cv2.resize(
+                    visual_overlay, (overlay.shape[1], overlay.shape[0]))
+
+        if roi_result.hotspot_centroids:
+            cx, cy, _ = roi_result.hotspot_centroids[0]
+            loc_str = f"({cx}, {cy})"
+        else:
+            x1, y1, x2, y2 = roi_result.roi_bounds
+            loc_str = f"ROI({(x1 + x2) // 2}, {(y1 + y2) // 2})"
+
+        return {
+            "overlay": overlay,
+            "visual_overlay": visual_overlay,
+            "thermal_jpg": pair["thermal_jpg"],
+            "visual_jpg": pair["visual_jpg"],
+            "max_temp": roi_result.max_temp,
+            "mean_temp": roi_result.mean_temp,
+            "hot_temp_95": roi_result.hot_temp_95,
+            "status": new_status.value,
+            "hotspot_count": len(roi_result.hotspot_centroids),
+            "loc_str": loc_str,
+            "do_alarm": do_alarm,
+            "hotspot_centroids": roi_result.hotspot_centroids,
+            "roi_bounds": roi_result.roi_bounds,
+            "base": pair["base"],
+        }
+
+    def _apply_analysis_result(self, results: list, generation: int):
+        """UI 스레드에서 실행: 분석 결과를 화면에 반영."""
+        if not self._running:
+            return
+        if generation < self._analysis_generation:
+            return  # 오래된 결과는 폐기
+
+        for result_dict, base in results:
+            self._mark_processed(base)
+
+            self._monitor_state.status = Status(result_dict["status"])
+
+            self._current_overlay = result_dict["overlay"]
+            self._current_visual_overlay = result_dict["visual_overlay"]
+            self._current_thermal_jpg = result_dict["thermal_jpg"]
+            self._current_visual_jpg = result_dict["visual_jpg"]
+            self._current_status = result_dict["status"]
+            self._current_hotspot_count = result_dict["hotspot_count"]
+            self._display_max = result_dict["max_temp"]
+            self._display_mean = result_dict["mean_temp"]
+            self._display_hot_95 = result_dict["hot_temp_95"]
+
+            was_notified = False
+            if result_dict["do_alarm"]:
+                threading.Thread(
+                    target=self._try_notify_from_result, args=(result_dict,),
+                    daemon=True,
+                ).start()
+
+            self._add_log_row(
+                datetime.now().strftime("%H:%M:%S"),
+                result_dict["loc_str"],
+                result_dict["max_temp"],
+                result_dict["status"],
+                was_notified,
+            )
+
+            if result_dict["do_alarm"]:
+                self._log_to_status(
+                    f"Alert: {result_dict['status']} | Max: {result_dict['max_temp']:.1f}°C")
+
+        self._refresh_display()
+        self._finish_analysis_worker(generation)
+
+    def _finish_analysis_worker(self, generation: int):
+        self._analysis_running = False
+        if self._analysis_pending:
+            self.root.after(0, self._schedule_analysis)
+
+    def _try_notify_from_result(self, result_dict: dict) -> bool:
+        try:
+            overlay = result_dict["overlay"]
+            if overlay is None:
+                return False
+            overlay_dir = self._config.paths.overlay_dir
+            os.makedirs(overlay_dir, exist_ok=True)
+            overlay_path = os.path.join(
+                overlay_dir,
+                f"{datetime.now().strftime('%Y%m%d%H%M%S')}_overlay.jpg")
+            cv2.imwrite(overlay_path, overlay)
+
+            success = send_alarm(
+                image_path=overlay_path,
+                temp=result_dict["hot_temp_95"],
+                status=result_dict["status"],
+                robot_id=self._config.identity.robot_id,
+            )
+            if success:
+                self._monitor_state.last_alarm_time = time.time()
+            return success
+        except RuntimeError:
+            self._append_activity_log("Telegram skipped: not configured")
+            return False
+        except Exception as exc:
+            self._append_activity_log(f"Telegram error: {exc}")
+            return False
     def _scan_all_paired_bases(self) -> set:
         dataset_dir = self._config.paths.dataset_dir
         if not os.path.isdir(dataset_dir):
@@ -820,14 +1016,16 @@ class MonitoringDashboard:
         visual_jpgs = {f.replace("_visual.jpg", ""): f for f in files
                        if f.endswith("_visual.jpg")}
 
-        if self._mode_var.get() == "thermal":
+        mode = self._capture_mode
+        if mode == "thermal":
             bases = sorted(thermal_jpgs.keys())
         else:
             bases = sorted(set(thermal_jpgs.keys()) & set(visual_jpgs.keys()))
         new_pairs = []
         for base in bases:
-            if base in self._processed_bases:
-                continue
+            with self._processed_bases_lock:
+                if base in self._processed_bases:
+                    continue
             npy_path = os.path.join(dataset_dir, base + "_thermal.npy")
             if base not in npys:
                 try:
@@ -836,7 +1034,6 @@ class MonitoringDashboard:
                     thermal, _ = extract_from_jpeg(jpg_path)
                     np.save(npy_path, thermal)
                 except Exception as exc:
-                    # GUI-UPDATE: 이전에는 조용히 무시하던 변환 실패를 화면에 노출한다.
                     self._append_activity_log(
                         f"NPY extraction failed for {base}: {exc}")
                     continue
@@ -851,139 +1048,123 @@ class MonitoringDashboard:
         return new_pairs
 
     def _mark_processed(self, base: str):
-        self._processed_bases.add(base)
-        max_cache = self._config.monitoring.max_processed_cache
-        if len(self._processed_bases) > max_cache:
-            retain = max_cache // 2
-            self._processed_bases = set(sorted(self._processed_bases)[-retain:])
+        with self._processed_bases_lock:
+            self._processed_bases.add(base)
+            max_cache = self._config.monitoring.max_processed_cache
+            if len(self._processed_bases) > max_cache:
+                retain = max_cache // 2
+                self._processed_bases = set(sorted(self._processed_bases)[-retain:])
 
     # ════════════════════════════════════════════════════════════
-    # 쌍 처리
+    # [DEAD CODE] 기존 쌍 처리 (→ _process_pair_to_dict + _apply_analysis_result 로 대체됨)
     # ════════════════════════════════════════════════════════════
-    def _process_pair(self, pair: dict):
-        try:
-            roi_config = load_roi_config()
-            roi_results = extract_all_rois_from_npy(pair["npy"], roi_config)
-            roi_result = max(roi_results, key=lambda r: r.hot_temp_95)
-            # 핫스팟 통합
-            all_hotspots = []
-            for rr in roi_results:
-                all_hotspots.extend(rr.hotspot_centroids)
-            unique_hotspots = []
-            for spot in all_hotspots:
-                is_dup = False
-                for u in unique_hotspots:
-                    if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
-                        if spot[2] > u[2]:
-                            unique_hotspots[unique_hotspots.index(u)] = spot
-                        is_dup = True
-                        break
-                if not is_dup:
-                    unique_hotspots.append(spot)
-            roi_result.hotspot_centroids = unique_hotspots
-
-            new_status, do_alarm = evaluate_with_state(
-                hot_temp=roi_result.hot_temp_95,
-                max_temp=roi_result.max_temp,
-                mean_temp=roi_result.mean_temp,
-                baseline=roi_config.baseline_temp,
-                warning_delta=roi_config.warning_delta,
-                critical_delta=roi_config.critical_delta,
-                state=self._monitor_state,
-                over_temp_pixels=roi_result.over_temp_pixels,
-                max_hotspot_size=roi_result.max_hotspot_size,
-            )
-
-            self._monitor_state.status = new_status
-
-            # Overlay 이미지 생성
-            overlay = create_overlay(
-                thermal_jpg_path=pair["thermal_jpg"],
-                visual_jpg_path=pair["visual_jpg"],
-                roi_bounds=roi_result.roi_bounds,
-                max_temp=roi_result.max_temp,
-                mean_temp=roi_result.mean_temp,
-                hot_temp=roi_result.hot_temp_95,
-                status=new_status.value,
-                hotspot_centroids=roi_result.hotspot_centroids,
-                roi_bounds_list=_get_roi_bounds_list(roi_config),
-                roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
-            )
-
-            self._current_overlay = overlay
-            # GUI-UPDATE: thermal-only 모드에서는 Visual 화면이 없어도 정상 처리한다.
-            self._current_visual_overlay = (
-                cv2.imread(pair["visual_jpg"]) if pair["visual_jpg"] else None)
-            if self._current_visual_overlay is not None:
-                self._current_visual_overlay = cv2.resize(
-                    self._current_visual_overlay, (overlay.shape[1], overlay.shape[0]))
-
-            self._current_thermal_jpg = pair["thermal_jpg"]
-            self._current_visual_jpg = pair["visual_jpg"]
-            self._current_roi_result = roi_result
-            self._current_status = new_status.value
-
-            # 위치 문자열
-            if roi_result.hotspot_centroids:
-                cx, cy, _ = roi_result.hotspot_centroids[0]
-                loc_str = f"({cx}, {cy})"
-            else:
-                x1, y1, x2, y2 = roi_result.roi_bounds
-                loc_str = f"ROI({(x1 + x2) // 2}, {(y1 + y2) // 2})"
-
-            # 알림
-            was_notified = False
-            if do_alarm:
-                was_notified = self._try_notify(roi_result, new_status)
-
-            # 로그 추가
-            self._add_log_row(
-                datetime.now().strftime("%H:%M:%S"),
-                loc_str,
-                roi_result.max_temp,
-                new_status.value,
-                was_notified,
-            )
-
-            if do_alarm:
-                self._log_to_status(
-                    f"Alert: {new_status.value} | Max: {roi_result.max_temp:.1f}°C")
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            # GUI-UPDATE: 분석 실패 원인을 터미널뿐 아니라 GUI에서도 확인한다.
-            self._append_activity_log(
-                f"Analysis failed for {pair.get('base', 'unknown')}: {e}")
-            self._log_to_status(f"Analysis error: {e}")
+    # def _process_pair(self, pair: dict):
+    #     try:
+    #         roi_config = load_roi_config()
+    #         roi_results = extract_all_rois_from_npy(pair["npy"], roi_config)
+    #         roi_result = max(roi_results, key=lambda r: r.hot_temp_95)
+    #         all_hotspots = []
+    #         for rr in roi_results:
+    #             all_hotspots.extend(rr.hotspot_centroids)
+    #         unique_hotspots = []
+    #         for spot in all_hotspots:
+    #             is_dup = False
+    #             for u in unique_hotspots:
+    #                 if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
+    #                     if spot[2] > u[2]:
+    #                         unique_hotspots[unique_hotspots.index(u)] = spot
+    #                     is_dup = True
+    #                     break
+    #             if not is_dup:
+    #                 unique_hotspots.append(spot)
+    #         roi_result.hotspot_centroids = unique_hotspots
+    #         new_status, do_alarm = evaluate_with_state(
+    #             hot_temp=roi_result.hot_temp_95,
+    #             max_temp=roi_result.max_temp,
+    #             mean_temp=roi_result.mean_temp,
+    #             baseline=roi_config.baseline_temp,
+    #             warning_delta=roi_config.warning_delta,
+    #             critical_delta=roi_config.critical_delta,
+    #             state=self._monitor_state,
+    #             over_temp_pixels=roi_result.over_temp_pixels,
+    #             max_hotspot_size=roi_result.max_hotspot_size,
+    #         )
+    #         self._monitor_state.status = new_status
+    #         overlay = create_overlay(
+    #             thermal_jpg_path=pair["thermal_jpg"],
+    #             visual_jpg_path=pair["visual_jpg"],
+    #             roi_bounds=roi_result.roi_bounds,
+    #             max_temp=roi_result.max_temp,
+    #             mean_temp=roi_result.mean_temp,
+    #             hot_temp=roi_result.hot_temp_95,
+    #             status=new_status.value,
+    #             hotspot_centroids=roi_result.hotspot_centroids,
+    #             roi_bounds_list=_get_roi_bounds_list(roi_config),
+    #             roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
+    #         )
+    #         self._current_overlay = overlay
+    #         self._current_visual_overlay = (
+    #             cv2.imread(pair["visual_jpg"]) if pair["visual_jpg"] else None)
+    #         if self._current_visual_overlay is not None:
+    #             self._current_visual_overlay = cv2.resize(
+    #                 self._current_visual_overlay, (overlay.shape[1], overlay.shape[0]))
+    #         self._current_thermal_jpg = pair["thermal_jpg"]
+    #         self._current_visual_jpg = pair["visual_jpg"]
+    #         self._current_roi_result = roi_result
+    #         self._current_status = new_status.value
+    #         if roi_result.hotspot_centroids:
+    #             cx, cy, _ = roi_result.hotspot_centroids[0]
+    #             loc_str = f"({cx}, {cy})"
+    #         else:
+    #             x1, y1, x2, y2 = roi_result.roi_bounds
+    #             loc_str = f"ROI({(x1 + x2) // 2}, {(y1 + y2) // 2})"
+    #         was_notified = False
+    #         if do_alarm:
+    #             was_notified = self._try_notify(roi_result, new_status)
+    #         self._add_log_row(
+    #             datetime.now().strftime("%H:%M:%S"),
+    #             loc_str,
+    #             roi_result.max_temp,
+    #             new_status.value,
+    #             was_notified,
+    #         )
+    #         if do_alarm:
+    #             self._log_to_status(
+    #                 f"Alert: {new_status.value} | Max: {roi_result.max_temp:.1f}°C")
+    #     except Exception as e:
+    #         import traceback
+    #         traceback.print_exc()
+    #         self._append_activity_log(
+    #             f"Analysis failed for {pair.get('base', 'unknown')}: {e}")
+    #         self._log_to_status(f"Analysis error: {e}")
 
     # ════════════════════════════════════════════════════════════
-    # 알림
+    # [DEAD CODE] 기존 알림 (→ _try_notify_from_result 로 대체됨)
     # ════════════════════════════════════════════════════════════
-    def _try_notify(self, roi_result: RoiResult, new_status: Status) -> bool:
-        try:
-            if self._current_overlay is None:
-                return False
-            overlay_dir = self._config.paths.overlay_dir
-            os.makedirs(overlay_dir, exist_ok=True)
-            overlay_path = os.path.join(overlay_dir, f"{datetime.now().strftime('%Y%m%d%H%M%S')}_overlay.jpg")
-            cv2.imwrite(overlay_path, self._current_overlay)
-
-            success = send_alarm(
-                image_path=overlay_path,
-                temp=roi_result.hot_temp_95,
-                status=new_status.value,
-                robot_id=self._config.identity.robot_id,
-            )
-            if success:
-                self._monitor_state.last_alarm_time = time.time()
-            return success
-        except RuntimeError:
-            self._append_activity_log("Telegram skipped: not configured")
-            return False
-        except Exception as exc:
-            self._append_activity_log(f"Telegram error: {exc}")
-            return False
+    # def _try_notify(self, roi_result: RoiResult, new_status: Status) -> bool:
+    #     try:
+    #         if self._current_overlay is None:
+    #             return False
+    #         overlay_dir = self._config.paths.overlay_dir
+    #         os.makedirs(overlay_dir, exist_ok=True)
+    #         overlay_path = os.path.join(overlay_dir,
+    #             f"{datetime.now().strftime('%Y%m%d%H%M%S')}_overlay.jpg")
+    #         cv2.imwrite(overlay_path, self._current_overlay)
+    #         success = send_alarm(
+    #             image_path=overlay_path,
+    #             temp=roi_result.hot_temp_95,
+    #             status=new_status.value,
+    #             robot_id=self._config.identity.robot_id,
+    #         )
+    #         if success:
+    #             self._monitor_state.last_alarm_time = time.time()
+    #         return success
+    #     except RuntimeError:
+    #         self._append_activity_log("Telegram skipped: not configured")
+    #         return False
+    #     except Exception as exc:
+    #         self._append_activity_log(f"Telegram error: {exc}")
+    #         return False
 
     # ════════════════════════════════════════════════════════════
     # 이미지 표시
@@ -999,18 +1180,18 @@ class MonitoringDashboard:
         self._photo_ref = self._cv2_to_tk(display_img, self.DISPLAY_IMAGE_WIDTH)
         self._image_label.configure(image=self._photo_ref)
 
-        if self._current_roi_result:
+        if self._display_max > 0 or self._current_status != "Normal":
             status = self._current_status
             color = {"Critical": "#ff0000", "Warning": "#ff8800"}.get(status, "#00aa00")
             self._status_label.configure(text=f"Status: {status}", foreground=color)
             self._max_temp_label.configure(
-                text=f"Max: {self._current_roi_result.max_temp:.1f} °C")
+                text=f"Max: {self._display_max:.1f} °C")
             self._mean_temp_label.configure(
-                text=f"Mean: {self._current_roi_result.mean_temp:.1f} °C")
+                text=f"Mean: {self._display_mean:.1f} °C")
             self._hot_temp_label.configure(
-                text=f"95th: {self._current_roi_result.hot_temp_95:.1f} °C")
+                text=f"95th: {self._display_hot_95:.1f} °C")
             self._hotspot_label.configure(
-                text=f"Hotspots: {len(self._current_roi_result.hotspot_centroids)}")
+                text=f"Hotspots: {self._current_hotspot_count}")
         self._refresh_readiness()
 
     def _on_view_changed(self):
@@ -1150,7 +1331,13 @@ class MonitoringDashboard:
     # 종료 처리
     # ════════════════════════════════════════════════════════════
     def on_close(self):
-        self._stop_monitoring()
+        self._running = False
+        if self._scan_timer_id:
+            self.root.after_cancel(self._scan_timer_id)
+        if self._capture_session:
+            self._capture_session.request_stop()
+            self._capture_session = None
+        self._analysis_executor.shutdown(wait=False)
         self.root.destroy()
 
 
