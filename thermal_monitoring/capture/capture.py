@@ -97,6 +97,63 @@ class CaptureSession:
     def running(self) -> bool:
         return self._running
 
+    def capture_both_once(self) -> tuple[str | None, str | None]:
+        """알람용 일회성 캡처: thermal + visual 동시 요청 → 디스크 저장 → 경로 반환.
+
+        Returns:
+            (thermal_jpg_path, visual_jpg_path) — 실패 시 (None, None)
+            visual_jpg_path는 mode가 'thermal'이면 None.
+        """
+        if not self._running:
+            _log.warning("capture_both_once: session not running")
+            return (None, None)
+
+        do_visual = self.mode == "both"
+        filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
+
+        def _fetch_one(img_type: str) -> tuple[str, bytes | None, str | None]:
+            try:
+                r = requests.get(self._urls[img_type], timeout=10)
+                if r.status_code == 200:
+                    content_type = r.headers.get("Content-Type", "")
+                    if "image" not in content_type.lower() and content_type != "octet-stream":
+                        _log.warning("[%s] batched capture: unexpected Content-Type: %s", img_type, content_type)
+                        return img_type, None, f"[{img_type}] Not an image"
+                    return img_type, r.content, None
+                _log.warning("[%s] batched capture: HTTP %d", img_type, r.status_code)
+                return img_type, None, f"[{img_type}] HTTP {r.status_code}"
+            except Exception as e:
+                _log.error("[%s] batched capture failed: %s", img_type, e)
+                return img_type, None, str(e)
+
+        results: dict[str, str | None] = {"thermal": None, "visual": None}
+        img_types = ["thermal", "visual"] if do_visual else ["thermal"]
+
+        if len(img_types) > 1:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {executor.submit(_fetch_one, t): t for t in img_types}
+                for future in as_completed(futures):
+                    img_type, content, error = future.result()
+                    if error or content is None:
+                        _log.warning("capture_both_once: %s failed, aborting", img_type)
+                        return (None, None)
+                    suffix = "_visual" if img_type == "visual" else ""
+                    jpg_path = os.path.join(self.save_dir, f"{filenametime}{suffix}.jpg")
+                    with open(jpg_path, "wb") as f:
+                        f.write(content)
+                    results[img_type] = jpg_path
+                    self._log(f"[{datetime.now().strftime('%H:%M:%S')}] [alarm] [{img_type}] saved ({len(content)} bytes)")
+        else:
+            _, content, error = _fetch_one("thermal")
+            if error or content is None:
+                return (None, None)
+            jpg_path = os.path.join(self.save_dir, f"{filenametime}.jpg")
+            with open(jpg_path, "wb") as f:
+                f.write(content)
+            results["thermal"] = jpg_path
+
+        return (results["thermal"], results.get("visual"))
+
     def set_warning_mode(self, active: bool) -> None:
         """과열 감지 시 캡처 주기를 warning_interval로 전환. 평상시 복귀."""
         with self._interval_lock:
@@ -111,9 +168,12 @@ class CaptureSession:
 
     def _run(self):
         os.makedirs(self.save_dir, exist_ok=True)
-        img_types = ["thermal", "visual"] if self.mode == "both" else ["thermal"]
 
         while self._running:
+            # 경고 모드에서는 thermal만 캡처 (visual은 알람 시점에만 필요)
+            with self._interval_lock:
+                is_normal_cycle = self.interval == self._normal_interval
+            img_types = ["thermal", "visual"] if (self.mode == "both" and is_normal_cycle) else ["thermal"]
             try:
                 filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
 

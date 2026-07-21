@@ -138,9 +138,8 @@ class MonitorSequencer:
         }
 
         # thermal JPG + visual JPG 둘 다 있는 모든 쌍을 대상으로 함
-        bases = sorted(
-            set(thermal_jpgs.keys()) & set(visual_jpgs.keys())
-        )
+        # visual이 없는 thermal만 있어도 분석 진행 (경고 모드 등)
+        bases = sorted(set(thermal_jpgs.keys()))
 
         new_pairs = []
         for base in bases:
@@ -157,10 +156,11 @@ class MonitorSequencer:
                 except Exception as e:
                     self._log(f"  Failed to extract NPY for {base}: {e}")
                     continue
+            visual_jpg = visual_jpgs.get(base)
             new_pairs.append({
                 "base": base,
                 "thermal_jpg": os.path.join(DATASET_DIR, thermal_jpgs[base]),
-                "visual_jpg": os.path.join(DATASET_DIR, visual_jpgs[base]),
+                "visual_jpg": os.path.join(DATASET_DIR, visual_jpg) if visual_jpg else "",
                 "npy": npy_path,
             })
 
@@ -296,9 +296,22 @@ class MonitorSequencer:
                 try:
                     self._log(f"Hotspots: {roi_result.hotspot_centroids}")
                     self._log(f"Count: {len(roi_result.hotspot_centroids)}")
+
+                    # 알람 시에는 fresh capture로 최신 thermal+visual 쌍 확보
+                    overlay_thermal = pair["thermal_jpg"]
+                    overlay_visual = pair["visual_jpg"]
+                    if do_alarm and self.capture:
+                        fresh_t, fresh_v = self.capture.capture_both_once()
+                        if fresh_t:
+                            self._log(f"  Alarm fresh capture: {os.path.basename(fresh_t)}")
+                            overlay_thermal = fresh_t
+                            overlay_visual = fresh_v or ""
+                        else:
+                            self._log("  Alarm fresh capture failed, using existing pair")
+
                     overlay = create_overlay(
-                        thermal_jpg_path=pair["thermal_jpg"],
-                        visual_jpg_path=pair["visual_jpg"],
+                        thermal_jpg_path=overlay_thermal,
+                        visual_jpg_path=overlay_visual,
                         roi_bounds=roi_result.roi_bounds,
                         max_temp=roi_result.max_temp,
                         mean_temp=roi_result.mean_temp,

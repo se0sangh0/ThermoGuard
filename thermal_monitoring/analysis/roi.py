@@ -156,6 +156,7 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
             area = int(stats[label_id, cv2.CC_STAT_AREA])
             if area < MIN_HOTSPOT:
                 continue
+            cluster_mask = labels == label_id
             cluster_temps = roi[cluster_mask]
             cluster_max_temp = float(np.nanmax(cluster_temps))
             _log.debug("hotspot cluster #%d: area=%d max=%.1f°C", label_id, area, cluster_max_temp)
