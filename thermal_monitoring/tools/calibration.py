@@ -23,11 +23,29 @@ from ..config import load_config
 thermal_pts = []
 rgb_pts = []
 pair_state = "thermal"  # "thermal" or "rgb"
+t_mouse_x, t_mouse_y = -1, -1  # Thermal 창 마우스 (원본 해상도)
+r_mouse_x, r_mouse_y = -1, -1  # RGB 창 마우스 (원본 해상도)
 
+ZOOM_SIZE = 80      # 확대경 영역 크기 (px)
+ZOOM_SCALE = 3.0    # 확대 배율
+
+
+def draw_crosshair(img, x, y, color, size=6, thickness=1, gap=3):
+    """정밀 마커: 십자선 + 얇은 원 (중심점이 빈 공간으로 보임)"""
+    # 수평선 (좌우, 가운데 갭)
+    cv2.line(img, (x - size, y), (x - gap, y), color, thickness)
+    cv2.line(img, (x + gap, y), (x + size, y), color, thickness)
+    # 수직선 (상하, 가운데 갭)
+    cv2.line(img, (x, y - size), (x, y - gap), color, thickness)
+    cv2.line(img, (x, y + gap), (x, y + size), color, thickness)
+    # 얇은 원
+    cv2.circle(img, (x, y), size, color, 1)
 
 #Thermal 이미지 클릭 이벤트
 def click_thermal(event, x, y, flags, param):
-    global pair_state
+    global pair_state, t_mouse_x, t_mouse_y
+    if event == cv2.EVENT_MOUSEMOVE or event == cv2.EVENT_LBUTTONDOWN:
+        t_mouse_x, t_mouse_y = x, y
     if event == cv2.EVENT_LBUTTONDOWN:
         if pair_state == "thermal":
             thermal_pts.append([x, y])
@@ -38,7 +56,9 @@ def click_thermal(event, x, y, flags, param):
 
 #RGB 이미지 클릭 이벤트
 def click_rgb(event, x, y, flags, param):
-    global pair_state
+    global pair_state, r_mouse_x, r_mouse_y
+    if event == cv2.EVENT_MOUSEMOVE or event == cv2.EVENT_LBUTTONDOWN:
+        r_mouse_x, r_mouse_y = x, y
     if event == cv2.EVENT_LBUTTONDOWN:
         if pair_state == "rgb":
             rgb_pts.append([x, y])
@@ -56,10 +76,11 @@ def resize_for_display(img, width):
 
 def run_calibration(thermal_path=None, rgb_path=None):
     """GUI 또는 CLI에서 호출 가능한 캘리브레이션 진입점."""
-    global thermal_pts, rgb_pts, pair_state
+    global thermal_pts, rgb_pts, pair_state, t_mouse_x, t_mouse_y, r_mouse_x, r_mouse_y
     thermal_pts.clear()
     rgb_pts.clear()
     pair_state = "thermal"
+    t_mouse_x = t_mouse_y = r_mouse_x = r_mouse_y = -1
 
     cfg = load_config()
     DATASET_DIR = cfg.paths.dataset_dir
@@ -118,19 +139,60 @@ def run_calibration(thermal_path=None, rgb_path=None):
         t = thermal_disp.copy()
         r = rgb_disp.copy()
 
-        for pt in thermal_pts:
-            dp = (int(pt[0] / thermal_scale), int(pt[1] / thermal_scale))
-            cv2.circle(t, dp, 5, (0, 0, 255), -1)
-        for pt in rgb_pts:
-            dp = (int(pt[0] / rgb_scale), int(pt[1] / rgb_scale))
-            cv2.circle(r, dp, 5, (0, 0, 255), -1)
-
+        # ── 마커: 십자선 + 얇은 원 (중심점 보임) ──
         for i, pt in enumerate(thermal_pts):
             dp = (int(pt[0] / thermal_scale), int(pt[1] / thermal_scale))
-            cv2.putText(t, str(i + 1), dp, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            draw_crosshair(t, *dp, (0, 0, 255), size=4)
+            cv2.putText(t, str(i + 1), (dp[0] + 6, dp[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         for i, pt in enumerate(rgb_pts):
             dp = (int(pt[0] / rgb_scale), int(pt[1] / rgb_scale))
-            cv2.putText(r, str(i + 1), dp, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            draw_crosshair(r, *dp, (0, 0, 255), size=4)
+            cv2.putText(r, str(i + 1), (dp[0] + 6, dp[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # ── 확대경 (우하단, 현재 마우스 위치 주변) ──
+        # Thermal 확대경
+        if t_mouse_x >= 0 and t_mouse_y >= 0:
+            hs = ZOOM_SIZE // 2
+            ox, oy = t_mouse_x, t_mouse_y
+            x1, y1 = max(0, ox - hs), max(0, oy - hs)
+            x2, y2 = min(thermal.shape[1], ox + hs), min(thermal.shape[0], oy + hs)
+            if x2 > x1 and y2 > y1:
+                roi = thermal[y1:y2, x1:x2]
+                zoomed = cv2.resize(roi, None, fx=ZOOM_SCALE, fy=ZOOM_SCALE,
+                                    interpolation=cv2.INTER_NEAREST)
+                cx = int((ox - x1) * ZOOM_SCALE)
+                cy = int((oy - y1) * ZOOM_SCALE)
+                draw_crosshair(zoomed, cx, cy, (0, 255, 255), size=3, thickness=1, gap=1)
+                zh, zw = zoomed.shape[:2]
+                margin = 8
+                px = t.shape[1] - zw - margin
+                py = t.shape[0] - zh - margin
+                if px >= 0 and py >= 0:
+                    zoomed = cv2.rectangle(zoomed, (0, 0), (zw - 1, zh - 1), (255, 255, 0), 1)
+                    t[py:py + zh, px:px + zw] = zoomed
+
+        # RGB 확대경
+        if r_mouse_x >= 0 and r_mouse_y >= 0:
+            hs = ZOOM_SIZE // 2
+            ox, oy = r_mouse_x, r_mouse_y
+            x1, y1 = max(0, ox - hs), max(0, oy - hs)
+            x2, y2 = min(rgb.shape[1], ox + hs), min(rgb.shape[0], oy + hs)
+            if x2 > x1 and y2 > y1:
+                roi = rgb[y1:y2, x1:x2]
+                zoomed = cv2.resize(roi, None, fx=ZOOM_SCALE, fy=ZOOM_SCALE,
+                                    interpolation=cv2.INTER_NEAREST)
+                cx = int((ox - x1) * ZOOM_SCALE)
+                cy = int((oy - y1) * ZOOM_SCALE)
+                draw_crosshair(zoomed, cx, cy, (0, 255, 255), size=3, thickness=1, gap=1)
+                zh, zw = zoomed.shape[:2]
+                margin = 8
+                px = r.shape[1] - zw - margin
+                py = r.shape[0] - zh - margin
+                if px >= 0 and py >= 0:
+                    zoomed = cv2.rectangle(zoomed, (0, 0), (zw - 1, zh - 1), (255, 255, 0), 1)
+                    r[py:py + zh, px:px + zw] = zoomed
 
         cv2.putText(t, "Thermal | S: save  R: reset  Z: undo  Q: quit",
                     (10, t.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
