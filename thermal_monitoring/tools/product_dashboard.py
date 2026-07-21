@@ -26,6 +26,11 @@ from ..capture.capture import CaptureSession
 from ..capture.thermal_utils import extract_from_jpeg
 from ..config import load_config, save_config
 
+try:
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+except AttributeError:  # Pillow < 9.1 compatibility on older Ubuntu systems
+    RESAMPLE_LANCZOS = Image.LANCZOS
+
 
 COLORS = {
     "navy": "#0b2038", "blue": "#1469be", "green": "#159447",
@@ -362,7 +367,10 @@ class ProductDashboard:
         )
 
         overlay = create_overlay(
-            str(thermal), str(visual) if visual else "", roi_result.roi_bounds,
+            # This panel is explicitly the Thermal view. Passing the visual
+            # path would make create_overlay use RGB as its background when a
+            # Homography exists, duplicating the visible-image panel.
+            str(thermal), "", roi_result.roi_bounds,
             roi_result.max_temp, roi_result.mean_temp, roi_result.hot_temp_95,
             status.value, hotspot_centroids=roi_result.hotspot_centroids,
             roi_bounds_list=_get_roi_bounds_list(roi_cfg),
@@ -372,8 +380,6 @@ class ProductDashboard:
         visual_img = None
         if visual and visual.exists():
             visual_img = cv2.imread(str(visual))
-        elif thermal.exists():
-            visual_img = cv2.imread(str(thermal))
 
         return {
             "base": base, "overlay": overlay, "visual_img": visual_img,
@@ -441,9 +447,20 @@ class ProductDashboard:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
     def _show_image(self, label, image, kind):
-        if image is None: return
+        if image is None:
+            missing_text = (
+                "열화상 이미지를 불러올 수 없습니다"
+                if kind == "thermal"
+                else "가시광 이미지를 불러올 수 없습니다"
+            )
+            label.configure(image="", text=missing_text)
+            if kind == "thermal":
+                self.thermal_photo = None
+            else:
+                self.visual_photo = None
+            return
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb); pil.thumbnail((650, 340), Image.Resampling.LANCZOS)
+        pil = Image.fromarray(rgb); pil.thumbnail((650, 340), RESAMPLE_LANCZOS)
         photo = ImageTk.PhotoImage(pil)
         label.configure(image=photo, text="")
         if kind == "thermal": self.thermal_photo = photo
@@ -521,18 +538,21 @@ class ProductDashboard:
 class SettingsDialog:
     def __init__(self, dashboard: ProductDashboard):
         self.d = dashboard; self.win = tk.Toplevel(dashboard.root)
-        self.win.title("환경설정"); self.win.geometry("620x600"); self.win.transient(dashboard.root); self.win.grab_set()
+        self.win.title("환경설정"); self.win.geometry("720x620"); self.win.transient(dashboard.root); self.win.grab_set()
         notebook = ttk.Notebook(self.win); notebook.pack(fill="both", expand=True, padx=14, pady=14)
         general = ttk.Frame(notebook, padding=16); roi = ttk.Frame(notebook, padding=16); advanced = ttk.Frame(notebook, padding=16)
         notebook.add(general, text="일반"); notebook.add(roi, text="감시 영역"); notebook.add(advanced, text="고급 설정")
         self.ip = tk.StringVar(value=self.d.cfg.camera.ip)
         self.interval = tk.StringVar(value=str(max(10, int(self.d.REFRESH_SECONDS))))
+        self.dataset_dir = tk.StringVar(value=self.d.cfg.paths.dataset_dir)
         self.baseline = tk.StringVar(value=str(self.d.cfg.roi.baseline_temp))
         self.warning = tk.StringVar(value=str(self.d.cfg.roi.warning_delta))
         self.critical = tk.StringVar(value=str(self.d.cfg.roi.critical_delta))
         self._field(general, "카메라 주소", self.ip, 0)
         self._field(general, "화면 갱신 주기(초)", self.interval, 1)
-        ttk.Label(general, text="운영 화면에는 노출하지 않는 관리자 설정입니다.").grid(row=2,column=0,columnspan=2,sticky="w",pady=12)
+        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 2)
+        ttk.Label(general, text="촬영 이미지, 온도 배열과 오버레이가 선택한 폴더에 저장됩니다.").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=12)
         ttk.Label(roi, text="가시광 이미지에서 감시할 설비 영역을 지정합니다.", font=("맑은 고딕", 11, "bold")).pack(anchor="w", pady=8)
         ttk.Button(roi, text="가시광 이미지에서 ROI 설정", command=self.open_roi_editor).pack(anchor="w", pady=8)
         ttk.Separator(roi, orient="horizontal").pack(fill="x", pady=14)
@@ -551,6 +571,25 @@ class SettingsDialog:
         ttk.Label(parent, text=label).grid(row=row,column=0,sticky="w",pady=8,padx=(0,12))
         ttk.Entry(parent, textvariable=variable, width=34).grid(row=row,column=1,sticky="ew",pady=8)
         parent.columnconfigure(1, weight=1)
+
+    def _path_field(self, parent, label, variable, row):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=8, padx=(0, 12))
+        ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=8)
+        ttk.Button(parent, text="찾아보기...", command=self._browse_dataset_dir).grid(
+            row=row, column=2, sticky="e", padx=(8, 0), pady=8)
+        parent.columnconfigure(1, weight=1)
+
+    def _browse_dataset_dir(self):
+        current = os.path.expandvars(os.path.expanduser(self.dataset_dir.get().strip()))
+        initial = current if current and os.path.isdir(current) else os.getcwd()
+        selected = filedialog.askdirectory(
+            parent=self.win,
+            title="데이터 저장 폴더 선택",
+            initialdir=initial,
+            mustexist=False,
+        )
+        if selected:
+            self.dataset_dir.set(os.path.normpath(selected))
 
     def open_roi_editor(self):
         dataset = Path(self.d.cfg.paths.dataset_dir)
@@ -599,12 +638,41 @@ class SettingsDialog:
 
     def save(self):
         try:
-            self.d.cfg.camera.ip = self.ip.get().strip()
+            camera_ip = self.ip.get().strip()
+            dataset_value = self.dataset_dir.get().strip()
+            if not dataset_value:
+                messagebox.showerror("입력 오류", "데이터 저장 폴더를 선택하세요.", parent=self.win)
+                return
+
+            dataset_path = os.path.normpath(os.path.expandvars(os.path.expanduser(dataset_value)))
+            overlay_path = os.path.join(dataset_path, "overlay")
+            os.makedirs(dataset_path, exist_ok=True)
+            os.makedirs(overlay_path, exist_ok=True)
+
+            capture_settings_changed = (
+                camera_ip != self.d.cfg.camera.ip
+                or dataset_path != os.path.normpath(self.d.cfg.paths.dataset_dir)
+            )
+            self.d.cfg.camera.ip = camera_ip
+            self.d.cfg.paths.dataset_dir = dataset_path
+            self.d.cfg.paths.overlay_dir = overlay_path
             self.d.REFRESH_SECONDS = max(10, min(30, int(float(self.interval.get()))))
             self.d.cfg.roi.baseline_temp = float(self.baseline.get())
             self.d.cfg.roi.warning_delta = float(self.warning.get())
             self.d.cfg.roi.critical_delta = float(self.critical.get())
-            save_config(self.d.cfg); self.d._check_connection_async(); self.win.destroy()
+            save_config(self.d.cfg)
+            self.d._add_operating_log("환경설정", "저장 경로 변경", dataset_path)
+
+            if capture_settings_changed and self.d.capture:
+                self.d.capture.request_stop()
+                self.d.capture = None
+                self.d.monitoring = False
+                self.d.root.after(300, self.d.start_monitoring)
+
+            self.d._check_connection_async()
+            self.win.destroy()
+        except OSError as exc:
+            messagebox.showerror("저장 경로 오류", f"폴더를 만들거나 사용할 수 없습니다.\n{exc}", parent=self.win)
         except ValueError:
             messagebox.showerror("입력 오류", "숫자 설정값을 확인하세요.", parent=self.win)
 
