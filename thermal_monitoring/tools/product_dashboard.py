@@ -46,7 +46,8 @@ class RuntimeMetrics:
     connection_successes: int = 0
     capture_attempts: int = 0
     capture_successes: int = 0
-    sequence_successes: int = 0
+    analysis_ok: int = 0          # 분석 정상 완료 (저장된 파일 기반)
+    analysis_fail: int = 0        # 분석 실패
     exception_count: int = 0
     anomaly_today: int = 0
 
@@ -310,7 +311,7 @@ class ProductDashboard:
             self._finish_analysis(generation)
             return
         self.metrics.exception_count += 1
-        self._add_operating_log("시퀀스", "예외 처리", message)
+        self._add_operating_log("분석", "예외 처리", message)
         self._append_event("Error", 0.0, f"분석 예외: {message}")
         self._update_metric_text()
         self._finish_analysis(generation)
@@ -406,13 +407,11 @@ class ProductDashboard:
             self._append_event(status.value, result["max_temp"], "확인 필요")
 
         self._show_image(self.thermal_label, result["overlay"], "thermal")
-        if result["visual_img"] is not None:
-            self._draw_visible_roi(result["visual_img"], result["roi_bounds"])
         self._show_image(self.visual_label, result["visual_img"], "visual")
         self.latest_status = status
         self.last_update = datetime.now()
-        self.metrics.sequence_successes += 1
-        self._add_operating_log("시퀀스", "정상 완료",
+        self.metrics.analysis_ok += 1
+        self._add_operating_log("분석", "정상 완료",
                                 f"{result['base']} · {status.value} · Max {result['max_temp']:.1f}°C")
         self._update_values_with_result(result)
         self._finish_analysis(generation)
@@ -491,7 +490,7 @@ class ProductDashboard:
         self.metric_label.configure(text=(
             f"카메라 연결 {m.rate(m.connection_successes,m.connection_attempts):.1f}%   ·   "
             f"캡처 성공 {m.rate(m.capture_successes,m.capture_attempts):.1f}%   ·   "
-            f"시퀀스 정상 완료 {m.sequence_successes}회   ·   예외 처리 {m.exception_count}회"))
+            f"분석 정상 완료 {m.analysis_ok}회   ·   예외 처리 {m.exception_count}회"))
 
     def open_operating_log(self):
         win = tk.Toplevel(self.root); win.title("운영 로그"); win.geometry("920x520"); win.transient(self.root)
@@ -499,7 +498,7 @@ class ProductDashboard:
         m = self.metrics
         ttk.Label(summary, text=(f"연결 성공률 {m.rate(m.connection_successes,m.connection_attempts):.1f}%   |   "
                                  f"캡처 성공률 {m.rate(m.capture_successes,m.capture_attempts):.1f}%   |   "
-                                 f"시퀀스 정상 완료 {m.sequence_successes}회   |   예외 처리 {m.exception_count}회   |   "
+                                 f"분석 정상 완료 {m.analysis_ok}회   |   예외 처리 {m.exception_count}회   |   "
                                  f"상태 {self.lifecycle}"), font=("맑은 고딕",10,"bold")).pack(anchor="w")
         frame = ttk.LabelFrame(win, text="시간순 기록", padding=8); frame.pack(fill="both", expand=True, padx=12, pady=(6,12))
         columns = ("time", "category", "result", "detail")
