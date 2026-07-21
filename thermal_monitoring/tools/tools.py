@@ -474,7 +474,8 @@ class MonitoringDashboard:
             self._config.paths.overlay_dir = os.path.join(new_dir, "overlay")
             save_config(self._config)
             self._dir_var.set(new_dir)
-            self._processed_bases.clear()
+            with self._processed_bases_lock:
+                self._processed_bases.clear()
             self._prime_processed_cache()
             self._log_to_status(f"Dataset directory changed: {new_dir}")
             self._refresh_readiness()
@@ -716,7 +717,8 @@ class MonitoringDashboard:
         save_config(self._config)
 
         self._monitor_state = MonitorState()
-        self._processed_bases.clear()
+        with self._processed_bases_lock:
+            self._processed_bases.clear()
         self._prime_processed_cache()
         self._running = True
         self._tick_count = 0
@@ -815,10 +817,20 @@ class MonitoringDashboard:
             new_pairs = self._scan_new_pairs()
             results = []
             for pair in new_pairs:
-                result = self._process_pair_to_dict(pair)
-                results.append((result, pair["base"]))
+                try:
+                    result = self._process_pair_to_dict(pair)
+                    results.append((result, pair["base"]))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    self._append_activity_log(
+                        f"Analysis failed for {pair.get('base', 'unknown')}: "
+                        f"{traceback.format_exc()[-200:]}")
 
-            self.root.after(0, lambda: self._apply_analysis_result(results, generation))
+            if results:
+                self.root.after(0, lambda: self._apply_analysis_result(results, generation))
+            else:
+                self.root.after(0, lambda: self._finish_analysis_worker(generation))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -927,6 +939,7 @@ class MonitoringDashboard:
 
             was_notified = False
             if result_dict["do_alarm"]:
+                was_notified = True  # 알림 발송 시도 즉시 로그에는 Yes로 표시
                 threading.Thread(
                     target=self._try_notify_from_result, args=(result_dict,),
                     daemon=True,
@@ -979,6 +992,7 @@ class MonitoringDashboard:
         except Exception as exc:
             self._append_activity_log(f"Telegram error: {exc}")
             return False
+
     def _scan_all_paired_bases(self) -> set:
         dataset_dir = self._config.paths.dataset_dir
         if not os.path.isdir(dataset_dir):
@@ -998,7 +1012,8 @@ class MonitoringDashboard:
 
     def _prime_processed_cache(self):
         existing = self._scan_all_paired_bases()
-        self._processed_bases = existing
+        with self._processed_bases_lock:
+            self._processed_bases = existing
 
     def _scan_new_pairs(self) -> list[dict]:
         dataset_dir = self._config.paths.dataset_dir
