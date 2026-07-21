@@ -13,6 +13,9 @@ import cv2
 import numpy as np
 
 from ..config import load_config, RoiConfig as AppRoiConfig, RoiEntry
+from ..logger import get_logger
+
+_log = get_logger("analysis.roi")
 
 # Thermal 이미지 vs .npy 해상도 차이 보정
 DISPLAY_W = load_config().display.roi_display_width
@@ -109,7 +112,7 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
 
     # 유효성 검사 - ROI가 너무 작으면 전체 프레임 사용
     if y2 <= y1 or x2 <= x1:
-        print(f"[roi] WARNING: ROI too small ({config.x1},{config.y1})-({config.x2},{config.y2}), using full frame")
+        _log.warning("ROI too small (%d,%d)-(%d,%d), using full frame", config.x1, config.y1, config.x2, config.y2)
         roi = thermal
     else:
         roi = thermal[y1:y2, x1:x2]
@@ -117,6 +120,7 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
     # NaN 제거
     valid = roi[~np.isnan(roi)]
     if len(valid) == 0:
+        _log.warning("ROI has zero valid pixels (all NaN) — returning zeroed result")
         return RoiResult(
             roi_thermal=roi,
             max_temp=0.0,
@@ -152,10 +156,9 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
             area = int(stats[label_id, cv2.CC_STAT_AREA])
             if area < MIN_HOTSPOT:
                 continue
-            # 클러스터별 마스크 및 온도
-            cluster_mask = labels == label_id
             cluster_temps = roi[cluster_mask]
             cluster_max_temp = float(np.nanmax(cluster_temps))
+            _log.debug("hotspot cluster #%d: area=%d max=%.1f°C", label_id, area, cluster_max_temp)
 
             cx, cy = centroids_raw[label_id]
             # ROI 오프셋 적용 후 thermal 이미지 좌표계로 변환

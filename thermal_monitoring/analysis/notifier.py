@@ -135,6 +135,7 @@ def send_alarm(
                 )
             if resp.status_code == 200:
                 photo_sent = True
+                _log.info("sendPhoto success: robot=%s temp=%.1f°C", robot_id, temp)
             else:
                 _log.error("sendPhoto failed: HTTP %d %s", resp.status_code, resp.text)
                 print(f"[Telegram] sendPhoto failed: {resp.status_code} {resp.text}")

@@ -25,6 +25,9 @@ from ..analysis.threshold import MonitorState, Status, evaluate_with_state
 from ..capture.capture import CaptureSession
 from ..capture.thermal_utils import extract_from_jpeg
 from ..config import load_config, save_config
+from ..logger import get_logger
+
+_file_log = get_logger("tools.dashboard")
 
 try:
     RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
@@ -532,6 +535,7 @@ class ProductDashboard:
         row = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), category, result, detail)
         self.operating_logs.insert(0, row)
         del self.operating_logs[1000:]
+        _file_log.info("[%s] %s | %s", category, result, detail)
 
     def open_settings(self):
         SettingsDialog(self)

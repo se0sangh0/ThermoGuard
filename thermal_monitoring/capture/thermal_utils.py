@@ -83,7 +83,6 @@ def extract_from_jpeg(jpg_path, exiftool=None):
         meta keys: timestamp, distance_cm, ambient_temp
     """
     if exiftool is None:
-        # GUI-UPDATE: GUI에서 경로를 변경한 경우를 반영하도록 호출 시점에 다시 확인한다.
         exiftool = _get_default_exiftool()
 
     meta_args = [
@@ -99,12 +98,27 @@ def extract_from_jpeg(jpg_path, exiftool=None):
         "-DateTimeOriginal", "-FocusDistance",
         jpg_path
     ]
-    meta_json = subprocess.check_output(meta_args, timeout=30).decode()
+    try:
+        meta_json = subprocess.check_output(meta_args, timeout=30).decode()
+    except subprocess.TimeoutExpired:
+        _log.error("ExifTool metadata timeout for %s", jpg_path)
+        raise
+    except Exception as e:
+        _log.error("ExifTool metadata failed for %s: %s", jpg_path, e)
+        raise
+
     meta = json.loads(meta_json)[0]
 
-    raw_bytes = subprocess.check_output(
-        [exiftool, "-RawThermalImage", "-b", jpg_path], timeout=30
-    )
+    try:
+        raw_bytes = subprocess.check_output(
+            [exiftool, "-RawThermalImage", "-b", jpg_path], timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        _log.error("ExifTool RawThermalImage timeout for %s", jpg_path)
+        raise
+    except Exception as e:
+        _log.error("ExifTool RawThermalImage failed for %s: %s", jpg_path, e)
+        raise
     raw_stream = io.BytesIO(raw_bytes)
     thermal_img = Image.open(raw_stream)
     raw_np = np.array(thermal_img, dtype=np.uint16).astype(np.float64)

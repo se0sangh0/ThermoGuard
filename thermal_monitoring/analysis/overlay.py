@@ -15,6 +15,9 @@ import cv2
 import numpy as np
 
 from ..config import load_config
+from ..logger import get_logger
+
+_log = get_logger("analysis.overlay")
 
 cfg = load_config()
 DATASET_DIR = cfg.paths.dataset_dir
@@ -242,10 +245,13 @@ def create_overlay(
     """
     if homography is None:
         homography = _load_homography()
+        if homography is not None:
+            _log.info("Homography loaded from %s", HOMOGRAPHY_PATH)
     # GUI-UPDATE: Visual 파일이 없으면 Homography를 적용하지 않고 Thermal에 표시한다.
     if homography is not None and (
         not visual_jpg_path or not os.path.isfile(visual_jpg_path)
     ):
+        _log.info("Visual not available, using thermal-only overlay")
         homography = None
 
     canvas, canvas_roi, sx, sy = _prepare_canvas(

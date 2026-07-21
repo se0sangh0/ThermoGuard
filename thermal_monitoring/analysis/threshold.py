@@ -15,6 +15,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from ..config import load_config
+from ..logger import get_logger
+
+_log = get_logger("analysis.threshold")
 
 _cfg = load_config()
 MIN_HOTSPOT_SIZE = _cfg.hotspot.min_size       # 95th percentile 경로 최소 클러스터 크기
@@ -97,4 +100,22 @@ def evaluate_with_state(
         max_hotspot_size,
     )
     do_alarm = should_alarm(new_status, state)
+
+    # 상태 전환 로그 (파일 로그)
+    if new_status != state.status:
+        _log.info(
+            "STATE CHANGE: %s → %s | hot=%.1f°C max=%.1f°C mean=%.1f°C "
+            "baseline=%.1f°C warn_delta=%.1f°C crit_delta=%.1f°C "
+            "hotspot_size=%d over_pixels=%d",
+            state.status.value, new_status.value,
+            hot_temp, max_temp, mean_temp,
+            baseline, warning_delta, critical_delta,
+            max_hotspot_size, over_temp_pixels,
+        )
+    if do_alarm:
+        _log.info("ALARM TRIGGERED: %s | hot=%.1f°C max=%.1f°C", new_status.value, hot_temp, max_temp)
+    elif new_status == Status.CRITICAL and not do_alarm:
+        _log.info("ALARM SUPPRESSED: cooldown active (%.0fs remaining)",
+                  state.alarm_cooldown - (time.time() - state.last_alarm_time))
+
     return new_status, do_alarm
