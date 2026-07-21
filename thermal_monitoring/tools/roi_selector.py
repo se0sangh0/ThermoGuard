@@ -115,7 +115,16 @@ def load_existing_rois():
     c = load_config()
     rois.clear()
     if c.roi.rois:
-        rois.extend(c.roi.rois)
+        for entry in c.roi.rois:
+            if isinstance(entry, dict):
+                rois.append(entry)
+            else:
+                # RoiEntry dataclass → dict 변환
+                rois.append({
+                    "name": entry.name,
+                    "x1": entry.x1, "y1": entry.y1,
+                    "x2": entry.x2, "y2": entry.y2,
+                })
     elif None not in (c.roi.x1, c.roi.y1, c.roi.x2, c.roi.y2):
         # 하위 호환: 구버전 단일 ROI → 리스트로 변환
         rois.append({
