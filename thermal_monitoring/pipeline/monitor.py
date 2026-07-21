@@ -88,20 +88,20 @@ class MonitorSequencer:
         """thermal JPG + visual JPG 둘 다 존재하는 모든 base를 반환"""
         if not os.path.isdir(DATASET_DIR):
             return set()
+        thermal_jpgs: dict[str, str] = {}
+        visual_jpgs: dict[str, str] = {}
         try:
-            files = os.listdir(DATASET_DIR)
+            with os.scandir(DATASET_DIR) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    name = entry.name
+                    if name.endswith("_visual.jpg"):
+                        visual_jpgs[name.replace("_visual.jpg", "")] = name
+                    elif name.endswith(".jpg") and "_overlay" not in name:
+                        thermal_jpgs[name.replace(".jpg", "")] = name
         except OSError:
             return set()
-        thermal_jpgs = {
-            f.replace(".jpg", ""): f
-            for f in files
-            if f.endswith(".jpg") and "_visual" not in f
-        }
-        visual_jpgs = {
-            f.replace("_visual.jpg", ""): f
-            for f in files
-            if f.endswith("_visual.jpg")
-        }
         return set(thermal_jpgs.keys()) & set(visual_jpgs.keys())
 
     def _prime_processed_cache(self):
@@ -116,26 +116,23 @@ class MonitorSequencer:
         if not os.path.isdir(DATASET_DIR):
             return []
 
+        thermal_jpgs: dict[str, str] = {}
+        npys: dict[str, str] = {}
+        visual_jpgs: dict[str, str] = {}
         try:
-            files = os.listdir(DATASET_DIR)
+            with os.scandir(DATASET_DIR) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    name = entry.name
+                    if name.endswith("_thermal.npy"):
+                        npys[name.replace("_thermal.npy", "")] = name
+                    elif name.endswith("_visual.jpg"):
+                        visual_jpgs[name.replace("_visual.jpg", "")] = name
+                    elif name.endswith(".jpg") and "_overlay" not in name:
+                        thermal_jpgs[name.replace(".jpg", "")] = name
         except OSError:
             return []
-
-        thermal_jpgs = {
-            f.replace(".jpg", ""): f
-            for f in files
-            if f.endswith(".jpg") and "_visual" not in f
-        }
-        npys = {
-            f.replace("_thermal.npy", ""): f
-            for f in files
-            if f.endswith("_thermal.npy")
-        }
-        visual_jpgs = {
-            f.replace("_visual.jpg", ""): f
-            for f in files
-            if f.endswith("_visual.jpg")
-        }
 
         # thermal JPG + visual JPG 둘 다 있는 모든 쌍을 대상으로 함
         # visual이 없는 thermal만 있어도 분석 진행 (경고 모드 등)

@@ -28,7 +28,7 @@ from ..logger import get_logger
 _logger = get_logger("data.cleanup")
 
 _RELATIVE_SAVE_DIR = "thermal_dataset"
-_DEFAULT_RETENTION_DAYS = 7
+_DEFAULT_RETENTION_DAYS = 2
 
 
 @dataclass
@@ -134,14 +134,26 @@ def run_cleanup(
          log_callback, result.messages)
     _log(f"[cleanup] Scanning: {save_dir}", log_callback, result.messages)
 
-    files = os.listdir(save_dir)
-
-    # 분류
-    thermal_jpgs = {f.replace(".jpg", ""): f for f in files
-                    if f.endswith(".jpg") and "_visual" not in f and "_overlay" not in f}
-    npys = {f.replace("_thermal.npy", ""): f for f in files if f.endswith("_thermal.npy")}
-    visual_jpgs = {f.replace("_visual.jpg", ""): f for f in files if f.endswith("_visual.jpg")}
-    overlays = [f for f in files if f.endswith("_overlay.jpg")]
+    thermal_jpgs: dict[str, str] = {}
+    npys: dict[str, str] = {}
+    visual_jpgs: dict[str, str] = {}
+    overlays: list[str] = []
+    try:
+        with os.scandir(save_dir) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if name.endswith("_thermal.npy"):
+                    npys[name.replace("_thermal.npy", "")] = name
+                elif name.endswith("_visual.jpg"):
+                    visual_jpgs[name.replace("_visual.jpg", "")] = name
+                elif name.endswith("_overlay.jpg"):
+                    overlays.append(name)
+                elif name.endswith(".jpg"):
+                    thermal_jpgs[name.replace(".jpg", "")] = name
+    except OSError:
+        return result
 
     # 1. 오래된 Normal 쌍만 삭제 (Warning/Critical 이력 보존)
     alarm_bases = _load_alarm_bases(save_dir)
@@ -211,18 +223,25 @@ def run_cleanup(
     # 4. 대응 쌍 없는 오버레이
     overlay_dir = os.path.join(save_dir, "overlay")
     if os.path.isdir(overlay_dir):
-        for f in os.listdir(overlay_dir):
-            if not f.endswith("_overlay.jpg"):
-                continue
-            base = f.replace("_overlay.jpg", "")
-            if base not in paired and base not in thermal_jpgs:
-                p = os.path.join(overlay_dir, f)
-                try:
-                    result.freed_bytes += _get_file_size(p)
-                    os.remove(p)
-                    result.removed_overlay += 1
-                except OSError as e:
-                    result.errors.append(f"Failed to remove overlay {p}: {e}")
+        try:
+            with os.scandir(overlay_dir) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    f = entry.name
+                    if not f.endswith("_overlay.jpg"):
+                        continue
+                    base = f.replace("_overlay.jpg", "")
+                    if base not in paired and base not in thermal_jpgs:
+                        p = os.path.join(overlay_dir, f)
+                        try:
+                            result.freed_bytes += _get_file_size(p)
+                            os.remove(p)
+                            result.removed_overlay += 1
+                        except OSError as e:
+                            result.errors.append(f"Failed to remove overlay {p}: {e}")
+        except OSError:
+            pass
         if result.removed_overlay > 0:
             _log(f"[cleanup] Removed {result.removed_overlay} orphan overlay(s)", log_callback, result.messages)
 
@@ -249,7 +268,7 @@ def run_cleanup(
 # ════════════════════════════════════════════════════════════
 
 _last_cleanup_time: float = 0.0
-_CLEANUP_INTERVAL_SEC = 3600.0  # 1시간
+_CLEANUP_INTERVAL_SEC = 900.0  # 15분
 
 
 def run_cleanup_if_due(

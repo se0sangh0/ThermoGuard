@@ -39,11 +39,20 @@ class CheckResult:
 
 # GUI-UPDATE: Browse로 선택한 Dataset을 검사하도록 전역 SAVE_DIR 의존을 제거했다.
 def _scan(save_dir: str):
-    files = os.listdir(save_dir)
-    jpgs = {f.replace(".jpg", ""): f
-            for f in files if f.endswith(".jpg") and "_visual" not in f}
-    npys = {f.replace("_thermal.npy", ""): f
-            for f in files if f.endswith("_thermal.npy")}
+    jpgs: dict[str, str] = {}
+    npys: dict[str, str] = {}
+    try:
+        with os.scandir(save_dir) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if name.endswith("_thermal.npy"):
+                    npys[name.replace("_thermal.npy", "")] = name
+                elif name.endswith(".jpg") and "_visual" not in name and "_overlay" not in name:
+                    jpgs[name.replace(".jpg", "")] = name
+    except OSError:
+        pass
     return jpgs, npys
 
 

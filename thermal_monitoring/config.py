@@ -65,11 +65,12 @@ class RoiConfig:
 
 @dataclass
 class MonitoringConfig:
-    process_interval_sec: float = 2.0
+    process_interval_sec: float = 10.0
     integrity_interval_sec: float = 60.0
     metadata_interval_sec: float = 120.0
     max_processed_cache: int = 10000
     alarm_cooldown_sec: float = 600.0
+    cleanup_retention_days: int = 2
 
 
 @dataclass
