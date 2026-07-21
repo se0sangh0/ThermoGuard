@@ -75,6 +75,7 @@ class ProductDashboard:
         self.cfg = load_config(force_reload=True)
         self.lifecycle = "running"  # running -> closing -> closed
         self.monitoring = False
+        self.capture_paused_by_user = False
         self.capture: Optional[CaptureSession] = None
         self.timer_id: Optional[str] = None
         self.processed: set[str] = set()
@@ -139,8 +140,16 @@ class ProductDashboard:
         self.header_time = tk.Label(right, text="마지막 갱신 —", bg=COLORS["navy"], fg="#c7d6e5",
                                     font=("맑은 고딕", 10))
         self.header_time.pack(side="left", padx=12)
-        tk.Label(right, text=f"{self.REFRESH_SECONDS}초마다 자동 갱신", bg=COLORS["navy"],
-                 fg="#c7d6e5", font=("맑은 고딕", 10)).pack(side="left", padx=12)
+        self.header_refresh_interval = tk.Label(
+            right, text=f"{self.REFRESH_SECONDS}초마다 자동 갱신",
+            bg=COLORS["navy"], fg="#c7d6e5", font=("맑은 고딕", 10),
+        )
+        self.header_refresh_interval.pack(side="left", padx=12)
+        self.capture_toggle_button = ttk.Button(
+            right, text="■  촬영 정지", style="Action.TButton",
+            command=self.toggle_capture,
+        )
+        self.capture_toggle_button.pack(side="left", padx=4)
         ttk.Button(right, text="↻  새로고침", style="Action.TButton",
                    command=self.refresh_now).pack(side="left", padx=4)
         ttk.Button(right, text="▤  운영 로그", style="Action.TButton",
@@ -248,9 +257,12 @@ class ProductDashboard:
 
     def _connection_result(self, ok):
         if ok:
-            self._set_system_state("정상 운영 중", COLORS["green"])
             self._add_operating_log("연결", "성공", f"카메라 {self.cfg.camera.ip} 응답 확인")
-            if not self.monitoring:
+            if self.capture_paused_by_user:
+                self._set_system_state("촬영 정지", COLORS["orange"])
+            else:
+                self._set_system_state("정상 운영 중", COLORS["green"])
+            if not self.monitoring and not self.capture_paused_by_user:
                 self.start_monitoring()
         else:
             self._set_system_state("연결 지연", COLORS["orange"])
@@ -260,20 +272,25 @@ class ProductDashboard:
     def start_monitoring(self):
         if self.monitoring or self.lifecycle != "running":
             return
+        self.capture_paused_by_user = False
         self.monitoring = True
+        self.capture_toggle_button.configure(text="■  촬영 정지")
         roi = self.cfg.roi
         baseline = roi.baseline_temp
         warning_delta = roi.warning_delta
 
         def _probe_callback(max_temp: float) -> bool:
+            capture = self.capture
+            if not self.monitoring or capture is None:
+                return False
             if max_temp >= baseline + warning_delta:
-                self.capture.set_warning_mode(True)
+                capture.set_warning_mode(True)
                 self._schedule_refresh(100)  # 즉시 분석 가속
-                w_interval = getattr(self.capture, '_warning_interval', 5.0)
+                w_interval = getattr(capture, '_warning_interval', 5.0)
                 self._add_operating_log("프로브", "과열 감지", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
                 return True
             else:
-                self.capture.set_warning_mode(False)
+                capture.set_warning_mode(False)
                 return False
 
         self.capture = CaptureSession(
@@ -283,6 +300,28 @@ class ProductDashboard:
             probe_callback=_probe_callback,
         )
         self.capture.start()
+
+    def toggle_capture(self):
+        """현장 사용자가 촬영만 정지하거나 다시 시작할 수 있게 한다."""
+        if self.monitoring:
+            self.stop_monitoring()
+        else:
+            self.start_monitoring()
+            self._set_system_state("정상 운영 중", COLORS["green"])
+            self._add_operating_log("촬영", "시작", "사용자가 촬영을 다시 시작함")
+
+    def stop_monitoring(self):
+        if not self.monitoring:
+            return
+        self.capture_paused_by_user = True
+        self.monitoring = False
+        capture = self.capture
+        self.capture = None
+        if capture:
+            capture.request_stop()
+        self.capture_toggle_button.configure(text="▶  촬영 시작")
+        self._set_system_state("촬영 정지", COLORS["orange"])
+        self._add_operating_log("촬영", "정지", "사용자가 촬영을 정지함")
 
     def _capture_log(self, message: str):
         if "saved" in message:
@@ -306,9 +345,8 @@ class ProductDashboard:
         self.timer_id = None
         self._schedule_analysis()
         self._update_metric_text()
-        # Warning/Critical 상태면 가속 분석, 아니면 기본 주기
-        interval = self.REFRESH_FAST_SECONDS * 1000 if self.state.status != Status.NORMAL else self.REFRESH_SECONDS * 1000
-        self._schedule_refresh(interval)
+        # 환경설정에서 지정한 화면 갱신 주기를 상태와 관계없이 적용한다.
+        self._schedule_refresh(self.REFRESH_SECONDS * 1000)
 
     def _schedule_analysis(self):
         if self._analysis_running:
@@ -498,9 +536,20 @@ class ProductDashboard:
                                     f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
                                     else "정상 복귀")
 
-        self._show_image(self.thermal_label, result["overlay"], "thermal")
-        self._show_image(self.visual_label, result["visual_img"], "visual")
         quality_ok = bool(result.get("image_quality_ok", False))
+        # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다. 한쪽씩
+        # 갱신하면 캡처 저장 시차나 잘못된 파일 쌍 때문에 좌우 영상이
+        # 뒤바뀌어 보일 수 있으므로, 이상 프레임은 표시하지 않고 직전의
+        # 정상 화면을 유지한다.
+        if quality_ok:
+            self._show_image(self.visual_label, result["visual_img"], "visual")
+            self._show_image(self.thermal_label, result["overlay"], "thermal")
+        else:
+            if self.visual_photo is None:
+                self._show_image(self.visual_label, None, "visual")
+            if self.thermal_photo is None:
+                self._show_image(self.thermal_label, None, "thermal")
+
         self.metrics.image_quality_checks += 1
         if quality_ok:
             self.metrics.image_quality_successes += 1
@@ -539,9 +588,15 @@ class ProductDashboard:
                 f"{result['hot_temp_95']:.1f} °C", f"{result['hotspot_count']}개")
         for lab, value in zip(self.temp_labels, vals):
             lab.configure(text=value)
-        stamp = self.last_update.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
-        self.visual_stamp.configure(text=stamp)
-        self.thermal_stamp.configure(text=stamp)
+        if result.get("image_quality_ok", False):
+            stamp = self.last_update.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
+            self.visual_stamp.configure(text=stamp)
+            self.thermal_stamp.configure(text=stamp)
+        else:
+            issue = result.get("image_quality_reason", "영상 종류 확인 필요")
+            hold_text = f"갱신 보류 · {issue}"
+            self.visual_stamp.configure(text=hold_text)
+            self.thermal_stamp.configure(text=hold_text)
         self.header_time.configure(text=self.last_update.strftime("마지막 갱신 %H:%M:%S"))
 
     def _finish_analysis(self, generation: int):
@@ -755,6 +810,15 @@ class SettingsDialog:
                 messagebox.showerror("입력 오류", "데이터 저장 폴더를 선택하세요.", parent=self.win)
                 return
 
+            refresh_seconds = int(float(self.interval.get()))
+            if not 10 <= refresh_seconds <= 300:
+                messagebox.showerror(
+                    "입력 오류",
+                    "화면 갱신 주기는 10초에서 300초 사이로 입력하세요.",
+                    parent=self.win,
+                )
+                return
+
             dataset_path = os.path.normpath(os.path.expandvars(os.path.expanduser(dataset_value)))
             overlay_path = os.path.join(dataset_path, "overlay")
             os.makedirs(dataset_path, exist_ok=True)
@@ -767,12 +831,23 @@ class SettingsDialog:
             self.d.cfg.camera.ip = camera_ip
             self.d.cfg.paths.dataset_dir = dataset_path
             self.d.cfg.paths.overlay_dir = overlay_path
-            self.d.REFRESH_SECONDS = max(10, min(30, int(float(self.interval.get()))))
+            previous_refresh_seconds = self.d.REFRESH_SECONDS
+            self.d.REFRESH_SECONDS = refresh_seconds
+            self.d.header_refresh_interval.configure(
+                text=f"{refresh_seconds}초마다 자동 갱신"
+            )
             self.d.cfg.roi.baseline_temp = float(self.baseline.get())
             self.d.cfg.roi.warning_delta = float(self.warning.get())
             self.d.cfg.roi.critical_delta = float(self.critical.get())
             save_config(self.d.cfg)
             self.d._add_operating_log("환경설정", "저장 경로 변경", dataset_path)
+            if refresh_seconds != previous_refresh_seconds:
+                self.d._add_operating_log(
+                    "환경설정", "화면 갱신 주기 변경",
+                    f"{previous_refresh_seconds}초 → {refresh_seconds}초",
+                )
+            # 이미 예약된 타이머도 취소하고 새 입력값 기준으로 다시 예약한다.
+            self.d._schedule_refresh(refresh_seconds * 1000)
 
             if capture_settings_changed and self.d.capture:
                 self.d.capture.request_stop()
