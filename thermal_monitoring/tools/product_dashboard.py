@@ -293,10 +293,44 @@ class ProductDashboard:
             result = self._process_pair_to_dict(pair)
             self.root.after(0, lambda: self._apply_analysis_result(result, generation))
         except Exception as exc:
-            self.metrics.exception_count += 1
-            self._add_operating_log("시퀀스", "예외 처리", str(exc))
-            self._append_event("Error", 0.0, f"분석 예외: {exc}")
-            self.root.after(0, lambda: self._finish_analysis(generation))
+            message = str(exc)
+            self.root.after(
+                0,
+                lambda msg=message: self._handle_analysis_error(msg, generation),
+            )
+
+    def _handle_analysis_error(self, message: str, generation: int):
+        """Worker 오류를 Tk 메인 스레드에서 로그와 화면에 반영한다."""
+        if self.lifecycle != "running":
+            self._finish_analysis(generation)
+            return
+        self.metrics.exception_count += 1
+        self._add_operating_log("시퀀스", "예외 처리", message)
+        self._append_event("Error", 0.0, f"분석 예외: {message}")
+        self._update_metric_text()
+        self._finish_analysis(generation)
+
+    def _latest_pair(self):
+        """Return the newest thermal, visual and NPY paths for analysis."""
+        dataset = Path(self.cfg.paths.dataset_dir)
+        if not dataset.exists():
+            return None
+
+        thermal_files = sorted(
+            path for path in dataset.glob("*.jpg")
+            if "_visual" not in path.name
+        )
+        if not thermal_files:
+            return None
+
+        thermal = thermal_files[-1]
+        base = thermal.stem
+        visual = dataset / f"{base}_visual.jpg"
+        npy = dataset / f"{base}_thermal.npy"
+        if not npy.exists():
+            matrix, _ = extract_from_jpeg(str(thermal))
+            np.save(npy, matrix)
+        return base, thermal, visual if visual.exists() else None, npy
 
     def _process_pair_to_dict(self, pair) -> dict:
         base, thermal, visual, npy = pair
@@ -550,8 +584,11 @@ class SettingsDialog:
         self.win.grab_release()
         try:
             from .calibration import run_calibration
-            run_calibration(str(thermal), str(visual))
-            self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
+            saved = run_calibration(str(thermal), str(visual))
+            if saved:
+                self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
+            else:
+                self.d._add_operating_log("캘리브레이션", "종료", "저장 없이 종료")
         except Exception as exc:
             self.d.metrics.exception_count += 1
             self.d._add_operating_log("캘리브레이션", "예외 처리", str(exc))

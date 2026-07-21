@@ -17,6 +17,8 @@ import numpy as np
 import sys
 import os
 import glob
+import tkinter as tk
+from tkinter import messagebox, ttk
 
 from ..config import load_config
 
@@ -28,6 +30,149 @@ r_mouse_x, r_mouse_y = -1, -1  # RGB 창 마우스 (원본 해상도)
 
 ZOOM_SIZE = 80      # 확대경 영역 크기 (px)
 ZOOM_SCALE = 3.0    # 확대 배율
+MAX_MEAN_ERROR_PX = 5.0
+MAX_POINT_ERROR_PX = 10.0
+
+
+class CalibrationControls:
+    """OpenCV calibration views에 버튼과 상태 안내를 제공하는 제어 팝업."""
+
+    def __init__(self):
+        parent = tk._default_root
+        if parent is None:
+            self.window = tk.Tk()
+            self._owns_root = True
+        else:
+            self.window = tk.Toplevel(parent)
+            self.window.transient(parent)
+            self._owns_root = False
+
+        self.action = None
+        self.window.title("Thermal-RGB 캘리브레이션")
+        self.window.geometry("640x230")
+        self.window.resizable(False, False)
+        self.window.protocol("WM_DELETE_WINDOW", lambda: self.request("quit"))
+
+        frame = ttk.Frame(self.window, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="Thermal → 가시광 순서로 동일한 지점을 선택하세요.",
+            font=("맑은 고딕", 13, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="마우스 위치는 영상 우측 하단에 3배 확대됩니다. "
+                 "정확한 검증을 위해 화면 전체에 6쌍 이상을 고르게 선택하는 것을 권장합니다.",
+            wraplength=600,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 12))
+
+        self.status_var = tk.StringVar(value="다음 작업: Thermal 이미지에서 첫 번째 대응점 선택")
+        ttk.Label(frame, textvariable=self.status_var, foreground="#145ea8").pack(anchor="w", pady=(0, 12))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="오차 검사 및 저장 (Ctrl+S)", command=lambda: self.request("save")).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="마지막 점 취소 (Z)", command=lambda: self.request("undo")).pack(side="left", padx=6)
+        ttk.Button(buttons, text="전체 리셋 (R)", command=lambda: self.request("reset")).pack(side="left", padx=6)
+        ttk.Button(buttons, text="종료 (Esc)", command=lambda: self.request("quit")).pack(side="right")
+
+        self.window.bind("<Control-s>", lambda _event: self.request("save"))
+        self.window.bind("<Control-S>", lambda _event: self.request("save"))
+        self.window.bind("z", lambda _event: self.request("undo"))
+        self.window.bind("Z", lambda _event: self.request("undo"))
+        self.window.bind("r", lambda _event: self.request("reset"))
+        self.window.bind("R", lambda _event: self.request("reset"))
+        self.window.bind("<Escape>", lambda _event: self.request("quit"))
+        self.window.update_idletasks()
+
+    def request(self, action):
+        self.action = action
+
+    def consume_action(self):
+        action = self.action
+        self.action = None
+        return action
+
+    def update_status(self):
+        complete = min(len(thermal_pts), len(rgb_pts))
+        if pair_state == "thermal":
+            next_step = "Thermal 이미지에서 대응점 선택"
+        else:
+            next_step = "가시광 이미지에서 같은 대응점 선택"
+        self.status_var.set(f"완성된 대응점: {complete}쌍 / 다음 작업: {next_step}")
+        self.window.update_idletasks()
+        self.window.update()
+
+    def close(self):
+        if self.window.winfo_exists():
+            self.window.destroy()
+
+
+def _validate_and_save_calibration(cfg, parent) -> bool:
+    """오차를 검사하고 허용 범위 이내인 경우에만 Homography를 저장한다."""
+    if len(thermal_pts) != len(rgb_pts):
+        messagebox.showwarning(
+            "저장할 수 없음",
+            "Thermal과 가시광 대응점을 같은 개수로 완성하세요.",
+            parent=parent,
+        )
+        return False
+    if len(thermal_pts) < 4:
+        messagebox.showwarning(
+            "저장할 수 없음",
+            f"최소 4쌍의 대응점이 필요합니다. 현재 {len(thermal_pts)}쌍입니다.",
+            parent=parent,
+        )
+        return False
+
+    thermal_arr = np.asarray(thermal_pts, dtype=np.float32)
+    rgb_arr = np.asarray(rgb_pts, dtype=np.float32)
+    matrix, _ = cv2.findHomography(thermal_arr, rgb_arr)
+    if matrix is None:
+        messagebox.showerror(
+            "캘리브레이션 계산 실패",
+            "대응점이 한쪽에 몰리거나 일직선이 되지 않도록 다시 선택하세요.",
+            parent=parent,
+        )
+        return False
+
+    projected = cv2.perspectiveTransform(thermal_arr.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    errors = np.linalg.norm(projected - rgb_arr, axis=1)
+    mean_error = float(errors.mean())
+    max_error = float(errors.max())
+    rmse = float(np.sqrt(np.mean(np.square(errors))))
+    metrics = (
+        f"대응점: {len(thermal_arr)}쌍\n"
+        f"평균 오차: {mean_error:.2f}px\n"
+        f"최대 오차: {max_error:.2f}px\n"
+        f"RMSE: {rmse:.2f}px\n\n"
+        f"허용 기준: 평균 {MAX_MEAN_ERROR_PX:.1f}px 이하, "
+        f"최대 {MAX_POINT_ERROR_PX:.1f}px 이하"
+    )
+
+    if mean_error > MAX_MEAN_ERROR_PX or max_error > MAX_POINT_ERROR_PX:
+        messagebox.showwarning(
+            "캘리브레이션 보정 필요",
+            "캘리브레이션 오차가 허용 기준보다 큽니다.\n"
+            "현재 결과는 저장하지 않았습니다.\n\n"
+            f"{metrics}\n\n"
+            "[전체 리셋] 후 특징이 명확하고 화면 전체에 고르게 분포된 대응점을 다시 선택하세요.",
+            parent=parent,
+        )
+        return False
+
+    output_path = cfg.paths.homography_path
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    np.save(output_path, matrix)
+    messagebox.showinfo(
+        "캘리브레이션 정상 완료",
+        "오차가 허용 기준 이내여서 보정값을 저장했습니다.\n\n"
+        f"{metrics}\n\n저장 위치: {output_path}",
+        parent=parent,
+    )
+    return True
 
 
 def draw_crosshair(img, x, y, color, size=4, thickness=1, gap=2):
@@ -130,6 +275,7 @@ def run_calibration(thermal_path=None, rgb_path=None):
 
     cv2.setMouseCallback("Thermal", make_scaled_callback(click_thermal, thermal_scale))
     cv2.setMouseCallback("RGB", make_scaled_callback(click_rgb, rgb_scale))
+    controls = CalibrationControls()
 
     while True:
         t = thermal_disp.copy()
@@ -199,17 +345,33 @@ def run_calibration(thermal_path=None, rgb_path=None):
         cv2.imshow("RGB", r)
 
         key = cv2.waitKey(1)
+        try:
+            controls.update_status()
+        except tk.TclError:
+            cv2.destroyAllWindows()
+            return False
 
-        if key == ord('q') or key == 27:
+        action = controls.consume_action()
+        if key == ord('s'):
+            action = "save"
+        elif key == ord('r'):
+            action = "reset"
+        elif key == ord('z'):
+            action = "undo"
+        elif key == ord('q') or key == 27:
+            action = "quit"
+
+        if action == "quit":
             print("Quit without saving.")
             cv2.destroyAllWindows()
-            return
-        elif key == ord('r'):
+            controls.close()
+            return False
+        elif action == "reset":
             thermal_pts.clear()
             rgb_pts.clear()
             pair_state = "thermal"
             print("[Reset] All points cleared.")
-        elif key == ord('z'):
+        elif action == "undo":
             if pair_state == "rgb" and thermal_pts:
                 thermal_pts.pop()
                 pair_state = "thermal"
@@ -220,13 +382,11 @@ def run_calibration(thermal_path=None, rgb_path=None):
                 print(f"[Undo] Last RGB point removed ({len(rgb_pts)} remaining)")
             else:
                 print("[Undo] Nothing to undo.")
-        elif key == ord('s'):
-            if len(thermal_pts) < 4:
-                print(f"[Save] Need at least 4 point pairs, currently have {len(thermal_pts)}")
-            elif len(thermal_pts) != len(rgb_pts):
-                print(f"[Save] Point count mismatch: thermal={len(thermal_pts)} vs rgb={len(rgb_pts)}")
-            else:
-                break
+        elif action == "save":
+            if _validate_and_save_calibration(cfg, controls.window):
+                cv2.destroyAllWindows()
+                controls.close()
+                return True
 
     cv2.destroyAllWindows()
 
