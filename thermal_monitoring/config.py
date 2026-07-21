@@ -31,7 +31,7 @@ OLD_EXP_CONFIG = "experiment_config.json"
 class CameraConfig:
     ip: str = "192.168.0.51"
     capture_interval_sec: float = 30.0
-    warning_interval_sec: float = 1.0
+    warning_interval_sec: float = 5.0
 
 
 @dataclass
