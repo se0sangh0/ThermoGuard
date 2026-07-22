@@ -103,7 +103,7 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
     if config is None:
         config = load_roi_config()
 
-    thermal = np.load(npy_path).astype(np.float64)
+    thermal = np.load(npy_path).astype(np.float32)
 
     if thermal.ndim != 2:
         raise ValueError(f"Expected 2D thermal array, got shape {thermal.shape}")

@@ -109,12 +109,20 @@ def _planck_params_from_meta(meta: dict) -> dict:
 
 
 def _raw_bytes_to_max_temp(raw_bytes: bytes, planck_params: dict) -> float:
-    """RawThermalImage 바이너리 → Planck 변환 → 최고 온도(°C)."""
+    """RawThermalImage 바이너리 → Planck 변환 → 최고 온도(°C).
+
+    raw2temp는 raw에 대해 단조 증가이므로, 전체 배열을 변환할 필요 없이
+    최대 raw 값 하나만 변환하여 최고 온도를 얻는다.
+    """
     raw_stream = io.BytesIO(raw_bytes)
     thermal_img = Image.open(raw_stream)
-    raw_np = np.array(thermal_img, dtype=np.uint16).astype(np.float64)
-    thermal = raw2temp(raw_np, **planck_params)
-    return float(np.nanmax(thermal))
+    raw_np = np.array(thermal_img, dtype=np.uint16)
+    max_raw = np.max(raw_np)
+    max_temp = raw2temp(np.float32(max_raw), **planck_params)
+    if np.isnan(max_temp):
+        thermal = raw2temp(raw_np.astype(np.float32), **planck_params)
+        return float(np.nanmax(thermal))
+    return float(max_temp)
 
 
 def extract_from_jpeg(jpg_path, exiftool=None):
@@ -162,7 +170,7 @@ def extract_from_jpeg(jpg_path, exiftool=None):
         raise
     raw_stream = io.BytesIO(raw_bytes)
     thermal_img = Image.open(raw_stream)
-    raw_np = np.array(thermal_img, dtype=np.uint16).astype(np.float64)
+    raw_np = np.array(thermal_img, dtype=np.uint16).astype(np.float32)
 
     params = _planck_params_from_meta(meta)
 
