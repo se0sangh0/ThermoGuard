@@ -29,6 +29,12 @@ from .thermal_utils import probe_thermal_from_url
 
 _log = get_logger("capture")
 
+# 카메라 REST API의 일시적 오류(서버 busy·동시 요청 등) → 짧은 백오프로 재시도.
+_TRANSIENT_STATUSES = frozenset({502, 503, 504, 429})
+_MAX_TRANSIENT_RETRIES = 2               # 최초 1회 + 추가 재시도 2회
+_RETRY_BACKOFF_SEC = (0.5, 1.0)          # 재시도 회차별 대기
+_MAX_RETRY_AFTER_SEC = 2.0               # Retry-After 헤더 반영 시 상한 (인터벌 초과 방지)
+
 
 class CaptureSession:
     def __init__(
@@ -54,6 +60,10 @@ class CaptureSession:
         self._normal_interval = self.interval
         self._warning_interval = cfg.camera.warning_interval_sec
         self._interval_lock = threading.Lock()
+        # 가장 최근 캡처 사이클에서 저장된 (thermal, visual) 경로. 알람 오버레이가
+        # 카메라를 다시 치지 않고 최신 프레임을 재사용할 수 있게 노출한다.
+        self._last_pair: tuple[str | None, str | None] = (None, None)
+        self._last_pair_lock = threading.Lock()
         # GUI-UPDATE: cam_ip 인자가 None이어도 config에서 확정된 self.cam_ip를 사용한다.
         self._urls = {
             "thermal": f"http://{self.cam_ip}/api/image/current?imgformat=JPEG",
@@ -97,6 +107,16 @@ class CaptureSession:
     def running(self) -> bool:
         return self._running
 
+    @property
+    def last_saved_pair(self) -> tuple[str | None, str | None]:
+        """가장 최근 캡처 사이클에서 저장된 (thermal, visual) 경로.
+
+        경고 모드(thermal-only 캡처)면 visual은 None, 아직 캡처 전이면 (None, None).
+        오버레이 생성 시 카메라 추가 접근 없이 최신 프레임을 쓰기 위한 용도.
+        """
+        with self._last_pair_lock:
+            return self._last_pair
+
     def capture_both_once(self) -> tuple[str | None, str | None]:
         """알람용 일회성 캡처: thermal + visual 동시 요청 → 디스크 저장 → 경로 반환.
 
@@ -111,27 +131,12 @@ class CaptureSession:
         do_visual = self.mode == "both"
         filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
 
-        def _fetch_one(img_type: str) -> tuple[str, bytes | None, str | None]:
-            try:
-                r = requests.get(self._urls[img_type], timeout=10)
-                if r.status_code == 200:
-                    content_type = r.headers.get("Content-Type", "")
-                    if "image" not in content_type.lower() and content_type != "octet-stream":
-                        _log.warning("[%s] batched capture: unexpected Content-Type: %s", img_type, content_type)
-                        return img_type, None, f"[{img_type}] Not an image"
-                    return img_type, r.content, None
-                _log.warning("[%s] batched capture: HTTP %d", img_type, r.status_code)
-                return img_type, None, f"[{img_type}] HTTP {r.status_code}"
-            except Exception as e:
-                _log.error("[%s] batched capture failed: %s", img_type, e)
-                return img_type, None, str(e)
-
         results: dict[str, str | None] = {"thermal": None, "visual": None}
         img_types = ["thermal", "visual"] if do_visual else ["thermal"]
 
         if len(img_types) > 1:
             with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = {executor.submit(_fetch_one, t): t for t in img_types}
+                futures = {executor.submit(self._fetch_image, t): t for t in img_types}
                 for future in as_completed(futures):
                     img_type, content, error = future.result()
                     if error or content is None:
@@ -144,13 +149,17 @@ class CaptureSession:
                     results[img_type] = jpg_path
                     self._log(f"[{datetime.now().strftime('%H:%M:%S')}] [alarm] [{img_type}] saved ({len(content)} bytes)")
         else:
-            _, content, error = _fetch_one("thermal")
+            _, content, error = self._fetch_image("thermal")
             if error or content is None:
                 return (None, None)
             jpg_path = os.path.join(self.save_dir, f"{filenametime}.jpg")
             with open(jpg_path, "wb") as f:
                 f.write(content)
             results["thermal"] = jpg_path
+
+        if results["thermal"]:
+            with self._last_pair_lock:
+                self._last_pair = (results["thermal"], results.get("visual"))
 
         return (results["thermal"], results.get("visual"))
 
@@ -166,6 +175,60 @@ class CaptureSession:
                 self._log(f"[capture] Interval changed: {old:.1f}s → {new_interval:.1f}s " +
                           f"({'warning' if active else 'normal'} mode)")
 
+    def _retry_delay(self, resp, attempt: int) -> float:
+        """재시도 대기 시간. Retry-After(초) 헤더가 있으면 반영하되 상한으로 캡."""
+        base = _RETRY_BACKOFF_SEC[min(attempt, len(_RETRY_BACKOFF_SEC) - 1)]
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                base = max(base, float(retry_after))  # 초 단위 형식만 처리 (HTTP-date는 무시)
+            except ValueError:
+                pass
+        return min(base, _MAX_RETRY_AFTER_SEC)
+
+    def _fetch_image(self, img_type: str) -> tuple[str, bytes | None, str | None]:
+        """단일 이미지 캡처 (thermal/visual 공용). 503 등 일시적 오류는 짧은 백오프로 재시도.
+
+        Returns:
+            (img_type, content_bytes | None, error_str | None)
+        """
+        url = self._urls[img_type]
+        last_err: str | None = None
+        for attempt in range(_MAX_TRANSIENT_RETRIES + 1):
+            try:
+                r = requests.get(url, timeout=10)
+            except requests.exceptions.Timeout:
+                _log.error("[%s] Timeout connecting to %s", img_type, self.cam_ip)
+                return img_type, None, f"[{img_type}] Timeout"
+            except requests.exceptions.ConnectionError as e:
+                _log.error("[%s] Connection refused: %s (%s)", img_type, self.cam_ip, e)
+                return img_type, None, f"[{img_type}] Connection error"
+            except Exception as e:
+                _log.error("[%s] Unexpected error: %s", img_type, e, exc_info=True)
+                return img_type, None, str(e)
+
+            if r.status_code == 200:
+                content_type = r.headers.get("Content-Type", "")
+                if "image" not in content_type.lower() and content_type != "octet-stream":
+                    _log.warning("[%s] Unexpected Content-Type: %s", img_type, content_type)
+                    return img_type, None, f"[{img_type}] Not an image. Content-Type: {content_type}"
+                return img_type, r.content, None
+
+            # 일시적 상태 코드 → 남은 재시도가 있으면 백오프 후 재시도
+            if r.status_code in _TRANSIENT_STATUSES and attempt < _MAX_TRANSIENT_RETRIES and self._running:
+                delay = self._retry_delay(r, attempt)
+                _log.warning("[%s] HTTP %d from %s — retry %d/%d after %.1fs",
+                             img_type, r.status_code, self.cam_ip,
+                             attempt + 1, _MAX_TRANSIENT_RETRIES, delay)
+                last_err = f"[{img_type}] HTTP {r.status_code}"
+                time.sleep(delay)
+                continue
+
+            _log.warning("[%s] HTTP %d from %s", img_type, r.status_code, self.cam_ip)
+            return img_type, None, f"[{img_type}] HTTP {r.status_code}"
+
+        return img_type, None, last_err or f"[{img_type}] transient failure"
+
     def _run(self):
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -176,34 +239,14 @@ class CaptureSession:
             img_types = ["thermal", "visual"] if (self.mode == "both" and is_normal_cycle) else ["thermal"]
             try:
                 filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
+                saved_thermal: str | None = None
+                saved_visual: str | None = None
 
-                def _fetch_one(img_type: str) -> tuple[str, bytes | None, str | None]:
-                    """단일 이미지 타입 캡처 — 병렬 호출용."""
-                    try:
-                        r = requests.get(self._urls[img_type], timeout=10)
-                        if r.status_code == 200:
-                            content_type = r.headers.get("Content-Type", "")
-                            if "image" not in content_type.lower() and content_type != "octet-stream":
-                                _log.warning("[%s] Unexpected Content-Type: %s", img_type, content_type)
-                                return img_type, None, f"[{img_type}] Not an image. Content-Type: {content_type}"
-                            return img_type, r.content, None
-                        _log.warning("[%s] HTTP %d from %s", img_type, r.status_code, self.cam_ip)
-                        return img_type, None, f"[{img_type}] HTTP {r.status_code}"
-                    except requests.exceptions.Timeout:
-                        _log.error("[%s] Timeout connecting to %s", img_type, self.cam_ip)
-                        return img_type, None, f"[{img_type}] Timeout"
-                    except requests.exceptions.ConnectionError as e:
-                        _log.error("[%s] Connection refused: %s (%s)", img_type, self.cam_ip, e)
-                        return img_type, None, f"[{img_type}] Connection error"
-                    except Exception as e:
-                        _log.error("[%s] Unexpected error: %s", img_type, e, exc_info=True)
-                        return img_type, None, str(e)
-
-                # Thermal + Visual 동시 요청으로 정렬 오차 최소화
+                # Thermal + Visual 동시 요청으로 정렬 오차 최소화 (503 등은 _fetch_image가 재시도)
                 all_ok = True
                 if len(img_types) > 1:
                     with ThreadPoolExecutor(max_workers=2) as executor:
-                        futures = {executor.submit(_fetch_one, t): t for t in img_types}
+                        futures = {executor.submit(self._fetch_image, t): t for t in img_types}
                         for future in as_completed(futures):
                             if not self._running:
                                 break
@@ -219,13 +262,17 @@ class CaptureSession:
                             jpg_path = os.path.join(self.save_dir, f"{filenametime}{suffix}.jpg")
                             with open(jpg_path, "wb") as f:
                                 f.write(content)
+                            if img_type == "visual":
+                                saved_visual = jpg_path
+                            else:
+                                saved_thermal = jpg_path
                             self._log(f"[{datetime.now().strftime('%H:%M:%S')}] [{img_type}] saved "
                                       f"({len(content)} bytes)")
                 else:
                     for img_type in img_types:
                         if not self._running:
                             break
-                        _, content, error = _fetch_one(img_type)
+                        _, content, error = self._fetch_image(img_type)
                         if error:
                             self._log(error)
                             all_ok = False
@@ -236,8 +283,14 @@ class CaptureSession:
                         jpg_path = os.path.join(self.save_dir, f"{filenametime}.jpg")
                         with open(jpg_path, "wb") as f:
                             f.write(content)
+                        saved_thermal = jpg_path
                         self._log(f"[{datetime.now().strftime('%H:%M:%S')}] [{img_type}] saved "
                                   f"({len(content)} bytes)")
+
+                # 알람 오버레이가 카메라를 다시 치지 않도록 최신 저장 쌍을 공개
+                if saved_thermal:
+                    with self._last_pair_lock:
+                        self._last_pair = (saved_thermal, saved_visual)
 
                 # 연결 상태 추적
                 if all_ok:

@@ -58,6 +58,35 @@ def _log(msg: str, log_callback=None, messages: list[str] | None = None):
         messages.append(msg)
 
 
+# metadata.csv의 image_id 캐시: 매 주기 CSV 전체를 재파싱하는 부하를 피한다.
+# 파일의 (mtime, size)가 바뀌면(외부 수정·정리 포함) 자동으로 무효화되어 재로딩한다.
+_existing_ids_cache: dict[str, tuple[float, int, set[str]]] = {}
+
+
+def _load_existing_ids(csv_path: str) -> set[str]:
+    """CSV에서 기존 image_id 집합을 로드.
+
+    (mtime, size) 기반 캐시로 변경이 없으면 stat 1회만으로 재읽기를 생략한다.
+    """
+    if not os.path.exists(csv_path):
+        return set()
+    try:
+        st = os.stat(csv_path)
+    except OSError:
+        return set()
+    cached = _existing_ids_cache.get(csv_path)
+    if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+
+    ids: set[str] = set()
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        ids = {row[0] for row in reader if row}
+    _existing_ids_cache[csv_path] = (st.st_mtime, st.st_size, ids)
+    return ids
+
+
 def run_metadata(
     save_dir: str | None = None,
     log_callback=None,
@@ -75,20 +104,23 @@ def run_metadata(
 
     roi_config = load_roi_config()
 
-    files = os.listdir(save_dir)
-    jpgs = {f.replace(".jpg", ""): f
-            for f in files if f.endswith(".jpg") and "_visual" not in f}
-    npys = {f.replace("_thermal.npy", ""): f
-            for f in files if f.endswith("_thermal.npy")}
+    jpgs: dict[str, str] = {}
+    npys: dict[str, str] = {}
+    with os.scandir(save_dir) as entries:
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            name = entry.name
+            if name.endswith("_thermal.npy"):
+                npys[name.replace("_thermal.npy", "")] = name
+            elif (name.endswith(".jpg")
+                    and "_visual" not in name
+                    and "_overlay" not in name):
+                jpgs[name.replace(".jpg", "")] = name
     paired = sorted(set(jpgs.keys()) & set(npys.keys()))
 
     csv_path = os.path.join(save_dir, "metadata.csv")
-    existing_ids: set[str] = set()
-    if os.path.exists(csv_path):
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            existing_ids = {row[0] for row in reader if row}
+    existing_ids = _load_existing_ids(csv_path)
 
     new_ids = sorted(set(paired) - existing_ids)
 
@@ -157,6 +189,14 @@ def run_metadata(
             count += 1
 
         _log(f"Added {count} records.", log_callback, result.messages)
+
+    # 방금 append한 레코드를 캐시에 반영 → 다음 주기는 stat 1회로 캐시 히트
+    existing_ids.update(new_ids)
+    try:
+        st = os.stat(csv_path)
+        _existing_ids_cache[csv_path] = (st.st_mtime, st.st_size, existing_ids)
+    except OSError:
+        _existing_ids_cache.pop(csv_path, None)
 
     return result
 
