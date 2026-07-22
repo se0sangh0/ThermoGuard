@@ -36,6 +36,7 @@ from ..analysis.threshold import (
     MonitorState,
     evaluate_threshold,
     evaluate_with_state,
+    _STATUS_RANK,
 )
 from ..analysis.overlay import create_overlay, save_overlay
 from ..analysis.notifier import send_alarm
@@ -55,9 +56,6 @@ INTEGRITY_INTERVAL = _cfg.monitoring.integrity_interval_sec
 METADATA_INTERVAL = _cfg.monitoring.metadata_interval_sec
 # 처리 완료된 파일 캐시 최대 개수 (메모리 관리)
 MAX_PROCESSED_CACHE = _cfg.monitoring.max_processed_cache
-
-# 상태 심각도 순위 (다중 ROI 대표 선정용: 높을수록 심각)
-_STATUS_RANK = {Status.NORMAL: 0, Status.WARNING: 1, Status.CRITICAL: 2}
 
 # 전송 실패한 CRITICAL 알람의 재시도 최소 간격 (초). CRITICAL이 지속되는 동안
 # 성공할 때까지 재시도하되, 네트워크 장애 시 과도한 요청을 막기 위한 백오프.
@@ -306,18 +304,37 @@ class MonitorSequencer:
         roi_result = analysis["roi_result"]
         base = pair["base"]
         try:
-            # 2. Threshold + 상태 판정
-            new_status, do_alarm = evaluate_with_state(
-                hot_temp=roi_result.hot_temp_95,
-                max_temp=roi_result.max_temp,
-                mean_temp=roi_result.mean_temp,
-                baseline=self.roi_config.baseline_temp,
-                warning_delta=self.roi_config.warning_delta,
-                critical_delta=self.roi_config.critical_delta,
-                state=self.state,
-                over_temp_pixels=roi_result.over_temp_pixels,
-                max_hotspot_size=roi_result.max_hotspot_size,
-            )
+            # 2. Threshold + 상태 판정 — 모든 ROI 개별 평가
+            per_roi_statuses: list[dict] = []
+            for rr in roi_results:
+                s, a = evaluate_with_state(
+                    hot_temp=rr.hot_temp_95,
+                    max_temp=rr.max_temp,
+                    mean_temp=rr.mean_temp,
+                    baseline=self.roi_config.baseline_temp,
+                    warning_delta=self.roi_config.warning_delta,
+                    critical_delta=self.roi_config.critical_delta,
+                    state=self.state,
+                    over_temp_pixels=rr.over_temp_pixels,
+                    max_hotspot_size=rr.max_hotspot_size,
+                    roi_name=rr.roi_name if rr.roi_name else None,
+                )
+                per_roi_statuses.append({"roi_name": rr.roi_name, "status": s, "alarm": a, "roi": rr})
+
+            # 최악 ROI로 대표 상태 선정
+            worst = max(per_roi_statuses, key=lambda x: (_STATUS_RANK[x["status"]], x["roi"].hot_temp_95))
+            new_status = worst["status"]
+            do_alarm = any(ps["alarm"] for ps in per_roi_statuses)
+
+            # per-ROI 상태 갱신
+            for ps in per_roi_statuses:
+                rn = ps["roi_name"]
+                if rn:
+                    rs = self.state.roi_state(rn)
+                    rs.status = ps["status"]
+                    if ps["alarm"]:
+                        rs.last_alarm_time = time.time()
+                        rs.alarm_pending = False
 
             prev_status = self.state.status
             self.state.status = new_status

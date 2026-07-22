@@ -25,6 +25,7 @@ from ..analysis.threshold import (
     Status,
     MonitorState,
     evaluate_with_state,
+    _STATUS_RANK,
 )
 from ..analysis.overlay import create_overlay, save_overlay
 from ..analysis.notifier import send_alarm as send_telegram
@@ -78,7 +79,40 @@ def _process_single_pair(
     base = pair["base"]
     try:
         roi_results = extract_all_rois_from_npy(pair["npy"], config)
-        result = max(roi_results, key=lambda r: r.hot_temp_95)
+
+        # 다중 ROI: 각 ROI별 개별 평가
+        per_roi_statuses: list[dict] = []
+        for rr in roi_results:
+            s, a = evaluate_with_state(
+                hot_temp=rr.hot_temp_95,
+                max_temp=rr.max_temp,
+                mean_temp=rr.mean_temp,
+                baseline=config.baseline_temp,
+                warning_delta=config.warning_delta,
+                critical_delta=config.critical_delta,
+                state=state,
+                over_temp_pixels=rr.over_temp_pixels,
+                max_hotspot_size=rr.max_hotspot_size,
+                roi_name=rr.roi_name if rr.roi_name else None,
+            )
+            per_roi_statuses.append({"roi_name": rr.roi_name, "status": s, "alarm": a, "roi": rr})
+
+        # 최악 ROI 선정
+        worst = max(per_roi_statuses, key=lambda x: (_STATUS_RANK[x["status"]], x["roi"].hot_temp_95))
+        result = worst["roi"]
+        new_status = worst["status"]
+        do_alarm = any(ps["alarm"] for ps in per_roi_statuses)
+
+        # per-ROI 상태 갱신
+        for ps in per_roi_statuses:
+            rn = ps["roi_name"]
+            if rn:
+                rs = state.roi_state(rn)
+                rs.status = ps["status"]
+                if ps["alarm"]:
+                    rs.last_alarm_time = time.time()
+                    rs.alarm_pending = False
+
         # 핫스팟 통합
         all_hotspots = []
         for rr in roi_results:
@@ -95,17 +129,6 @@ def _process_single_pair(
             if not is_dup:
                 unique_hotspots.append(spot)
         result.hotspot_centroids = unique_hotspots
-        new_status, do_alarm = evaluate_with_state(
-            hot_temp=result.hot_temp_95,
-            max_temp=result.max_temp,
-            mean_temp=result.mean_temp,
-            baseline=config.baseline_temp,
-            warning_delta=config.warning_delta,
-            critical_delta=config.critical_delta,
-            state=state,
-            over_temp_pixels=result.over_temp_pixels,
-            max_hotspot_size=result.max_hotspot_size,
-        )
 
         prev_status = state.status
         with lock:

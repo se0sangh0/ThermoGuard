@@ -163,6 +163,7 @@ FLIR A50 카메라  (192.168.0.51)
           알람 → capture_both_once()가 thermal+visual 새 쌍을 가져옴.
 ```
 
+
 ---
 
 ## 4. CaptureSession 스레드 상세
@@ -386,20 +387,6 @@ product_dashboard.py의 `open_calibration()`은 호출 전에
 `visual = dataset / f"{thermal.stem}_visual.jpg"` → `visual.exists()` 체크로
 이미 검증을 수행한다.
 
-### 10B. Float32 정밀도
-
-전체 온도 행렬 파이프라인이 `float32`로 통일되어 있다.
-
-| 위치 | 이전 | 현재 |
-|------|------|------|
-| `extract_from_jpeg()` | `float64` 중간 변환 | `float32`로 일관 (반환 시 이미 .astype(np.float32)) |
-| `_raw_bytes_to_max_temp()` | `np.float64(max_raw)` | `np.float32(max_raw)` |
-| `roi.py: extract_roi_from_npy()` | `.astype(np.float64)` | `.astype(np.float32)` |
-| NPY 디스크 저장 | `np.save(..., float32)` | `float32` 그대로 |
-
-Planck 변환의 float64 ↔ float32 오차는 0°C (raw ≥ 10000 범위, 240×320 2D 프레임 기준)로
-정밀도 손실이 전혀 없으며 메모리 사용량은 절반으로 감소한다.
-
 ---
 
 ## 11. 외부 네트워크
@@ -509,43 +496,32 @@ GUI 모드:
 
 ```
 프로브가 과열 감지  (3초 간격, 정상 모드)
-    │
     ▼
 probe_thermal_from_url() → temp >= baseline + warning_delta
-    │
     ▼
 probe_callback(True)  [CaptureSession 데몬 스레드]
-    │
     ├─ set_warning_mode(True)  → interval = 5s
-    └─ return True  → 프로브 루프 탈출
-    │
+    ├─ return True  → 프로브 루프 탈출
     ▼
 즉시 재캡처  [_run() 루프 시작점]
     │  thermal only (과열 모드에서는 visual 생략)
     │  JPG를 디스크에 저장
-    │
     ▼
 _monitoring_loop() / _schedule_analysis()  [메인 스레드 / executor]
     │  _scan_new_pairs()가 새 JPG 발견
     │  NPY 누락 시 추출
-    │
     ▼
 extract_roi_from_npy()  [roi.py]
-    │
     ▼
 evaluate_with_state()  [threshold.py]
     │  returns (Status.CRITICAL, do_alarm=True)
-    │
     ▼
 capture_both_once()  [알람 발생 시 thermal+visual 새 촬영]
-    │
     ▼
 create_overlay() + save_overlay()  [overlay.py]
-    │
     ▼
 send_alarm()  [notifier.py]
     │  Telegram sendPhoto → 작업자에게 알림
-    │
     ▼
 알람 쿨다운 시작 (기본 600초)
     쿨다운 만료 전까지 추가 Critical 감지 억제
