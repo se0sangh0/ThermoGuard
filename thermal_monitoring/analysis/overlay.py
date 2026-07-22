@@ -23,6 +23,8 @@ cfg = load_config()
 DATASET_DIR = cfg.paths.dataset_dir
 HOMOGRAPHY_PATH = cfg.paths.homography_path
 OVERLAY_DIR = cfg.paths.overlay_dir
+DISPLAY_W = cfg.display.roi_display_width
+DISPLAY_H = cfg.display.roi_display_height
 
 # 시각화 스타일
 ROI_COLOR_NORMAL = (0, 255, 0)    # 초록
@@ -87,7 +89,7 @@ def _prepare_canvas(
         if canvas is None:
             raise FileNotFoundError(f"Cannot read thermal image: {thermal_jpg_path}")
         thermal_h, thermal_w = canvas.shape[:2]
-        return canvas, roi_bounds, thermal_w / 640, thermal_h / 480
+        return canvas, roi_bounds, thermal_w / DISPLAY_W, thermal_h / DISPLAY_H
 
     # Homography 적용: thermal 좌표 -> visual 좌표
     vis_h, vis_w = canvas.shape[:2]
