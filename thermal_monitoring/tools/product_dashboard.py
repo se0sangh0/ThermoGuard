@@ -96,6 +96,7 @@ class ProductDashboard:
         self._analysis_running = False
         self._analysis_pending = False
         self._analysis_generation = 0
+        self._manual_capture_running = False
 
         self._configure_style()
         self._build_ui()
@@ -150,8 +151,11 @@ class ProductDashboard:
             command=self.toggle_capture,
         )
         self.capture_toggle_button.pack(side="left", padx=4)
-        ttk.Button(right, text="↻  새로고침", style="Action.TButton",
-                   command=self.refresh_now).pack(side="left", padx=4)
+        self.refresh_button = ttk.Button(
+            right, text="↻  새로고침", style="Action.TButton",
+            command=self.capture_and_refresh,
+        )
+        self.refresh_button.pack(side="left", padx=4)
         ttk.Button(right, text="▤  운영 로그", style="Action.TButton",
                    command=self.open_operating_log).pack(side="left", padx=4)
         ttk.Button(right, text="⚙  환경설정", style="Action.TButton",
@@ -340,12 +344,78 @@ class ProductDashboard:
         self.timer_id = self.root.after(delay_ms or self.REFRESH_SECONDS * 1000, self.refresh_now)
 
     def refresh_now(self):
+        """자동 타이머용: 저장된 최신 촬영 결과를 다시 분석한다."""
         if self.lifecycle != "running":
             return
         self.timer_id = None
         self._schedule_analysis()
         self._update_metric_text()
         # 환경설정에서 지정한 화면 갱신 주기를 상태와 관계없이 적용한다.
+        self._schedule_refresh(self.REFRESH_SECONDS * 1000)
+
+    def capture_and_refresh(self):
+        """버튼 클릭 시 새 Thermal/Visual을 촬영하고 그 결과로 화면을 갱신한다."""
+        if self.lifecycle != "running" or self._manual_capture_running:
+            return
+        capture = self.capture
+        if not self.monitoring or capture is None or not capture.running:
+            messagebox.showinfo(
+                "새로고침",
+                "촬영이 정지되어 있습니다. 촬영 시작 후 다시 시도하세요.",
+                parent=self.root,
+            )
+            return
+
+        if self.timer_id:
+            self.root.after_cancel(self.timer_id)
+            self.timer_id = None
+        self._manual_capture_running = True
+        self.refresh_button.configure(text="촬영 중...", state="disabled")
+        self._add_operating_log("수동 촬영", "시작", "새로고침 버튼으로 즉시 촬영 요청")
+        self._analysis_executor.submit(self._run_capture_refresh_worker, capture)
+
+    def _run_capture_refresh_worker(self, capture: CaptureSession):
+        try:
+            thermal_path, visual_path = capture.capture_both_once()
+            if not thermal_path:
+                raise RuntimeError("새 열화상 이미지를 촬영하지 못했습니다.")
+            if self.cfg.tools.mode == "both" and not visual_path:
+                raise RuntimeError("새 가시광 이미지를 촬영하지 못했습니다.")
+
+            thermal = Path(thermal_path)
+            visual = Path(visual_path) if visual_path else None
+            npy = thermal.with_name(f"{thermal.stem}_thermal.npy")
+            matrix, _ = extract_from_jpeg(str(thermal))
+            np.save(npy, matrix)
+            pair = (thermal.stem, thermal, visual, npy)
+            result = self._process_pair_to_dict(pair)
+            self.root.after(0, lambda: self._apply_capture_refresh_result(result))
+        except Exception as exc:
+            message = str(exc)
+            self.root.after(0, lambda msg=message: self._handle_capture_refresh_error(msg))
+
+    def _apply_capture_refresh_result(self, result: dict):
+        try:
+            self._add_operating_log(
+                "수동 촬영", "완료", f"{result['base']} 촬영 및 화면 갱신 완료"
+            )
+            self._apply_analysis_result(result, self._analysis_generation)
+        finally:
+            self._finish_capture_refresh()
+
+    def _handle_capture_refresh_error(self, message: str):
+        try:
+            self._add_operating_log("수동 촬영", "실패", message)
+            self._handle_analysis_error(message, self._analysis_generation)
+            messagebox.showerror("새로고침 실패", message, parent=self.root)
+        finally:
+            self._finish_capture_refresh()
+
+    def _finish_capture_refresh(self):
+        self._manual_capture_running = False
+        if self.lifecycle != "running":
+            return
+        self.refresh_button.configure(text="↻  새로고침", state="normal")
         self._schedule_refresh(self.REFRESH_SECONDS * 1000)
 
     def _schedule_analysis(self):
