@@ -62,7 +62,7 @@ class RuntimeMetrics:
 
 
 class ProductDashboard:
-    REFRESH_SECONDS = 20
+    REFRESH_SECONDS = 30
     REFRESH_FAST_SECONDS = 5    # Warning/Critical 상태일 때 분석 간격
 
     def __init__(self, root: tk.Tk):
@@ -499,6 +499,7 @@ class ProductDashboard:
 
     def _process_pair_to_dict(self, pair) -> dict:
         base, thermal, visual, npy = pair
+        captured_at = self._capture_time_from_file(base, thermal)
         thermal_img = cv2.imread(str(thermal))
         visual_img = None
         if visual and visual.exists():
@@ -553,9 +554,25 @@ class ProductDashboard:
             "status": status, "alarm": alarm,
             "roi_bounds": roi_result.roi_bounds,
             "roi_results": roi_results,
+            "captured_at": captured_at,
             "image_quality_ok": image_quality_ok,
             "image_quality_reason": image_quality_reason,
         }
+
+    @staticmethod
+    def _capture_time_from_file(base: str, thermal: Path) -> datetime:
+        """저장 파일명에 기록된 캡처 요청 시각을 읽는다.
+
+        CaptureSession은 촬영 직전에 YYYYmmddHHMMSS_ffffff 형식으로
+        파일명을 생성한다. 이전 형식의 파일도 표시할 수 있게 초 단위
+        형식을 함께 지원하고, 형식이 다른 외부 파일은 수정 시각을 쓴다.
+        """
+        for timestamp_format in ("%Y%m%d%H%M%S_%f", "%Y%m%d%H%M%S"):
+            try:
+                return datetime.strptime(base, timestamp_format)
+            except ValueError:
+                continue
+        return datetime.fromtimestamp(thermal.stat().st_mtime)
 
     def _assess_image_quality(self, thermal_img, visual_img) -> tuple[bool, str]:
         """화면에 표시할 Thermal/Visual 한 쌍이 서로 유효한지 검사한다."""
@@ -659,7 +676,8 @@ class ProductDashboard:
         for lab, value in zip(self.temp_labels, vals):
             lab.configure(text=value)
         if result.get("image_quality_ok", False):
-            stamp = self.last_update.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
+            captured_at = result.get("captured_at") or self.last_update
+            stamp = captured_at.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
             self.visual_stamp.configure(text=stamp)
             self.thermal_stamp.configure(text=stamp)
         else:
@@ -779,16 +797,14 @@ class SettingsDialog:
         general = ttk.Frame(notebook, padding=16); roi = ttk.Frame(notebook, padding=16); advanced = ttk.Frame(notebook, padding=16)
         notebook.add(general, text="일반"); notebook.add(roi, text="감시 영역"); notebook.add(advanced, text="고급 설정")
         self.ip = tk.StringVar(value=self.d.cfg.camera.ip)
-        self.interval = tk.StringVar(value=str(max(10, int(self.d.REFRESH_SECONDS))))
         self.dataset_dir = tk.StringVar(value=self.d.cfg.paths.dataset_dir)
         self.baseline = tk.StringVar(value=str(self.d.cfg.roi.baseline_temp))
         self.warning = tk.StringVar(value=str(self.d.cfg.roi.warning_delta))
         self.critical = tk.StringVar(value=str(self.d.cfg.roi.critical_delta))
         self._field(general, "카메라 주소", self.ip, 0)
-        self._field(general, "화면 갱신 주기(초)", self.interval, 1)
-        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 2)
+        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 1)
         ttk.Label(general, text="촬영 이미지, 온도 배열과 오버레이가 선택한 폴더에 저장됩니다.").grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=12)
+            row=2, column=0, columnspan=3, sticky="w", pady=12)
         ttk.Label(roi, text="가시광 이미지에서 감시할 설비 영역을 지정합니다.", font=("맑은 고딕", 11, "bold")).pack(anchor="w", pady=8)
         ttk.Button(roi, text="가시광 이미지에서 ROI 설정", command=self.open_roi_editor).pack(anchor="w", pady=8)
         ttk.Separator(roi, orient="horizontal").pack(fill="x", pady=14)
@@ -880,15 +896,6 @@ class SettingsDialog:
                 messagebox.showerror("입력 오류", "데이터 저장 폴더를 선택하세요.", parent=self.win)
                 return
 
-            refresh_seconds = int(float(self.interval.get()))
-            if not 10 <= refresh_seconds <= 300:
-                messagebox.showerror(
-                    "입력 오류",
-                    "화면 갱신 주기는 10초에서 300초 사이로 입력하세요.",
-                    parent=self.win,
-                )
-                return
-
             dataset_path = os.path.normpath(os.path.expandvars(os.path.expanduser(dataset_value)))
             overlay_path = os.path.join(dataset_path, "overlay")
             os.makedirs(dataset_path, exist_ok=True)
@@ -901,23 +908,13 @@ class SettingsDialog:
             self.d.cfg.camera.ip = camera_ip
             self.d.cfg.paths.dataset_dir = dataset_path
             self.d.cfg.paths.overlay_dir = overlay_path
-            previous_refresh_seconds = self.d.REFRESH_SECONDS
-            self.d.REFRESH_SECONDS = refresh_seconds
-            self.d.header_refresh_interval.configure(
-                text=f"{refresh_seconds}초마다 자동 갱신"
-            )
             self.d.cfg.roi.baseline_temp = float(self.baseline.get())
             self.d.cfg.roi.warning_delta = float(self.warning.get())
             self.d.cfg.roi.critical_delta = float(self.critical.get())
             save_config(self.d.cfg)
             self.d._add_operating_log("환경설정", "저장 경로 변경", dataset_path)
-            if refresh_seconds != previous_refresh_seconds:
-                self.d._add_operating_log(
-                    "환경설정", "화면 갱신 주기 변경",
-                    f"{previous_refresh_seconds}초 → {refresh_seconds}초",
-                )
-            # 이미 예약된 타이머도 취소하고 새 입력값 기준으로 다시 예약한다.
-            self.d._schedule_refresh(refresh_seconds * 1000)
+            # 화면 갱신 주기는 운영 화면 정책에 따라 30초로 고정한다.
+            self.d._schedule_refresh(self.d.REFRESH_SECONDS * 1000)
 
             if capture_settings_changed and self.d.capture:
                 self.d.capture.request_stop()
