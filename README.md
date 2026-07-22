@@ -85,13 +85,18 @@ project/
 
 ```python
 # 최상위 API
-from thermal_monitoring import load_config, setup_encoding, get_logger
+from thermal_monitoring import load_config, save_config, AppConfig, setup_encoding, get_logger
 
 # 서브패키지별 API
-from thermal_monitoring.capture import CaptureSession, extract_from_jpeg
-from thermal_monitoring.data import run_check, run_metadata, run_cleanup
-from thermal_monitoring.analysis import extract_roi_from_npy, evaluate_threshold, create_overlay, send_alarm
-from thermal_monitoring.pipeline import MonitorSequencer, run_pipeline
+from thermal_monitoring.capture import CaptureSession, extract_from_jpeg, raw2temp, probe_thermal_from_url
+from thermal_monitoring.data import run_check, run_metadata, run_cleanup, run_cleanup_if_due
+from thermal_monitoring.analysis import (
+    load_roi_config, extract_roi_from_npy, extract_all_rois_from_npy,
+    evaluate_threshold, evaluate_with_state,
+    create_overlay, save_overlay, send_alarm,
+    Status, MonitorState, RoiResult, RoiConfig,
+)
+from thermal_monitoring.pipeline import MonitorSequencer, run_pipeline, scan_pairs
 ```
 
 ## 빠른 시작
@@ -236,6 +241,7 @@ grep "unreachable\|restored" logs/app.log
 | 알림 | `analysis.notifier` | 전송 성공·실패·이미지 누락 |
 | 캡처 | `capture` | 프로브 온도, 주기 전환, 연결 끊김·복구 |
 | ExifTool | `capture.thermal_utils` | 서브프로세스 timeout·실패 (파일명 포함) |
+| float32 | 전역 | 온도 행렬 dtype → 메모리 절감, Planck 변환 정밀도 유지 |
 
 **주요 로깅 이벤트:**
 
@@ -266,11 +272,11 @@ grep "unreachable\|restored" logs/app.log
 |------|------|
 | `config.py` | **통합 설정 모듈** — 모든 설정의 단일 진실 공급원, config.json 읽기/쓰기, 구버전 파일 자동 이관 |
 | `dashboard.py` | 운영 대시보드 GUI — 환경 설정 + 실시간 감지 화면 + 로그, ROI 설정·캘리브레이션 연동, 백그라운드 분석 (UI 블로킹 없음) |
-| `capture.py` | FLIR A50에서 Thermal + RGB 이미지 수집 (`CaptureSession` 클래스, GUI/스크립트 겸용) |
+| `capture.py` | FLIR A50에서 Thermal + RGB 이미지 수집 (`CaptureSession` 클래스 — start/stop/request_stop/capture_both_once/set_warning_mode/last_saved_pair, GUI/스크립트 겸용) |
 | `thermal_utils.py` | Radiometric JPEG에서 exiftool로 Raw Thermal 추출, Planck 변환으로 실제 °C 환산 |
 | `checking.py` | 데이터셋 무결성 검사 — NPY 누락 시 JPG에서 복구 (병렬), 고아 NPY 정리 (`run_check()` 함수) |
 | `metadata.py` | JPG-NPY 파일쌍 스캔 후 `metadata.csv` 자동 생성, ROI 온도 분석·판정 결과 포함 (`run_metadata()` 함수) |
-| `cleanup.py` | 오래된 데이터셋 자동 정리 — Normal 상태의 보존 기간 지난 쌍 삭제, Warning/Critical 이력 있는 데이터는 metadata.csv 참조하여 보존, 고아 NPY/JPG/오버레이는 무조건 삭제 (`run_cleanup()`, `run_cleanup_if_due()`) |
+| `cleanup.py` | 오래된 데이터셋 자동 정리 — Normal 상태의 보존 기간(기본 2일) 지난 쌍 삭제, Warning/Critical 이력 있는 데이터는 metadata.csv 참조하여 보존, 고아 NPY/JPG/오버레이는 무조건 삭제 (`run_cleanup()`, `run_cleanup_if_due()`) |
 | `calibration.py` | OpenCV GUI로 Thermal ↔ RGB 대응점 지정, Homography 행렬 계산 |
 | `roi_selector.py` | GUI ROI 영역 설정 도구 — **다중 ROI 지원** (N키 추가, Tab 전환, Del 삭제, 색상 구분), `config.json` 자동 저장 |
 
@@ -356,7 +362,7 @@ grep "unreachable\|restored" logs/app.log
 |------|------|
 | 언어 | Python 3.12 |
 | 이미지 처리 | OpenCV, Pillow |
-| 수치 연산 | NumPy |
+| 수치 연산 | NumPy (float32) |
 | 데이터 포맷 | JPEG, NPY, CSV, JSON |
 | 통신 | REST API (requests) |
 | 알림 | Telegram Bot API |
@@ -412,7 +418,7 @@ grep "unreachable\|restored" logs/app.log
 
 | 데이터 구분 | 보존 기한 경과 시 처리 |
 |-------------|----------------------|
-| Normal 상태 쌍 (JPG + NPY + Visual) | 7일 경과 시 **삭제** |
+| Normal 상태 쌍 (JPG + NPY + Visual) | 2일 경과 시 **삭제** |
 | Warning/Critical 이력 쌍 | 보존 기한 무시, **영구 보존** |
 | JPG 없는 고아 NPY | **즉시 삭제** |
 | NPY 없는 고아 JPG | **즉시 삭제** |
@@ -420,10 +426,10 @@ grep "unreachable\|restored" logs/app.log
 
 ```bash
 # 수동 실행
-python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(retention_days=7)"
+python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(retention_days=2)"
 
 # 보존 기한 조정
-python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(retention_days=30)"
+python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(retention_days=7)"
 ```
 
 ## 🔒 보안 및 개인정보 규칙

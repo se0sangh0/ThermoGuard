@@ -111,6 +111,22 @@ def run_calibration(thermal_path=None, rgb_path=None):
         print(f"RGB 이미지를 불러올 수 없습니다: {rgb_path}")
         return
 
+    # ── 동일 캡처 사이클 쌍인지 검증 ──
+    t_stem = os.path.splitext(os.path.basename(thermal_path))[0]
+    v_stem = os.path.splitext(os.path.basename(rgb_path))[0]
+    if v_stem.endswith("_visual"):
+        v_base = v_stem[:-len("_visual")]
+    else:
+        v_base = v_stem
+    if t_stem != v_base:
+        print(f"\n⚠  경고: Thermal과 Visual이 같은 촬영 시점이 아닙니다!")
+        print(f"  Thermal  →  {os.path.basename(thermal_path)}")
+        print(f"  Visual   →  {os.path.basename(rgb_path)}")
+        print(f"  서로 다른 시점의 이미지로 캘리브레이션하면 로봇이 움직인")
+        print(f"  만큼 Homography가 틀어져 오버레이 정합도가 떨어집니다.")
+        print(f"\n  계속하려면 Enter, 중단하려면 Ctrl+C: ", end="")
+        input()
+
     print(f"Thermal: {thermal_path}")
     print(f"RGB: {rgb_path}")
     print("  Click alternating: Thermal -> RGB -> Thermal -> ...")

@@ -172,7 +172,7 @@ main() → MonitorSequencer.start()
 t=0s   HTTP 병렬 요청 (thermal + visual 동시) → JPG 저장
        → 30초 대기 시작
 
-       ┌─ 대기 중 프로브 루프 (1초 간격) ─────────────────┐
+       ┌─ 대기 중 프로브 루프 (3초 간격) ─────────────────┐
 t=1s   │ probe: HTTP로 thermal JPEG 다운로드               │
        │   → exiftool stdin 파이프로 XMP 메타데이터 추출   │
        │   → Main:MaxValue 읽기 (디스크 I/O 없음)          │
@@ -187,7 +187,7 @@ t=30s  → 다음 풀캡처
 ```
 t=15s  probe: max_temp=52°C → threshold 38°C 초과!
          ├── probe_callback(52.0) → True 반환
-         ├── capture.set_warning_mode(True) → interval 1초로 전환
+         ├── capture.set_warning_mode(True) → interval 5초로 전환
          └── break → 대기 루프 즉시 탈출
 
 t=15.1s  풀캡처 (thermal + visual 동시 요청 → JPG 저장)
@@ -211,15 +211,15 @@ t=17s  _scan_new_pairs() → 방금 저장된 쌍 발견
          └── send_alarm() → Telegram 이미지+캡션 전송
 ```
 
-## 3-5. 과열 모드 — 1초 고속 캡처
+## 3-5. 과열 모드 — 5초 고속 캡처
 
 ```
-t=16.1s  풀캡처 (1초 주기) → 분석 → Warning 지속
-t=17.1s  풀캡처 → 분석 → Warning 지속 (쿨다운 중 → 알림 없음)
-t=18.1s  풀캡처 → 분석 → Critical 감지
+t=16.1s  풀캡처 (thermal-only, 5초 주기) → 분석 → Warning 지속
+t=21.1s  풀캡처 → 분석 → Warning 지속 (쿨다운 중 → 알림 없음)
+t=26.1s  풀캡처 → 분석 → Critical 감지
            ├── prev=Warning, new=Critical → 알림 전송
            └── [Telegram] "🚨 Overheat Alarm — Status: Critical"
-t=19.1s  풀캡처 → Critical (쿨다운 중)
+t=31.1s  풀캡처 → Critical (쿨다운 중)
 ```
 
 ## 3-6. 정상 복귀
@@ -239,7 +239,7 @@ t=46s   → 30초 대기 + 1초 프로브 루프 재개
 ```
 60초마다   run_check() → NPY 누락 복구 (병렬), 고아 정리
 120초마다  run_metadata() → metadata.csv 생성/갱신
-3600초마다 run_cleanup_if_due() → 7일 지난 Normal 쌍 삭제 (Warning/Critical 보존)
+3600초마다 run_cleanup_if_due() → 2일 지난 Normal 쌍 삭제 (Warning/Critical 보존)
 ```
 
 ## 3-8. 데이터 수집 방식
@@ -251,12 +251,12 @@ t=46s   → 30초 대기 + 1초 프로브 루프 재개
 ```
 평상시 (30초 주기)
   ├── 풀캡처: 30초마다 Thermal + Visual JPEG 저장
-  └── 프로브: 대기 시간 동안 매 1초마다 경량 Thermal 체크
+  └── 프로브: 대기 시간 동안 매 3초마다 경량 Thermal 체크
                 (JPEG 바이트 → exiftool stdin 파이프 → XMP Main:MaxValue 추출)
                 │
                 ▼ threshold 초과 감지 시
-과열 모드 (1초 주기)
-  └── 풀캡처: 1초마다 Thermal + Visual JPEG 저장 (정밀 추적)
+과열 모드 (5초 주기)
+  └── 풀캡처: 5초마다 Thermal JPEG만 저장 (visual 생략, 정밀 추적)
                 │
                 ▼ Normal 복귀 시
 평상시 (30초 주기) ← 복귀
@@ -264,8 +264,8 @@ t=46s   → 30초 대기 + 1초 프로브 루프 재개
 
 | 모드 | 캡처 주기 | 설정 키 | 동작 |
 |------|-----------|---------|------|
-| Normal | 30초 | `camera.capture_interval_sec` | 프로브가 백그라운드에서 1초마다 온도 체크 |
-| Warning/Critical | 1초 | `camera.warning_interval_sec` | 고속 풀캡처로 정밀 추적, Normal 복귀 시 자동 해제 |
+| Normal | 30초 | `camera.capture_interval_sec` | 프로브가 백그라운드에서 3초마다 온도 체크 |
+| Warning/Critical | 5초 | `camera.warning_interval_sec` | 고속 풀캡처로 정밀 추적 (thermal-only), Normal 복귀 시 자동 해제 |
 
 프로브는 FLIR JPEG의 XMP 메타데이터(Main:MaxValue)를 exiftool stdin 파이프로 추출하므로, Raw Thermal 변환이나 디스크 I/O가 발생하지 않습니다.
 
@@ -385,14 +385,13 @@ Critical
 | 상태 값 | 메세지 전송 유무 | 전송 정보                             |
 | ---- | --------- | --------------------------------- |
 | 평시   | 없음        |                                   |
-| 과열   | 전송        | 로봇ID, 상태, 최고 온도, 발생 시간, 발생 범위 이미지 |
+| 과열   | **없음** (캡처 주기만 5초로 전환)  |                                   |
 | 경보   | 전송        | 로봇ID, 상태, 최고 온도, 발생 시간, 발생 범위 이미지 |
 
 ```
 # 전송 규칙
-# 상태 변화 시에만 메세지 전송하기
+# 상태 변화 시에만 메세지 전송하기 (Critical 진입 시에만)
 
-Normal → Warning
 Warning → Critical
 Critical → Normal
 
