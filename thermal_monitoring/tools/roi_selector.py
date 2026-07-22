@@ -1,23 +1,25 @@
 """
-roi_selector.py - GUI ROI 영역 설정 도구 (다중 ROI 지원, Homography 연동)
+roi_selector.py - GUI ROI 영역 설정 도구 (다중 ROI 지원, Homography 연동, 버튼 UI + API)
 
 사용법:
-    python roi_selector.py [thermal_image.jpg]            # 기존: 열화상 이미지
-    python roi_selector.py [thermal_image.jpg] [visual_image.jpg]  # 신규: 가시광+Homography
+    python roi_selector.py [thermal_image.jpg]
+    python roi_selector.py [thermal_image.jpg] [visual_image.jpg]
 
 열화상 이미지를 띄우고 마우스 드래그로 ROI 영역을 지정합니다.
 thermal_to_rgb.npy (Homography)가 존재하고 가시광 이미지가 있으면
 가시광 이미지 위에서 ROI를 그리고, 저장 시 열화상 좌표(640×480)로 자동 변환합니다.
 
+API 사용 (다른 모듈에서 import):
+    from tools.roi_selector import (
+        add_new_roi, select_next_roi, delete_selected_roi,
+        reset_all_rois, undo_last_action, save_and_exit, quit_without_save,
+        rois, selected_idx, is_running,
+    )
+
 조작:
     마우스 드래그 : ROI 영역 선택
-    N             : 새 ROI 추가 (이름 입력)
-    Tab / 숫자키  : 다음 ROI 선택 (순환)
-    Del           : 선택된 ROI 삭제
-    ESC / Q       : 종료 (변경사항 저장 안 함)
-    S             : 모든 ROI를 config.json에 저장 후 종료
-    R             : 모든 ROI 초기화
-    Z             : 마지막 작업 취소 (Undo)
+    하단 버튼 클릭 : New / Next / Del / Undo / Reset / Save / Quit
+    단축키        : N(New)  Tab(Next)  Del(삭제)  Z(Undo)  R(Reset)  S(Save)  Q(종료)
 """
 
 import json
@@ -34,10 +36,12 @@ cfg = load_config()
 DATASET_DIR = cfg.paths.dataset_dir
 DISPLAY_WIDTH = cfg.display.display_width
 
-# 다중 ROI 상태
+# ── UI 상수 ──
+BUTTON_BAR_HEIGHT = 44
+
+# ── 다중 ROI 상태 ──
 rois: list[dict] = []           # [{"name": str, "x1": int, "y1": int, "x2": int, "y2": int}, ...]
 selected_idx: int = 0           # 현재 선택된 ROI 인덱스
-# 현재 드래그 상태
 roi_start = None
 roi_end = None
 dragging = False
@@ -46,6 +50,10 @@ scale = 1.0
 H_inv = None                    # inverse homography (visual→thermal)
 use_visual = False              # 가시광 이미지 표시 중이면 True
 thermal_resolution = (640, 480) # 최종 저장 좌표계 기준
+# ── 실행 상태 ──
+_running = False                # main loop 실행 중 여부
+_quit_flag = False              # Q / ESC (저장 없이 종료)
+_save_flag = False              # S (저장 후 종료)
 
 ROI_COLORS = [
     (0, 255, 0),    # 초록
@@ -58,6 +66,179 @@ ROI_COLORS = [
     (128, 0, 255),  # 보라
 ]
 
+# ── 버튼 정의 (label, RGB_color, action_key) ──
+_BUTTONS = [
+    ("New",   (50, 180, 50),  "new"),
+    ("Next",  (50, 100, 180), "next"),
+    ("Del",   (50, 50, 200),  "delete"),
+    ("Undo",  (160, 160, 50), "undo"),
+    ("Reset", (180, 80, 50),  "reset"),
+    ("Save",  (50, 160, 50),  "save"),
+    ("Quit",  (50, 50, 180),  "quit"),
+]
+
+# 런타임에 계산됨
+_button_rects: list[tuple[int, int, int, int]] = []  # (x1, y1, x2, y2)
+_canvas_h = 0  # 전체 캔버스 높이 (이미지 + 버튼 바)
+
+
+# ───────────────────────────────────────────────────────────────
+#  공개 API 함수 (다른 모듈에서 import 가능)
+# ───────────────────────────────────────────────────────────────
+
+def is_running() -> bool:
+    """main loop 실행 중인지 여부"""
+    return _running
+
+
+def add_new_roi(name: str = "") -> int:
+    """새 ROI 추가. name이 비어있으면 다이얼로그로 입력받음. 새 인덱스 반환 (-1이면 취소)."""
+    global rois, selected_idx
+    if not name:
+        import tkinter.simpledialog as sd
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        name = sd.askstring("New ROI", "ROI name:", parent=root)
+        root.destroy()
+        if not name:
+            return -1
+    rois.append({"name": name, "x1": 0, "y1": 0, "x2": 640, "y2": 480})
+    selected_idx = len(rois) - 1
+    print(f"Added '{name}' (select it and drag to set bounds)")
+    return selected_idx
+
+
+def select_next_roi() -> int:
+    """다음 ROI 선택 (순환). 새 인덱스 반환."""
+    global selected_idx
+    if rois:
+        selected_idx = (selected_idx + 1) % len(rois)
+        print(f"Selected: {rois[selected_idx]['name']}")
+    return selected_idx
+
+
+def delete_selected_roi() -> int:
+    """현재 선택된 ROI 삭제. 새 인덱스 반환 (-1이면 없음)."""
+    global selected_idx
+    if 0 <= selected_idx < len(rois):
+        name = rois[selected_idx]["name"]
+        del rois[selected_idx]
+        if rois:
+            selected_idx = min(selected_idx, len(rois) - 1)
+        else:
+            selected_idx = -1
+        print(f"Deleted '{name}'")
+    return selected_idx
+
+
+def reset_all_rois() -> None:
+    """모든 ROI 초기화."""
+    global rois, selected_idx, roi_start, roi_end, dragging
+    rois.clear()
+    selected_idx = -1
+    roi_start = None
+    roi_end = None
+    dragging = False
+    print("All ROIs reset.")
+
+
+def undo_last_action() -> int:
+    """마지막 ROI 제거 (Undo). 새 인덱스 반환."""
+    global rois, selected_idx
+    if len(rois) > 0:
+        name = rois[-1]["name"]
+        rois.pop()
+        selected_idx = min(selected_idx, len(rois) - 1) if rois else -1
+        print(f"Undo: removed '{name}'")
+    else:
+        print("Nothing to undo.")
+    return selected_idx
+
+
+def save_and_exit() -> bool:
+    """모든 ROI 저장 후 종료 플래그 설정. 성공 여부 반환."""
+    global _save_flag
+    if rois:
+        _save_all_rois()
+        _save_flag = True
+        return True
+    print("No ROI defined. Add at least one ROI with New button or drag on the image.")
+    return False
+
+
+def quit_without_save() -> None:
+    """저장 없이 종료 플래그 설정."""
+    global _quit_flag
+    _quit_flag = True
+    print("Quit without saving.")
+
+
+# ───────────────────────────────────────────────────────────────
+#  내부 유틸리티
+# ───────────────────────────────────────────────────────────────
+
+def _compute_button_rects(canvas_w: int) -> None:
+    """버튼 위치 계산"""
+    global _button_rects
+    _button_rects.clear()
+    n = len(_BUTTONS)
+    btn_w = 68
+    btn_h = 30
+    gap = 5
+    total_w = n * btn_w + (n - 1) * gap
+    start_x = (canvas_w - total_w) // 2
+    bar_y0 = _canvas_h - BUTTON_BAR_HEIGHT
+    y = bar_y0 + (BUTTON_BAR_HEIGHT - btn_h) // 2
+    x = start_x
+    for _ in _BUTTONS:
+        _button_rects.append((x, y, x + btn_w, y + btn_h))
+        x += btn_w + gap
+
+
+def _get_clicked_button(x: int, y: int) -> int | None:
+    """클릭 좌표가 버튼 영역이면 인덱스 반환, 아니면 None"""
+    for i, (bx1, by1, bx2, by2) in enumerate(_button_rects):
+        if bx1 <= x <= bx2 and by1 <= y <= by2:
+            return i
+    return None
+
+
+def _execute_action(action: str) -> None:
+    """액션 키로 해당 함수 호출"""
+    if action == "new":
+        add_new_roi()
+    elif action == "next":
+        select_next_roi()
+    elif action == "delete":
+        delete_selected_roi()
+    elif action == "undo":
+        undo_last_action()
+    elif action == "reset":
+        reset_all_rois()
+    elif action == "save":
+        save_and_exit()
+    elif action == "quit":
+        quit_without_save()
+
+
+def _draw_button_bar(disp: np.ndarray) -> None:
+    """캔버스 하단에 버튼 바 그리기"""
+    bar_y0 = _canvas_h - BUTTON_BAR_HEIGHT
+    # 배경
+    cv2.rectangle(disp, (0, bar_y0), (disp.shape[1], _canvas_h), (55, 55, 55), -1)
+    # 구분선
+    cv2.line(disp, (0, bar_y0), (disp.shape[1], bar_y0), (100, 100, 100), 1)
+    # 버튼
+    for i, ((label, rgb, _), (bx1, by1, bx2, by2)) in enumerate(zip(_BUTTONS, _button_rects)):
+        bgr = (rgb[2], rgb[1], rgb[0])
+        cv2.rectangle(disp, (bx1, by1), (bx2, by2), bgr, -1)
+        cv2.rectangle(disp, (bx1, by1), (bx2, by2), (180, 180, 180), 1)
+        ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 2)[0]
+        tx = bx1 + (bx2 - bx1 - ts[0]) // 2
+        ty = by1 + (by2 - by1 + ts[1]) // 2
+        cv2.putText(disp, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+
 
 def resize_for_display(img, width):
     h, w = img.shape[:2]
@@ -67,7 +248,17 @@ def resize_for_display(img, width):
 
 def mouse_callback(event, x, y, flags, param):
     global roi_start, roi_end, dragging, rois, selected_idx
+    img_h = _canvas_h - BUTTON_BAR_HEIGHT
 
+    # 버튼 바 클릭
+    if y >= img_h:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            btn_idx = _get_clicked_button(x, y)
+            if btn_idx is not None:
+                _execute_action(_BUTTONS[btn_idx][2])
+        return
+
+    # 이미지 영역: ROI 드래그
     ox = int(x * scale)
     oy = int(y * scale)
 
@@ -104,7 +295,6 @@ def mouse_callback(event, x, y, flags, param):
 
 
 def get_roi_box():
-    """현재 ROI 박스 좌표 반환 (원본 기준), 없으면 None"""
     if roi_start and roi_end:
         x1 = min(roi_start[0], roi_end[0])
         y1 = min(roi_start[1], roi_end[1])
@@ -116,7 +306,6 @@ def get_roi_box():
 
 
 def load_existing_rois():
-    """config.json에서 모든 저장된 ROI 불러오기"""
     global rois, selected_idx
     c = load_config()
     rois.clear()
@@ -125,14 +314,12 @@ def load_existing_rois():
             if isinstance(entry, dict):
                 rois.append(entry)
             else:
-                # RoiEntry dataclass → dict 변환
                 rois.append({
                     "name": entry.name,
                     "x1": entry.x1, "y1": entry.y1,
                     "x2": entry.x2, "y2": entry.y2,
                 })
     elif None not in (c.roi.x1, c.roi.y1, c.roi.x2, c.roi.y2):
-        # 하위 호환: 구버전 단일 ROI → 리스트로 변환
         rois.append({
             "name": "ROI-1",
             "x1": c.roi.x1, "y1": c.roi.y1,
@@ -142,13 +329,12 @@ def load_existing_rois():
     return len(rois)
 
 
-def save_all_rois():
+def _save_all_rois():
     """config.json에 모든 ROI 저장 (visual 모드면 thermal 좌표로 변환)"""
     c = load_config(force_reload=True)
     entries = []
     for r in rois:
         if use_visual and H_inv is not None:
-            # 가시광 좌표 → 열화상 640×480 좌표로 변환
             corners_vis = np.array([
                 [r["x1"], r["y1"]],
                 [r["x2"], r["y2"]],
@@ -156,7 +342,6 @@ def save_all_rois():
             thermal_pts = cv2.perspectiveTransform(corners_vis, H_inv).reshape(2, 2)
             tx1, ty1 = int(round(thermal_pts[0, 0])), int(round(thermal_pts[0, 1]))
             tx2, ty2 = int(round(thermal_pts[1, 0])), int(round(thermal_pts[1, 1]))
-            # 정렬 및 클램핑
             x1 = max(0, min(min(tx1, tx2), thermal_resolution[0] - 1))
             y1 = max(0, min(min(ty1, ty2), thermal_resolution[1] - 1))
             x2 = max(0, min(max(tx1, tx2), thermal_resolution[0] - 1))
@@ -182,9 +367,14 @@ def _get_color(idx: int) -> tuple:
     return ROI_COLORS[idx % len(ROI_COLORS)]
 
 
+# ───────────────────────────────────────────────────────────────
+#  main
+# ───────────────────────────────────────────────────────────────
+
 def main():
     global scale, selected_idx, rois, roi_start, roi_end, dragging
-    global H_inv, use_visual
+    global H_inv, use_visual, _running, _quit_flag, _save_flag
+    global _canvas_h
 
     # ── 인자 파싱 ──
     thermal_path: str | None = None
@@ -216,10 +406,11 @@ def main():
             H_inv = np.linalg.inv(H)
             img = cv2.imread(visual_path)
             use_visual = True
-            display_res = img.shape[:2]  # (H, W) of visual
+            display_res = img.shape[:2]
             print(f"Homography loaded → Visual mode: {os.path.basename(visual_path)}"
                   f" ({display_res[1]}×{display_res[0]})")
-            print(f"  ROI coordinates will be auto-converted to thermal {thermal_resolution[0]}×{thermal_resolution[1]} on save.")
+            print(f"  ROI coordinates will be auto-converted to thermal "
+                  f"{thermal_resolution[0]}×{thermal_resolution[1]} on save.")
         else:
             print(f"Invalid homography shape {H.shape}, falling back to thermal.")
             use_visual = False
@@ -232,13 +423,11 @@ def main():
         print(f"Thermal mode: {os.path.basename(thermal_path)}")
 
     if img is None:
-        print(f"이미지를 불러올 수 없습니다.")
+        print("이미지를 불러올 수 없습니다.")
         sys.exit(1)
 
     print(f"Loaded: {thermal_path if not use_visual else visual_path}  ({img.shape[1]}×{img.shape[0]})")
-    print("  Drag mouse to set ROI for selected area")
-    print("  N = new ROI    Tab = next    Del = delete    S = save & exit")
-    print("  R = reset all    Z = undo    Q = quit without saving")
+    print("  Drag mouse to set ROI | Buttons below | Shortcuts: N Tab Del Z R S Q")
 
     count = load_existing_rois()
     if count > 0:
@@ -247,12 +436,22 @@ def main():
     img_disp = resize_for_display(img, DISPLAY_WIDTH)
     scale = img.shape[1] / img_disp.shape[1]
 
+    # 캔버스 = 이미지 + 버튼 바
+    _canvas_h = img_disp.shape[0] + BUTTON_BAR_HEIGHT
+    _compute_button_rects(img_disp.shape[1])
+
     wintitle = "ROI Selector - Visual (H)" if use_visual else "ROI Selector - Thermal"
     cv2.namedWindow(wintitle)
     cv2.setMouseCallback(wintitle, mouse_callback)
 
+    _running = True
+    _quit_flag = False
+    _save_flag = False
+
     while True:
-        disp = img_disp.copy()
+        # 버튼 바 포함한 전체 캔버스
+        disp = np.zeros((_canvas_h, img_disp.shape[1], 3), dtype=np.uint8)
+        disp[0:img_disp.shape[0], 0:img_disp.shape[1]] = img_disp
 
         # 모든 ROI 박스 그리기
         for i, r in enumerate(rois):
@@ -282,72 +481,48 @@ def main():
 
         # 상태 텍스트
         mode_text = "Visual mode (H→thermal)" if use_visual else "Thermal mode"
-        status_lines = [
-            f"{mode_text} | Selected: {rois[selected_idx]['name'] if 0 <= selected_idx < len(rois) else '(none)'}",
-            f"ROIs: {len(rois)} | N: new  Tab: next  Del: delete  S: save  Q: quit",
-        ]
-        for i, line in enumerate(status_lines):
-            cv2.putText(disp, line, (10, 20 + i * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+        sel_name = rois[selected_idx]["name"] if 0 <= selected_idx < len(rois) else "(none)"
+        status = f"{mode_text} | Selected: {sel_name} | ROIs: {len(rois)}"
+        cv2.putText(disp, status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+
+        # 버튼 바 그리기
+        _draw_button_bar(disp)
 
         cv2.imshow(wintitle, disp)
         key = cv2.waitKey(1)
 
+        # ── 종료 플래그 체크 (버튼 클릭으로 설정됨) ──
+        if _quit_flag:
+            break
+        if _save_flag:
+            break
+
+        # ── 키보드 단축키 (기존 호환) ──
         if key == ord("q") or key == 27:
-            print("Quit without saving.")
+            quit_without_save()
             break
 
         elif key == ord("n"):
-            import tkinter.simpledialog as sd
-            import tkinter as tk
-            root = tk.Tk()
-            root.withdraw()
-            name = sd.askstring("New ROI", "ROI name:", parent=root)
-            root.destroy()
-            if name:
-                rois.append({"name": name, "x1": 0, "y1": 0, "x2": 640, "y2": 480})
-                selected_idx = len(rois) - 1
-                print(f"Added '{name}' (select it and drag to set bounds)")
+            add_new_roi()
 
         elif key == 9:  # Tab
-            if rois:
-                selected_idx = (selected_idx + 1) % len(rois)
-                print(f"Selected: {rois[selected_idx]['name']}")
+            select_next_roi()
 
-        elif key == 127 or key == 8:  # Del or Backspace
-            if 0 <= selected_idx < len(rois):
-                name = rois[selected_idx]["name"]
-                del rois[selected_idx]
-                if rois:
-                    selected_idx = min(selected_idx, len(rois) - 1)
-                else:
-                    selected_idx = -1
-                print(f"Deleted '{name}'")
+        elif key == 127 or key == 8:  # Del / Backspace
+            delete_selected_roi()
 
         elif key == ord("r"):
-            rois.clear()
-            selected_idx = -1
-            roi_start = None
-            roi_end = None
-            dragging = False
-            print("All ROIs reset.")
+            reset_all_rois()
 
         elif key == ord("z"):
-            if len(rois) > 0:
-                name = rois[-1]["name"]
-                rois.pop()
-                selected_idx = min(selected_idx, len(rois) - 1) if rois else -1
-                print(f"Undo: removed '{name}'")
-            else:
-                print("Nothing to undo.")
+            undo_last_action()
 
         elif key == ord("s"):
-            if rois:
-                save_all_rois()
+            if save_and_exit():
                 break
-            else:
-                print("No ROI defined. Add at least one ROI with N key or drag on the image.")
 
     cv2.destroyAllWindows()
+    _running = False
 
 
 if __name__ == "__main__":
