@@ -36,7 +36,7 @@ cfg = load_config()
 print(cfg.camera.ip)              # "192.168.0.51"
 print(cfg.roi.baseline_temp)      # 23.0
 print(cfg.camera.capture_interval_sec)  # 30.0
-print(cfg.camera.warning_interval_sec)  # 1.0
+print(cfg.camera.warning_interval_sec)  # 5.0
 for roi in cfg.roi.rois:
     print(roi.name, roi.x1, roi.y1, roi.x2, roi.y2)
 ```
@@ -58,7 +58,7 @@ save_config(cfg)
   "camera": {
     "ip": "192.168.0.51",           // 카메라 IP
     "capture_interval_sec": 30.0,   // 평상시 캡처 주기
-    "warning_interval_sec": 1.0     // 과열 감지 시 캡처 주기
+    "warning_interval_sec": 5.0     // 과열 감지 시 캡처 주기
   },
   "identity": {
     "camera_id": "CAM-01",          // 카메라 식별자
@@ -76,11 +76,12 @@ save_config(cfg)
     ]
   },
   "monitoring": {
-    "process_interval_sec": 2.0,    // 파일 스캔 주기
+    "process_interval_sec": 10.0,   // 파일 스캔 주기
     "integrity_interval_sec": 60.0, // 무결성 검사 주기
     "metadata_interval_sec": 120.0, // 메타데이터 갱신 주기
     "max_processed_cache": 10000,   // 처리 파일 캐시
-    "alarm_cooldown_sec": 600       // 알림 쿨다운 (10분)
+    "alarm_cooldown_sec": 600,      // 알림 쿨다운 (10분)
+    "cleanup_retention_days": 2     // 데이터 보존 기간 (일)
   },
   "hotspot": {
     "min_size": 3,                  // 95th 경로 최소 클러스터 크기
@@ -346,7 +347,7 @@ from thermal_monitoring.data import run_cleanup, CleanupResult
 
 result: CleanupResult = run_cleanup(
     save_dir="thermal_dataset",
-    retention_days=7,        # 보존 기간 (기본 7일)
+    retention_days=2,        # 보존 기간 (기본 2일)
     log_callback=my_log_func,
 )
 # result.removed_pairs, result.preserved_alarms (알람 이력 보존)
@@ -367,7 +368,7 @@ from thermal_monitoring.pipeline import MonitorSequencer
 
 monitor = MonitorSequencer(
     cam_ip="192.168.0.51",
-    capture_interval=30.0,     # 평상시 캡처 주기
+    capture_interval=30.0,     # 평상시 캡처 주기 (기본값: 1.0)
 )
 monitor.start()   # 블로킹 실행 (캡처 + 분석 + 알림 통합)
 monitor.stop()    # 종료
@@ -498,7 +499,7 @@ class MyDashboard:
 `config.json`의 `roi.rois` 배열을 순회하며 각 `{name, x1, y1, x2, y2}`에 사각형을 그리면 됩니다. `create_overlay()` 호출 시 `roi_bounds_list`로 전달하면 자동으로 그려집니다.
 
 **Q: Thermal 이미지와 Visual 이미지가 정렬되지 않아요.**  
-캘리브레이션 후 `thermal_to_rgb.npy`가 생성되면 `create_overlay()`가 자동으로 Homography 변환을 적용합니다. 캘리브레이션은 `tools.py`의 "Calibrate" 버튼이나 `run_calibration()` 함수로 실행합니다.
+캘리브레이션 후 `thermal_to_rgb.npy`가 생성되면 `create_overlay()`가 자동으로 Homography 변환을 적용합니다. 캘리브레이션은 `tools.py`의 "Calibrate" 버튼이나 `run_calibration()` 함수로 실행합니다. (import: `from thermal_monitoring.tools.calibration import run_calibration`)
 
 **Q: GUI에서 오래 걸리는 작업은 어떻게 처리하나요?**  
 `run_check()`, `run_metadata()`, `run_cleanup()`은 내부적으로 파일 I/O가 있으므로 `threading.Thread`로 백그라운드 실행을 권장합니다. `log_callback` 인자로 진행 상황을 GUI에 전달할 수 있습니다.
