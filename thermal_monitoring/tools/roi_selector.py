@@ -1,11 +1,13 @@
 """
-roi_selector.py - GUI ROI 영역 설정 도구 (다중 ROI 지원)
+roi_selector.py - GUI ROI 영역 설정 도구 (다중 ROI 지원, Homography 연동)
 
 사용법:
-    python roi_selector.py [thermal_image.jpg]
+    python roi_selector.py [thermal_image.jpg]            # 기존: 열화상 이미지
+    python roi_selector.py [thermal_image.jpg] [visual_image.jpg]  # 신규: 가시광+Homography
 
-Thermal 이미지를 띄우고 마우스 드래그로 ROI 영역을 지정합니다.
-선택 완료 후 S 키를 누르면 config.json이 자동 업데이트됩니다.
+열화상 이미지를 띄우고 마우스 드래그로 ROI 영역을 지정합니다.
+thermal_to_rgb.npy (Homography)가 존재하고 가시광 이미지가 있으면
+가시광 이미지 위에서 ROI를 그리고, 저장 시 열화상 좌표(640×480)로 자동 변환합니다.
 
 조작:
     마우스 드래그 : ROI 영역 선택
@@ -40,6 +42,10 @@ roi_start = None
 roi_end = None
 dragging = False
 scale = 1.0
+# ── Homography / Visual 모드 ──
+H_inv = None                    # inverse homography (visual→thermal)
+use_visual = False              # 가시광 이미지 표시 중이면 True
+thermal_resolution = (640, 480) # 최종 저장 좌표계 기준
 
 ROI_COLORS = [
     (0, 255, 0),    # 초록
@@ -137,24 +143,37 @@ def load_existing_rois():
 
 
 def save_all_rois():
-    """config.json에 모든 ROI 저장"""
+    """config.json에 모든 ROI 저장 (visual 모드면 thermal 좌표로 변환)"""
     c = load_config(force_reload=True)
     entries = []
     for r in rois:
-        entries.append({
-            "name": r["name"],
-            "x1": int(r["x1"]), "y1": int(r["y1"]),
-            "x2": int(r["x2"]), "y2": int(r["y2"]),
-        })
+        if use_visual and H_inv is not None:
+            # 가시광 좌표 → 열화상 640×480 좌표로 변환
+            corners_vis = np.array([
+                [r["x1"], r["y1"]],
+                [r["x2"], r["y2"]],
+            ], dtype=np.float32).reshape(-1, 1, 2)
+            thermal_pts = cv2.perspectiveTransform(corners_vis, H_inv).reshape(2, 2)
+            tx1, ty1 = int(round(thermal_pts[0, 0])), int(round(thermal_pts[0, 1]))
+            tx2, ty2 = int(round(thermal_pts[1, 0])), int(round(thermal_pts[1, 1]))
+            # 정렬 및 클램핑
+            x1 = max(0, min(min(tx1, tx2), thermal_resolution[0] - 1))
+            y1 = max(0, min(min(ty1, ty2), thermal_resolution[1] - 1))
+            x2 = max(0, min(max(tx1, tx2), thermal_resolution[0] - 1))
+            y2 = max(0, min(max(ty1, ty2), thermal_resolution[1] - 1))
+            print(f"  [{r['name']}] visual({r['x1']},{r['y1']})-({r['x2']},{r['y2']})"
+                  f" → thermal({x1},{y1})-({x2},{y2})")
+        else:
+            x1, y1, x2, y2 = int(r["x1"]), int(r["y1"]), int(r["x2"]), int(r["y2"])
+        entries.append({"name": r["name"], "x1": x1, "y1": y1, "x2": x2, "y2": y2})
     c.roi.rois = entries
-    # 첫 번째 ROI로 하위 호환 좌표도 유지
     if entries:
         c.roi.x1 = entries[0]["x1"]
         c.roi.y1 = entries[0]["y1"]
         c.roi.x2 = entries[0]["x2"]
         c.roi.y2 = entries[0]["y2"]
     save_config(c)
-    print(f"[roi_selector] {len(entries)} ROI(s) saved to config.json:")
+    print(f"[roi_selector] {len(entries)} ROI(s) saved to config.json in thermal 640×480 coordinates:")
     for e in entries:
         print(f"  {e['name']}: ({e['x1']},{e['y1']})-({e['x2']},{e['y2']})")
 
@@ -165,25 +184,58 @@ def _get_color(idx: int) -> tuple:
 
 def main():
     global scale, selected_idx, rois, roi_start, roi_end, dragging
+    global H_inv, use_visual
 
-    if len(sys.argv) >= 2:
-        img_path = sys.argv[1]
+    # ── 인자 파싱 ──
+    thermal_path: str | None = None
+    visual_path: str | None = None
+    if len(sys.argv) >= 3:
+        thermal_path = sys.argv[1]
+        visual_path = sys.argv[2]
+    elif len(sys.argv) == 2:
+        thermal_path = sys.argv[1]
     else:
         jpg_files = sorted(glob.glob(os.path.join(DATASET_DIR, "*.jpg")))
         thermal_files = [f for f in jpg_files if "_visual" not in f]
-        img_path = thermal_files[-1] if thermal_files else None
+        if thermal_files:
+            thermal_path = thermal_files[-1]
+            v = os.path.splitext(thermal_path)[0] + "_visual.jpg"
+            if v in jpg_files:
+                visual_path = v
 
-    if img_path is None:
+    if thermal_path is None:
         print("Thermal 이미지를 찾을 수 없습니다.")
-        print("사용법: python roi_selector.py [thermal_image.jpg]")
+        print("사용법: python roi_selector.py [thermal.jpg] [visual.jpg]")
         sys.exit(1)
 
-    img = cv2.imread(img_path)
+    # ── Homography 확인 ──
+    HOMOGRAPHY_PATH = cfg.paths.homography_path
+    if os.path.isfile(HOMOGRAPHY_PATH) and visual_path and os.path.isfile(visual_path):
+        H = np.load(HOMOGRAPHY_PATH)
+        if H.shape == (3, 3):
+            H_inv = np.linalg.inv(H)
+            img = cv2.imread(visual_path)
+            use_visual = True
+            display_res = img.shape[:2]  # (H, W) of visual
+            print(f"Homography loaded → Visual mode: {os.path.basename(visual_path)}"
+                  f" ({display_res[1]}×{display_res[0]})")
+            print(f"  ROI coordinates will be auto-converted to thermal {thermal_resolution[0]}×{thermal_resolution[1]} on save.")
+        else:
+            print(f"Invalid homography shape {H.shape}, falling back to thermal.")
+            use_visual = False
+    else:
+        use_visual = False
+
+    if not use_visual:
+        img = cv2.imread(thermal_path)
+        H_inv = None
+        print(f"Thermal mode: {os.path.basename(thermal_path)}")
+
     if img is None:
-        print(f"이미지를 불러올 수 없습니다: {img_path}")
+        print(f"이미지를 불러올 수 없습니다.")
         sys.exit(1)
 
-    print(f"Loaded: {img_path}  ({img.shape[1]}x{img.shape[0]})")
+    print(f"Loaded: {thermal_path if not use_visual else visual_path}  ({img.shape[1]}×{img.shape[0]})")
     print("  Drag mouse to set ROI for selected area")
     print("  N = new ROI    Tab = next    Del = delete    S = save & exit")
     print("  R = reset all    Z = undo    Q = quit without saving")
@@ -195,8 +247,9 @@ def main():
     img_disp = resize_for_display(img, DISPLAY_WIDTH)
     scale = img.shape[1] / img_disp.shape[1]
 
-    cv2.namedWindow("ROI Selector - Thermal Image")
-    cv2.setMouseCallback("ROI Selector - Thermal Image", mouse_callback)
+    wintitle = "ROI Selector - Visual (H)" if use_visual else "ROI Selector - Thermal"
+    cv2.namedWindow(wintitle)
+    cv2.setMouseCallback(wintitle, mouse_callback)
 
     while True:
         disp = img_disp.copy()
@@ -228,14 +281,15 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         # 상태 텍스트
+        mode_text = "Visual mode (H→thermal)" if use_visual else "Thermal mode"
         status_lines = [
-            f"Selected: {rois[selected_idx]['name'] if 0 <= selected_idx < len(rois) else '(none)'}",
+            f"{mode_text} | Selected: {rois[selected_idx]['name'] if 0 <= selected_idx < len(rois) else '(none)'}",
             f"ROIs: {len(rois)} | N: new  Tab: next  Del: delete  S: save  Q: quit",
         ]
         for i, line in enumerate(status_lines):
             cv2.putText(disp, line, (10, 20 + i * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
 
-        cv2.imshow("ROI Selector - Thermal Image", disp)
+        cv2.imshow(wintitle, disp)
         key = cv2.waitKey(1)
 
         if key == ord("q") or key == 27:

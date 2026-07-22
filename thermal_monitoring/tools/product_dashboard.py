@@ -869,14 +869,22 @@ class SettingsDialog:
 
     def open_roi_editor(self):
         dataset = Path(self.d.cfg.paths.dataset_dir)
-        visuals = sorted(dataset.glob("*_visual.jpg")) if dataset.exists() else []
-        if not visuals:
-            messagebox.showwarning("ROI 설정", "가시광 이미지가 없습니다. 먼저 이미지를 수집하세요.", parent=self.win); return
-        self.d._add_operating_log("ROI 설정", "시작", str(visuals[-1]))
+        if not dataset.exists():
+            messagebox.showwarning("ROI 설정", "데이터셋 폴더가 없습니다.", parent=self.win); return
+        jpgs = sorted(dataset.glob("*.jpg"))
+        thermal_files = [p for p in jpgs if "_visual" not in p.name]
+        if not thermal_files:
+            messagebox.showwarning("ROI 설정", "이미지가 없습니다. 먼저 이미지를 수집하세요.", parent=self.win); return
+        thermal = thermal_files[-1]
+        visual = dataset / f"{thermal.stem}_visual.jpg"
+        self.d._add_operating_log("ROI 설정", "시작", str(visual if visual.exists() else thermal))
         self.win.grab_release()
         try:
             from .roi_selector import main as roi_main
-            sys.argv = ["roi_selector", str(visuals[-1])]
+            if visual.exists():
+                sys.argv = ["roi_selector", str(thermal), str(visual)]
+            else:
+                sys.argv = ["roi_selector", str(thermal)]
             roi_main()
             self.d.cfg = load_config(force_reload=True)
             self.d._add_operating_log("ROI 설정", "완료", f"{len(self.d.cfg.roi.rois)}개 영역 저장됨")
@@ -902,6 +910,16 @@ class SettingsDialog:
             saved = run_calibration(str(thermal), str(visual))
             if saved:
                 self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
+                # ROI selector 자동 실행 유도
+                if messagebox.askyesno(
+                    "ROI 설정",
+                    "캘리브레이션이 완료되었습니다.\n\n"
+                    "가시광 이미지에서 ROI 영역을 설정하시겠습니까?\n"
+                    "(가시광에서 지정한 ROI는 열화상 좌표로 자동 변환됩니다.)",
+                    parent=self.win,
+                ):
+                    self.win.grab_set()  # 선취득 → roi_editor 진입 직전 release
+                    self.open_roi_editor()
             else:
                 self.d._add_operating_log("캘리브레이션", "종료", "저장 없이 종료")
         except Exception as exc:
