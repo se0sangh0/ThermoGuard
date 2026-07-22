@@ -19,7 +19,7 @@ monitor.py - 실시간 열화상 감시 시퀀서 (Real-time Thermal Monitoring 
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -34,6 +34,7 @@ from ..analysis.roi import load_roi_config, extract_roi_from_npy, extract_all_ro
 from ..analysis.threshold import (
     Status,
     MonitorState,
+    evaluate_threshold,
     evaluate_with_state,
 )
 from ..analysis.overlay import create_overlay, save_overlay
@@ -54,6 +55,13 @@ INTEGRITY_INTERVAL = _cfg.monitoring.integrity_interval_sec
 METADATA_INTERVAL = _cfg.monitoring.metadata_interval_sec
 # 처리 완료된 파일 캐시 최대 개수 (메모리 관리)
 MAX_PROCESSED_CACHE = _cfg.monitoring.max_processed_cache
+
+# 상태 심각도 순위 (다중 ROI 대표 선정용: 높을수록 심각)
+_STATUS_RANK = {Status.NORMAL: 0, Status.WARNING: 1, Status.CRITICAL: 2}
+
+# 전송 실패한 CRITICAL 알람의 재시도 최소 간격 (초). CRITICAL이 지속되는 동안
+# 성공할 때까지 재시도하되, 네트워크 장애 시 과도한 요청을 막기 위한 백오프.
+ALARM_RETRY_BACKOFF_SEC = 60.0
 
 
 class MonitorSequencer:
@@ -84,32 +92,36 @@ class MonitorSequencer:
         print(f"[{ts}] {msg}")
 
     # ── 파일 스캔 ─────────────────────────────────────────────
-    def _scan_all_paired_bases(self) -> set:
-        """thermal JPG + visual JPG 둘 다 존재하는 모든 base를 반환"""
+    def _scan_all_existing_bases(self) -> set:
+        """시작 시점에 이미 존재하는 모든 thermal base를 반환.
+
+        _scan_new_pairs와 동일하게 thermal JPG 기준(visual 유무 무관)으로 스캔한다.
+        visual까지 요구하면, 이전 실행의 thermal-only(경고 모드) 잔여 파일이
+        프라임에서 누락되어 과거 데이터로 재분석/오알람될 수 있다.
+        """
         if not os.path.isdir(DATASET_DIR):
             return set()
-        thermal_jpgs: dict[str, str] = {}
-        visual_jpgs: dict[str, str] = {}
+        bases: set = set()
         try:
             with os.scandir(DATASET_DIR) as entries:
                 for entry in entries:
                     if not entry.is_file():
                         continue
                     name = entry.name
-                    if name.endswith("_visual.jpg"):
-                        visual_jpgs[name.replace("_visual.jpg", "")] = name
-                    elif name.endswith(".jpg") and "_overlay" not in name:
-                        thermal_jpgs[name.replace(".jpg", "")] = name
+                    if (name.endswith(".jpg")
+                            and "_visual" not in name
+                            and "_overlay" not in name):
+                        bases.add(name.replace(".jpg", ""))
         except OSError:
             return set()
-        return set(thermal_jpgs.keys()) & set(visual_jpgs.keys())
+        return bases
 
     def _prime_processed_cache(self):
-        """시작 시점에 이미 존재하는 모든 쌍을 processed_bases에 추가 (기존 데이터 알람 방지)"""
-        existing = self._scan_all_paired_bases()
+        """시작 시점에 이미 존재하는 모든 thermal base를 processed_bases에 추가 (기존 데이터 알람 방지)"""
+        existing = self._scan_all_existing_bases()
         self.processed_bases = existing
         if existing:
-            self._log(f"Seeded processed cache with {len(existing)} existing pair(s) — will not re-analyze.")
+            self._log(f"Seeded processed cache with {len(existing)} existing base(s) — will not re-analyze.")
 
     def _scan_new_pairs(self) -> list[dict]:
         """아직 처리되지 않은 이미지 쌍을 찾아 반환"""
@@ -208,42 +220,92 @@ class MonitorSequencer:
         except Exception as e:
             self._log(f"Cleanup error (recovering): {e}")
 
-    # ── 단일 쌍 처리 ─────────────────────────────────────────
-    def _process_pair(self, pair: dict) -> bool:
+    # ── 단일 쌍 분석 (순수/스레드 안전, 상태 변경 없음) ──────────
+    def _analyze_pair(self, pair: dict) -> Optional[dict]:
         """
-        이미지 한 쌍을 전체 파이프라인으로 처리.
+        이미지 한 쌍의 ROI 통계를 추출하고 대표 ROI를 선정한다.
+
+        상태 머신(self.state)을 건드리지 않는 순수 연산이므로 여러 쌍을
+        스레드 풀로 병렬 실행해도 안전하다. 상태 판정/알람은 이후
+        _evaluate_and_act에서 timestamp 순으로 순차 처리한다.
 
         Returns:
-            True: 정상 처리
-            False: 오류 발생 (시퀀스는 계속됨)
+            분석 결과 dict, 또는 오류/스킵 시 None
         """
         base = pair["base"]
         try:
             if self.roi_config is None:
                 self._log(f"[{base}] ROI config not loaded — skipping")
-                return False
+                return None
 
             # 1. ROI 추출 (다중 ROI 지원)
             roi_results = extract_all_rois_from_npy(pair["npy"], self.roi_config)
-            # 가장 높은 95th를 가진 ROI를 대표로 사용
-            roi_result = max(roi_results, key=lambda r: r.hot_temp_95)
+
+            # 대표 ROI 선정: 각 ROI를 개별 판정하여 가장 심각한(동률이면 95th가 높은)
+            #  ROI를 대표로 사용. 95th만으로 뽑으면 max·클러스터가 큰 국소 발열
+            #  ROI를 놓칠 수 있어 상태 심각도 기준으로 보완한다.
+            def _severity(rr) -> tuple:
+                st = evaluate_threshold(
+                    rr.hot_temp_95, rr.max_temp,
+                    self.roi_config.baseline_temp,
+                    self.roi_config.warning_delta,
+                    self.roi_config.critical_delta,
+                    max_hotspot_size=rr.max_hotspot_size,
+                )
+                return (_STATUS_RANK[st], rr.hot_temp_95)
+
+            roi_result = max(roi_results, key=_severity)
+
+            # 모든 ROI의 핫스팟 통합 + 5px 이내 중복 제거
             all_hotspots = []
             for rr in roi_results:
                 all_hotspots.extend(rr.hotspot_centroids)
-            # 중복 핫스팟 제거 (5px 이내 동일 위치)
             unique_hotspots = []
             for spot in all_hotspots:
                 is_dup = False
-                for u in unique_hotspots:
+                for idx, u in enumerate(unique_hotspots):
                     if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
                         if spot[2] > u[2]:
-                            unique_hotspots[unique_hotspots.index(u)] = spot
+                            unique_hotspots[idx] = spot
                         is_dup = True
                         break
                 if not is_dup:
                     unique_hotspots.append(spot)
             roi_result.hotspot_centroids = unique_hotspots
 
+            return {
+                "pair": pair,
+                "roi_results": roi_results,
+                "roi_result": roi_result,
+            }
+
+        except FileNotFoundError as e:
+            _log_monitor.warning("[%s] File missing: %s", base, e)
+            self._log(f"[{base}] File missing: {e}")
+            return None
+        except ValueError as e:
+            _log_monitor.warning("[%s] Data error: %s", base, e)
+            self._log(f"[{base}] Data error: {e}")
+            return None
+        except Exception as e:
+            _log_monitor.error("[%s] Unexpected analysis error: %s", base, e, exc_info=True)
+            self._log(f"[{base}] Unexpected error: {e}")
+            return None
+
+    # ── 상태 판정 + 전이 + 알람 (메인 스레드 전용, 순차 실행) ────
+    def _evaluate_and_act(self, analysis: dict) -> None:
+        """
+        분석 결과에 상태 머신을 적용하고 오버레이/알람을 처리한다.
+
+        self.state를 변경하므로 반드시 메인 스레드에서 timestamp 순서대로
+        순차 호출해야 한다(병렬 호출 시 상태 경쟁으로 중복 알람/비결정적
+        상태 전이가 발생한다).
+        """
+        pair = analysis["pair"]
+        roi_results = analysis["roi_results"]
+        roi_result = analysis["roi_result"]
+        base = pair["base"]
+        try:
             # 2. Threshold + 상태 판정
             new_status, do_alarm = evaluate_with_state(
                 hot_temp=roi_result.hot_temp_95,
@@ -272,8 +334,22 @@ class MonitorSequencer:
                 _log_monitor.info("Capture interval restored to normal (%.1fs) — status: Normal",
                                   _cfg.camera.capture_interval_sec)
 
-            with self._lock:
-                self._status_counts[new_status.value] += 1
+            self._status_counts[new_status.value] += 1
+
+            # ── 알람 대기(pending) 상태 갱신 ──
+            # 새 CRITICAL 전이면 알람을 '보내야 함'으로 표시. CRITICAL을 벗어나면 종료.
+            if do_alarm:
+                self.state.alarm_pending = True
+            if new_status != Status.CRITICAL:
+                self.state.alarm_pending = False
+
+            # 이번 사이클에 전송을 시도할지: 신규 전이거나, 대기 중이며 백오프가 경과했을 때.
+            # (전송 실패 시 status는 이미 CRITICAL이라 do_alarm은 False가 되므로,
+            #  alarm_pending 기반으로 CRITICAL이 지속되는 동안 재시도한다.)
+            now = time.time()
+            attempt_send = self.state.alarm_pending and (
+                do_alarm or (now - self.state.last_alarm_attempt) >= ALARM_RETRY_BACKOFF_SEC
+            )
 
             # 상태 변화 표시
             transition = ""
@@ -294,17 +370,16 @@ class MonitorSequencer:
                     self._log(f"Hotspots: {roi_result.hotspot_centroids}")
                     self._log(f"Count: {len(roi_result.hotspot_centroids)}")
 
-                    # 알람 시에는 fresh capture로 최신 thermal+visual 쌍 확보
+                    # 카메라 2중 접근 방지: 배경 캡처가 방금 저장한 최신 쌍을 재사용.
+                    # (경고 모드면 visual이 없어 thermal-only 오버레이로 폴백)
                     overlay_thermal = pair["thermal_jpg"]
                     overlay_visual = pair["visual_jpg"]
-                    if do_alarm and self.capture:
-                        fresh_t, fresh_v = self.capture.capture_both_once()
-                        if fresh_t:
-                            self._log(f"  Alarm fresh capture: {os.path.basename(fresh_t)}")
-                            overlay_thermal = fresh_t
-                            overlay_visual = fresh_v or ""
-                        else:
-                            self._log("  Alarm fresh capture failed, using existing pair")
+                    if self.capture:
+                        last_t, last_v = self.capture.last_saved_pair
+                        if last_t:
+                            overlay_thermal = last_t
+                            overlay_visual = last_v or ""
+                            self._log(f"  Using latest captured frame: {os.path.basename(last_t)}")
 
                     overlay = create_overlay(
                         thermal_jpg_path=overlay_thermal,
@@ -322,8 +397,10 @@ class MonitorSequencer:
                 except Exception as e:
                     self._log(f"  Overlay error: {e}")
 
-            # 4. 알림 전송 (상태 변화 시)
-            if do_alarm:
+            # 4. 알림 전송 (신규 전이 또는 실패분 재시도)
+            if attempt_send:
+                self.state.last_alarm_attempt = now
+                is_retry = not do_alarm
                 try:
                     success = send_alarm(
                         image_path=overlay_path or pair["thermal_jpg"],
@@ -332,32 +409,23 @@ class MonitorSequencer:
                     )
                     if success:
                         self.state.last_alarm_time = time.time()
-                        with self._lock:
-                            self._alarm_count += 1
-                        self._log(f"  ▲ Alarm sent: {new_status.value}")
+                        self.state.alarm_pending = False
+                        self._alarm_count += 1
+                        self._log(f"  ▲ Alarm {'re-sent' if is_retry else 'sent'}: {new_status.value}")
                     else:
-                        self._log(f"  ▲ Alarm failed to send")
+                        self._log("  ▲ Alarm send failed — pending, will retry")
                 except RuntimeError:
+                    # 텔레그램 미설정: 재시도해도 소용없으므로 대기 해제
+                    self.state.alarm_pending = False
                     self._log("  ▲ Alarm skipped (Telegram not configured)")
                 except Exception as e:
-                    self._log(f"  ▲ Alarm error: {e}")
+                    self._log(f"  ▲ Alarm error: {e} — pending, will retry")
 
-            return True
-
-        except FileNotFoundError as e:
-            _log_monitor.warning("[%s] File missing: %s", base, e)
-            self._log(f"[{base}] File missing: {e}")
-            return False
-        except ValueError as e:
-            _log_monitor.warning("[%s] Data error: %s", base, e)
-            self._log(f"[{base}] Data error: {e}")
-            return False
         except Exception as e:
-            _log_monitor.error("[%s] Unexpected error: %s", base, e, exc_info=True)
+            _log_monitor.error("[%s] Unexpected evaluate/act error: %s", base, e, exc_info=True)
             self._log(f"[{base}] Unexpected error: {e}")
             import traceback
             traceback.print_exc()
-            return False
 
     # ── 메인 감시 루프 ───────────────────────────────────────
     def _monitoring_loop(self):
@@ -400,22 +468,22 @@ class MonitorSequencer:
                 new_pairs = self._scan_new_pairs()
                 if new_pairs:
                     self._log(f"→ {len(new_pairs)} new pair(s) detected")
-                    # 다중 쌍을 스레드 풀로 병렬 처리
+                    # 1) ROI 추출은 순수/스레드 안전 → 스레드 풀로 병렬 처리.
+                    #    executor.map은 입력 순서(=timestamp 정렬)를 그대로 보존한다.
                     if len(new_pairs) > 1:
                         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_PAIRS) as executor:
-                            futures = {
-                                executor.submit(self._process_pair, pair): pair["base"]
-                                for pair in new_pairs
-                            }
-                            for future in as_completed(futures):
-                                base = futures[future]
-                                self._mark_processed(base)
+                            analyses = list(executor.map(self._analyze_pair, new_pairs))
                     else:
-                        for pair in new_pairs:
-                            if not self._running:
-                                break
-                            self._process_pair(pair)
-                            self._mark_processed(pair["base"])
+                        analyses = [self._analyze_pair(new_pairs[0])]
+
+                    # 2) 상태 판정/알람은 timestamp 순서로 메인 스레드에서 순차 실행.
+                    #    (상태 경쟁 방지 + 시계열 상태 전이 정합성 보장)
+                    for pair, analysis in zip(new_pairs, analyses):
+                        if not self._running:
+                            break
+                        if analysis is not None:
+                            self._evaluate_and_act(analysis)
+                        self._mark_processed(pair["base"])
 
             except Exception as e:
                 _log_monitor.error("Monitoring loop error (recovering): %s", e, exc_info=True)
@@ -423,11 +491,13 @@ class MonitorSequencer:
                 import traceback
                 traceback.print_exc()
 
-            # 다음 스캔까지 대기 (stop 체크를 위해 1초씩 분할)
-            for _ in range(int(self.process_interval)):
-                if not self._running:
+            # 다음 스캔까지 대기 (monotonic 데드라인 — 1초 미만/소수 값도 안전, busy-spin 방지)
+            deadline = time.monotonic() + self.process_interval
+            while self._running:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-                time.sleep(1)
+                time.sleep(min(1.0, remaining))
 
     # ── 공개 API ─────────────────────────────────────────────
     def start(self):

@@ -35,6 +35,8 @@ class MonitorState:
     status: Status = Status.NORMAL
     last_alarm_time: float = 0.0
     alarm_cooldown: float = _cfg.monitoring.alarm_cooldown_sec  # from config.json
+    alarm_pending: bool = False        # 전송 실패한 CRITICAL 알람이 재시도 대기 중인지
+    last_alarm_attempt: float = 0.0    # 마지막 전송 시도 시각 (재시도 백오프용)
 
 
 def evaluate_threshold(
