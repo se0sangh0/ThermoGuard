@@ -442,6 +442,10 @@ def main(event_pump=None):
 
     wintitle = "ROI Selector - Visual (H)" if use_visual else "ROI Selector - Thermal"
     cv2.namedWindow(wintitle)
+    try:
+        cv2.setWindowProperty(wintitle, cv2.WND_PROP_TOPMOST, 1)
+    except cv2.error:
+        pass
     cv2.setMouseCallback(wintitle, mouse_callback)
 
     _running = True

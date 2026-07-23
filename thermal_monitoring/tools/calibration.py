@@ -174,6 +174,11 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None):
 
     cv2.namedWindow("Thermal")
     cv2.namedWindow("RGB")
+    for title in ("Thermal", "RGB"):
+        try:
+            cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)
+        except cv2.error:
+            pass
 
     thermal_disp = resize_for_display(thermal, DISPLAY_WIDTH)
     rgb_disp = resize_for_display(rgb, DISPLAY_WIDTH)
