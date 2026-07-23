@@ -20,8 +20,19 @@ from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
 from ..analysis.overlay import create_overlay
-from ..analysis.roi import RoiResult, extract_roi_from_npy, load_roi_config, extract_all_rois_from_npy, _get_roi_bounds_list
-from ..analysis.threshold import MonitorState, Status, evaluate_with_state, _STATUS_RANK
+from ..analysis.roi import (
+    RoiResult,
+    load_roi_config,
+    extract_all_rois_from_npy,
+    _get_roi_bounds_list,
+    merge_roi_hotspot_centroids,
+)
+from ..analysis.threshold import (
+    MonitorState,
+    Status,
+    evaluate_rois_with_state,
+    apply_roi_state_updates,
+)
 from ..capture.capture import CaptureSession
 from ..capture.thermal_utils import extract_from_jpeg
 from ..config import load_config, save_config
@@ -511,53 +522,22 @@ class ProductDashboard:
         roi_cfg = load_roi_config()
         roi_results = extract_all_rois_from_npy(str(npy), roi_cfg)
 
-        # 다중 ROI: 각 ROI별 개별 평가 (알람 쿨다운도 ROI 단위로 독립)
-        per_roi_statuses: list[dict] = []
-        for rr in roi_results:
-            s, a = evaluate_with_state(
-                rr.hot_temp_95, rr.max_temp, rr.mean_temp,
-                roi_cfg.baseline_temp, roi_cfg.warning_delta,
-                roi_cfg.critical_delta, self.state,
-                rr.over_temp_pixels, rr.max_hotspot_size,
-                roi_name=rr.roi_name if rr.roi_name else None,
-            )
-            per_roi_statuses.append({"roi_name": rr.roi_name, "status": s, "alarm": a, "roi": rr})
-
-        # 최악 ROI로 capture interval 전환 + GUI KPI 표시
-        worst = max(per_roi_statuses, key=lambda x: (_STATUS_RANK[x["status"]], x["roi"].hot_temp_95))
+        per_roi_statuses, worst, alarm = evaluate_rois_with_state(
+            roi_results,
+            baseline=roi_cfg.baseline_temp,
+            warning_delta=roi_cfg.warning_delta,
+            critical_delta=roi_cfg.critical_delta,
+            state=self.state,
+        )
         status = worst["status"]
         roi_result = worst["roi"]
-        alarm = any(ps["alarm"] for ps in per_roi_statuses)
 
-        # per-ROI 상태 갱신
-        for ps in per_roi_statuses:
-            rn = ps["roi_name"]
-            if rn:
-                rs = self.state.roi_state(rn)
-                rs.status = ps["status"]
-                if ps["alarm"]:
-                    rs.last_alarm_time = time.time()
-                    rs.alarm_pending = False
+        apply_roi_state_updates(self.state, per_roi_statuses)
 
         # 전역 최악 상태 갱신
         self.state.status = status
 
-        # 핫스팟 병합 (중복 제거)
-        all_hotspots = []
-        for rr in roi_results:
-            all_hotspots.extend(rr.hotspot_centroids)
-        unique_hotspots = []
-        for spot in all_hotspots:
-            is_dup = False
-            for u in unique_hotspots:
-                if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
-                    if spot[2] > u[2]:
-                        unique_hotspots[unique_hotspots.index(u)] = spot
-                    is_dup = True
-                    break
-            if not is_dup:
-                unique_hotspots.append(spot)
-        roi_result.hotspot_centroids = unique_hotspots
+        roi_result.hotspot_centroids = merge_roi_hotspot_centroids(roi_results)
 
         overlay = create_overlay(
             # This panel is explicitly the Thermal view. Passing the visual

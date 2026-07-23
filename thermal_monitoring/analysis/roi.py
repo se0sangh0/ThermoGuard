@@ -240,6 +240,30 @@ def _get_roi_bounds_list(config: RoiConfig) -> list[tuple]:
     return [(config.x1, config.y1, config.x2, config.y2)]
 
 
+def deduplicate_hotspot_centroids(hotspots: list[tuple], proximity_px: int = 5) -> list[tuple]:
+    """가까운 핫스팟을 하나로 합치고 더 높은 온도를 유지한다."""
+    unique_hotspots: list[tuple] = []
+    for spot in hotspots:
+        is_duplicate = False
+        for idx, existing in enumerate(unique_hotspots):
+            if abs(spot[0] - existing[0]) < proximity_px and abs(spot[1] - existing[1]) < proximity_px:
+                if spot[2] > existing[2]:
+                    unique_hotspots[idx] = spot
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            unique_hotspots.append(spot)
+    return unique_hotspots
+
+
+def merge_roi_hotspot_centroids(roi_results: list[RoiResult], proximity_px: int = 5) -> list[tuple]:
+    """여러 ROI의 핫스팟을 하나의 리스트로 합친 뒤 중복 제거한다."""
+    all_hotspots: list[tuple] = []
+    for roi_result in roi_results:
+        all_hotspots.extend(roi_result.hotspot_centroids)
+    return deduplicate_hotspot_centroids(all_hotspots, proximity_px=proximity_px)
+
+
 # ------------------------------------------------------------
 # 테스트
 # ------------------------------------------------------------
