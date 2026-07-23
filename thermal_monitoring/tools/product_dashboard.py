@@ -109,6 +109,8 @@ class ProductDashboard:
         # 최근 화면 품질을 기준으로 정상률을 계산한다. 누적 전체 기준보다
         # 현재 발생한 영상 이상이 즉시 수치에 반영된다.
         self._image_quality_window: list[bool] = []
+        self._connection_ok: Optional[bool] = None
+        self._connection_check_running = False
 
         self._analysis_executor = ThreadPoolExecutor(max_workers=1)
         self._analysis_running = False
@@ -510,6 +512,9 @@ class ProductDashboard:
         self.header_state.configure(text=f"● {text}", fg=color)
 
     def _check_connection_async(self):
+        if self._connection_check_running or self.lifecycle != "running":
+            return
+        self._connection_check_running = True
         self.metrics.connection_attempts += 1
         def work():
             ok = False
@@ -525,6 +530,8 @@ class ProductDashboard:
         threading.Thread(target=work, daemon=True).start()
 
     def _connection_result(self, ok):
+        self._connection_check_running = False
+        self._connection_ok = ok
         if ok:
             self._add_operating_log("연결", "성공", f"카메라 {self.cfg.camera.ip} 응답 확인")
             if self.capture_paused_by_user:
@@ -534,8 +541,9 @@ class ProductDashboard:
             if not self.monitoring and not self.capture_paused_by_user:
                 self.start_monitoring()
         else:
-            self._set_system_state("연결 지연", COLORS["orange"])
+            self._set_system_state("연결 없음", COLORS["red"])
             self._add_operating_log("연결", "실패", f"카메라 {self.cfg.camera.ip} 응답 없음")
+        self._update_quality_display()
         self._update_metric_text()
 
     def start_monitoring(self):
@@ -599,7 +607,33 @@ class ProductDashboard:
         elif any(word in message.lower() for word in ("error", "timeout", "http", "connection")):
             self.metrics.capture_attempts += 1; self.metrics.exception_count += 1
             self._add_operating_log("캡처", "예외 처리", message)
+            self.root.after(0, self._check_connection_async)
         self._update_metric_text_async()
+
+    def _update_quality_display(self):
+        quality_ok_count = sum(self._image_quality_window)
+        quality_total = len(self._image_quality_window)
+        if self._connection_ok is not True or quality_total == 0:
+            quality_rate = 0.0
+        else:
+            quality_rate = 100.0 * quality_ok_count / quality_total
+
+        quality_color = (
+            COLORS["red"] if self._connection_ok is False
+            else COLORS["muted"] if quality_total == 0
+            else COLORS["green"] if quality_rate == 100.0
+            else COLORS["orange"] if quality_rate >= 80.0
+            else COLORS["red"]
+        )
+        detail = (
+            "연결 없음" if self._connection_ok is False
+            else f"{quality_ok_count}/{quality_total}" if quality_total
+            else "측정 대기"
+        )
+        self.header_quality.configure(
+            text=f"최근 영상 정상률 {quality_rate:.1f}% ({detail})",
+            fg=quality_color,
+        )
 
     def _schedule_refresh(self, delay_ms=None):
         if self.lifecycle != "running":
@@ -940,21 +974,7 @@ class ProductDashboard:
         s = result["status"]
         korean = {Status.NORMAL: "정상", Status.WARNING: "경고", Status.CRITICAL: "위험"}[s]
         color = {Status.NORMAL: COLORS["green"], Status.WARNING: COLORS["orange"], Status.CRITICAL: COLORS["red"]}[s]
-        quality_rate = (
-            100.0 * sum(self._image_quality_window) / len(self._image_quality_window)
-            if self._image_quality_window else 100.0
-        )
-        quality_color = (
-            COLORS["green"] if quality_rate == 100.0
-            else COLORS["orange"] if quality_rate >= 80.0
-            else COLORS["red"]
-        )
-        quality_ok_count = sum(self._image_quality_window)
-        quality_total = len(self._image_quality_window)
-        self.header_quality.configure(
-            text=f"최근 영상 정상률 {quality_rate:.1f}% ({quality_ok_count}/{quality_total})",
-            fg=quality_color,
-        )
+        self._update_quality_display()
         overall_max = result.get("overall_max_temp", result["max_temp"])
         overall_roi = result.get("overall_max_roi_name", "ROI-01")
         delta = overall_max - self.cfg.roi.baseline_temp
