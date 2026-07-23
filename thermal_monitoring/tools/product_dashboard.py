@@ -1188,31 +1188,22 @@ class SettingsDialog:
             except cv2.error:
                 continue
 
-    def _show_tool_guard(self, tool_name: str):
+    def _show_tool_guard(self):
         """설정창 클릭이 대기열에 쌓이지 않도록 모달 안내창이 입력을 선점한다."""
         guard = tk.Toplevel(self.win)
         guard.title("작업 진행 중")
         guard.transient(self.win)
         guard.resizable(False, False)
-        guard.geometry("360x150")
-        guard.protocol("WM_DELETE_WINDOW", self._focus_running_tool)
+        guard.geometry("260x90")
+        guard.protocol("WM_DELETE_WINDOW", lambda: None)
 
         body = ttk.Frame(guard, padding=18)
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text=f"{tool_name} 작업 중입니다.",
+            text="작업 중입니다.",
             font=("맑은 고딕", 11, "bold"),
-        ).pack(pady=(0, 8))
-        ttk.Label(
-            body,
-            text="열린 작업 창에서 저장하거나 종료해 주세요.",
-        ).pack(pady=(0, 14))
-        ttk.Button(
-            body,
-            text="작업 창으로 이동",
-            command=self._focus_running_tool,
-        ).pack()
+        ).pack(expand=True)
 
         guard.update_idletasks()
         x = self.win.winfo_rootx() + (self.win.winfo_width() - guard.winfo_width()) // 2
@@ -1241,7 +1232,7 @@ class SettingsDialog:
         self._roi_editor_running = tool_name == "ROI 설정"
         self._calibration_running = tool_name == "캘리브레이션"
         self.win.grab_release()
-        self._show_tool_guard(tool_name)
+        self._show_tool_guard()
         return True
 
     def _end_tool(self):
