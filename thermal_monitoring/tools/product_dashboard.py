@@ -100,6 +100,7 @@ class ProductDashboard:
         self.events: list[dict] = []
         self.operating_logs: list[tuple[str, str, str, str]] = []
         self.operating_log_window: Optional[tk.Toplevel] = None
+        self._operating_log_opening = False
         self.settings_dialog: Optional[SettingsDialog] = None
         self.temperature_history: list[tuple[datetime, float]] = []
         self._last_history_capture: Optional[datetime] = None
@@ -1044,6 +1045,9 @@ class ProductDashboard:
             f"분석 정상 완료 {m.analysis_ok}회   ·   예외 처리 {m.exception_count}회"))
 
     def open_operating_log(self):
+        if self._operating_log_opening:
+            return
+
         if self.operating_log_window:
             try:
                 if self.operating_log_window.winfo_exists():
@@ -1055,8 +1059,25 @@ class ProductDashboard:
                 pass
             self.operating_log_window = None
 
-        win = tk.Toplevel(self.root); win.title("운영 로그"); win.geometry("920x520"); win.transient(self.root)
-        self.operating_log_window = win
+        # 참조가 유실되더라도 같은 이름의 Tk 창이 남아 있으면 새로 만들지 않는다.
+        try:
+            existing = self.root.nametowidget(".operating_log")
+            if existing.winfo_exists():
+                self.operating_log_window = existing
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+        except (KeyError, tk.TclError):
+            pass
+
+        self._operating_log_opening = True
+        try:
+            win = tk.Toplevel(self.root, name="operating_log")
+            win.title("운영 로그"); win.geometry("920x520"); win.transient(self.root)
+            self.operating_log_window = win
+        finally:
+            self._operating_log_opening = False
 
         def close_log_window():
             self.operating_log_window = None
@@ -1121,6 +1142,7 @@ class SettingsDialog:
         self.win.protocol("WM_DELETE_WINDOW", self.close)
         self._roi_editor_running = False
         self._calibration_running = False
+        self._tool_running: Optional[str] = None
         notebook = ttk.Notebook(self.win); notebook.pack(fill="both", expand=True, padx=14, pady=14)
         general = ttk.Frame(notebook, padding=16); roi = ttk.Frame(notebook, padding=16); advanced = ttk.Frame(notebook, padding=16)
         notebook.add(general, text="일반"); notebook.add(roi, text="감시 영역"); notebook.add(advanced, text="고급 설정")
@@ -1149,11 +1171,35 @@ class SettingsDialog:
         ttk.Button(buttons, text="저장", style="Action.TButton", command=self.save).pack(side="right", padx=4)
 
     def close(self):
-        if self._roi_editor_running or self._calibration_running:
+        if self._tool_running:
             return
         self.d.settings_dialog = None
         if self.win.winfo_exists():
             self.win.destroy()
+
+    def _begin_tool(self, tool_name: str) -> bool:
+        """OpenCV 도구는 프로세스에서 한 번에 하나만 실행한다."""
+        if self._tool_running:
+            self.d._add_operating_log(
+                tool_name, "중복 실행 차단", f"{self._tool_running} 실행 중"
+            )
+            return False
+        self._tool_running = tool_name
+        self._roi_editor_running = tool_name == "ROI 설정"
+        self._calibration_running = tool_name == "캘리브레이션"
+        self.roi_button.configure(state="disabled")
+        self.calibration_button.configure(state="disabled")
+        self.win.grab_release()
+        return True
+
+    def _end_tool(self):
+        self._tool_running = None
+        self._roi_editor_running = False
+        self._calibration_running = False
+        if self.win.winfo_exists():
+            self.roi_button.configure(state="normal")
+            self.calibration_button.configure(state="normal")
+            self.win.grab_set()
 
     @staticmethod
     def _field(parent, label, variable, row):
@@ -1181,7 +1227,7 @@ class SettingsDialog:
             self.dataset_dir.set(os.path.normpath(selected))
 
     def open_roi_editor(self):
-        if self._roi_editor_running:
+        if self._tool_running:
             return
         dataset = Path(self.d.cfg.paths.dataset_dir)
         if not dataset.exists():
@@ -1192,10 +1238,9 @@ class SettingsDialog:
             messagebox.showwarning("ROI 설정", "이미지가 없습니다. 먼저 이미지를 수집하세요.", parent=self.win); return
         thermal = thermal_files[-1]
         visual = dataset / f"{thermal.stem}_visual.jpg"
+        if not self._begin_tool("ROI 설정"):
+            return
         self.d._add_operating_log("ROI 설정", "시작", str(visual if visual.exists() else thermal))
-        self._roi_editor_running = True
-        self.roi_button.configure(state="disabled")
-        self.win.grab_release()
         try:
             from .roi_selector import main as roi_main
             if visual.exists():
@@ -1209,13 +1254,10 @@ class SettingsDialog:
             self.d._add_operating_log("ROI 설정", "예외 처리", str(exc))
             messagebox.showerror("ROI 설정", str(exc), parent=self.win)
         finally:
-            self._roi_editor_running = False
-            self.roi_button.configure(state="normal")
-            if self.win.winfo_exists():
-                self.win.grab_set()
+            self._end_tool()
 
     def open_calibration(self):
-        if self._calibration_running:
+        if self._tool_running:
             return
         dataset = Path(self.d.cfg.paths.dataset_dir)
         thermal_files = sorted(p for p in dataset.glob("*.jpg") if "_visual" not in p.name) if dataset.exists() else []
@@ -1224,10 +1266,10 @@ class SettingsDialog:
         thermal = thermal_files[-1]; visual = dataset / f"{thermal.stem}_visual.jpg"
         if not visual.exists():
             messagebox.showwarning("캘리브레이션", "대응하는 가시광 이미지가 없습니다.", parent=self.win); return
+        if not self._begin_tool("캘리브레이션"):
+            return
         self.d._add_operating_log("캘리브레이션", "시작", thermal.name)
-        self._calibration_running = True
-        self.calibration_button.configure(state="disabled")
-        self.win.grab_release()
+        open_roi_afterwards = False
         try:
             from .calibration import run_calibration
             saved = run_calibration(str(thermal), str(visual))
@@ -1241,8 +1283,7 @@ class SettingsDialog:
                     "(가시광에서 지정한 ROI는 열화상 좌표로 자동 변환됩니다.)",
                     parent=self.win,
                 ):
-                    self.win.grab_set()  # 선취득 → roi_editor 진입 직전 release
-                    self.open_roi_editor()
+                    open_roi_afterwards = True
             else:
                 self.d._add_operating_log("캘리브레이션", "종료", "저장 없이 종료")
         except Exception as exc:
@@ -1250,10 +1291,9 @@ class SettingsDialog:
             self.d._add_operating_log("캘리브레이션", "예외 처리", str(exc))
             messagebox.showerror("캘리브레이션", str(exc), parent=self.win)
         finally:
-            self._calibration_running = False
-            self.calibration_button.configure(state="normal")
-            if self.win.winfo_exists():
-                self.win.grab_set()
+            self._end_tool()
+        if open_roi_afterwards and self.win.winfo_exists():
+            self.win.after_idle(self.open_roi_editor)
 
     def save(self):
         try:
