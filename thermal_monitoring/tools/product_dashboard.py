@@ -111,6 +111,10 @@ class ProductDashboard:
         self._image_quality_window: list[bool] = []
         self._connection_ok: Optional[bool] = None
         self._connection_check_running = False
+        self._last_quality_capture_id: Optional[str] = None
+        self._latest_pair_quality_ok = False
+        self._latest_pair_fresh = False
+        self._last_successful_capture_at: Optional[datetime] = None
 
         self._analysis_executor = ThreadPoolExecutor(max_workers=1)
         self._analysis_running = False
@@ -613,13 +617,18 @@ class ProductDashboard:
     def _update_quality_display(self):
         quality_ok_count = sum(self._image_quality_window)
         quality_total = len(self._image_quality_window)
-        if self._connection_ok is not True or quality_total == 0:
+        if (
+            self._connection_ok is not True
+            or not self._latest_pair_fresh
+            or quality_total == 0
+        ):
             quality_rate = 0.0
         else:
             quality_rate = 100.0 * quality_ok_count / quality_total
 
         quality_color = (
             COLORS["red"] if self._connection_ok is False
+            else COLORS["orange"] if not self._latest_pair_fresh and self._last_quality_capture_id
             else COLORS["muted"] if quality_total == 0
             else COLORS["green"] if quality_rate == 100.0
             else COLORS["orange"] if quality_rate >= 80.0
@@ -627,6 +636,8 @@ class ProductDashboard:
         )
         detail = (
             "연결 없음" if self._connection_ok is False
+            else "연결 확인 중" if self._connection_ok is None
+            else "갱신 없음" if self._last_quality_capture_id and not self._latest_pair_fresh
             else f"{quality_ok_count}/{quality_total}" if quality_total
             else "측정 대기"
         )
@@ -918,6 +929,19 @@ class ProductDashboard:
         previous = self.latest_status
         captured_at = result.get("captured_at") or datetime.now()
         quality_ok = bool(result.get("image_quality_ok", False))
+        capture_id = str(result.get("base", ""))
+        freshness_limit = max(
+            self.REFRESH_SECONDS * 2,
+            float(self.cfg.camera.capture_interval_sec) * 2,
+        ) + 5.0
+        capture_age = max(0.0, (datetime.now() - captured_at).total_seconds())
+        self._latest_pair_fresh = capture_age <= freshness_limit
+        is_new_capture = bool(capture_id) and capture_id != self._last_quality_capture_id
+        if is_new_capture:
+            self._last_quality_capture_id = capture_id
+            self._latest_pair_quality_ok = quality_ok
+            if quality_ok:
+                self._last_successful_capture_at = captured_at
         self.state.status = status
         if (
             quality_ok
@@ -953,15 +977,23 @@ class ProductDashboard:
             if self.thermal_photo is None:
                 self._show_image(self.thermal_label, None, "thermal")
 
-        self.metrics.image_quality_checks += 1
-        if quality_ok:
-            self.metrics.image_quality_successes += 1
-        else:
+        # 같은 디스크 파일을 30초마다 재분석해도 품질 표본은 한 번만 집계한다.
+        # 오래된 파일은 현재 정상률의 근거로 사용하지 않는다.
+        if is_new_capture and self._latest_pair_fresh:
+            self.metrics.image_quality_checks += 1
+            if quality_ok:
+                self.metrics.image_quality_successes += 1
+            else:
+                self._add_operating_log(
+                    "영상 품질", "비정상", result.get("image_quality_reason", "영상 확인 필요")
+                )
+            self._image_quality_window.append(quality_ok)
+            del self._image_quality_window[:-20]
+        elif is_new_capture:
             self._add_operating_log(
-                "영상 품질", "비정상", result.get("image_quality_reason", "영상 확인 필요")
+                "영상 품질", "갱신 없음",
+                f"{capture_id} · 촬영 후 {capture_age:.0f}초 경과",
             )
-        self._image_quality_window.append(quality_ok)
-        del self._image_quality_window[:-20]
         self.latest_status = status
         self.last_update = datetime.now()
         self.metrics.analysis_ok += 1
