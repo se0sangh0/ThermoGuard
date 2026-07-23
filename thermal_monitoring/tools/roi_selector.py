@@ -371,7 +371,7 @@ def _get_color(idx: int) -> tuple:
 #  main
 # ───────────────────────────────────────────────────────────────
 
-def main():
+def main(event_pump=None):
     global scale, selected_idx, rois, roi_start, roi_end, dragging
     global H_inv, use_visual, _running, _quit_flag, _save_flag
     global _canvas_h
@@ -447,8 +447,19 @@ def main():
     _running = True
     _quit_flag = False
     _save_flag = False
+    window_rendered = False
 
     while True:
+        # 닫힌 창을 imshow가 다시 생성하기 전에 X 닫힘을 먼저 감지한다.
+        if window_rendered:
+            try:
+                if cv2.getWindowProperty(wintitle, cv2.WND_PROP_VISIBLE) < 1:
+                    quit_without_save()
+                    break
+            except cv2.error:
+                quit_without_save()
+                break
+
         # 버튼 바 포함한 전체 캔버스
         disp = np.zeros((_canvas_h, img_disp.shape[1], 3), dtype=np.uint8)
         disp[0:img_disp.shape[0], 0:img_disp.shape[1]] = img_disp
@@ -489,7 +500,10 @@ def main():
         _draw_button_bar(disp)
 
         cv2.imshow(wintitle, disp)
+        window_rendered = True
         key = cv2.waitKey(1)
+        if event_pump is not None:
+            event_pump()
 
         # 제목 표시줄의 X 버튼도 Quit과 동일하게 저장 없이 종료한다.
         try:

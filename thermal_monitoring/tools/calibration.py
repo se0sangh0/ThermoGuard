@@ -113,7 +113,7 @@ def _draw_button_bar(canvas, image_height, button_rects):
         )
 
 
-def run_calibration(thermal_path=None, rgb_path=None):
+def run_calibration(thermal_path=None, rgb_path=None, event_pump=None):
     """GUI 또는 CLI에서 호출 가능한 캘리브레이션 진입점."""
     global thermal_pts, rgb_pts, pair_state, t_mouse_x, t_mouse_y, r_mouse_x, r_mouse_y
     thermal_pts.clear()
@@ -204,7 +204,23 @@ def run_calibration(thermal_path=None, rgb_path=None):
     cv2.setMouseCallback("Thermal", make_scaled_callback(click_thermal, thermal_scale))
     cv2.setMouseCallback("RGB", rgb_callback)
 
+    windows_rendered = False
     while True:
+        # 닫힌 창을 다음 imshow가 다시 생성하기 전에 감지한다.
+        if windows_rendered:
+            try:
+                if any(
+                    cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1
+                    for title in ("Thermal", "RGB")
+                ):
+                    print("Quit without saving.")
+                    cv2.destroyAllWindows()
+                    return False
+            except cv2.error:
+                print("Quit without saving.")
+                cv2.destroyAllWindows()
+                return False
+
         t = thermal_disp.copy()
         r = rgb_disp.copy()
 
@@ -272,8 +288,11 @@ def run_calibration(thermal_path=None, rgb_path=None):
 
         cv2.imshow("Thermal", t)
         cv2.imshow("RGB", rgb_canvas)
+        windows_rendered = True
 
         key = cv2.waitKey(1)
+        if event_pump is not None:
+            event_pump()
         action = button_action["value"]
         button_action["value"] = None
 
