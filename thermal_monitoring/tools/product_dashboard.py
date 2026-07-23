@@ -1144,6 +1144,7 @@ class SettingsDialog:
         self._calibration_running = False
         self._tool_running: Optional[str] = None
         self._tool_window_titles: tuple[str, ...] = ()
+        self._tool_guard_window: Optional[tk.Toplevel] = None
         notebook = ttk.Notebook(self.win); notebook.pack(fill="both", expand=True, padx=14, pady=14)
         general = ttk.Frame(notebook, padding=16); roi = ttk.Frame(notebook, padding=16); advanced = ttk.Frame(notebook, padding=16)
         notebook.add(general, text="일반"); notebook.add(roi, text="감시 영역"); notebook.add(advanced, text="고급 설정")
@@ -1187,6 +1188,46 @@ class SettingsDialog:
             except cv2.error:
                 continue
 
+    def _show_tool_guard(self, tool_name: str):
+        """설정창 클릭이 대기열에 쌓이지 않도록 모달 안내창이 입력을 선점한다."""
+        guard = tk.Toplevel(self.win)
+        guard.title("작업 진행 중")
+        guard.transient(self.win)
+        guard.resizable(False, False)
+        guard.geometry("360x150")
+        guard.protocol("WM_DELETE_WINDOW", self._focus_running_tool)
+
+        body = ttk.Frame(guard, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=f"{tool_name} 작업 중입니다.",
+            font=("맑은 고딕", 11, "bold"),
+        ).pack(pady=(0, 8))
+        ttk.Label(
+            body,
+            text="열린 작업 창에서 저장하거나 종료해 주세요.",
+        ).pack(pady=(0, 14))
+        ttk.Button(
+            body,
+            text="작업 창으로 이동",
+            command=self._focus_running_tool,
+        ).pack()
+
+        guard.update_idletasks()
+        x = self.win.winfo_rootx() + (self.win.winfo_width() - guard.winfo_width()) // 2
+        y = self.win.winfo_rooty() + (self.win.winfo_height() - guard.winfo_height()) // 2
+        guard.geometry(f"+{max(0, x)}+{max(0, y)}")
+        guard.grab_set()
+        guard.lift()
+        guard.focus_force()
+        self._tool_guard_window = guard
+
+    def _pump_tool_events(self):
+        """OpenCV 루프 중 모달 안내창 이벤트만 처리해 클릭 적체를 비운다."""
+        if self._tool_guard_window and self._tool_guard_window.winfo_exists():
+            self._tool_guard_window.update()
+
     def _begin_tool(self, tool_name: str, window_titles: tuple[str, ...]) -> bool:
         """OpenCV 도구는 프로세스에서 한 번에 하나만 실행한다."""
         if self._tool_running:
@@ -1200,9 +1241,18 @@ class SettingsDialog:
         self._roi_editor_running = tool_name == "ROI 설정"
         self._calibration_running = tool_name == "캘리브레이션"
         self.win.grab_release()
+        self._show_tool_guard(tool_name)
         return True
 
     def _end_tool(self):
+        if self._tool_guard_window:
+            try:
+                if self._tool_guard_window.winfo_exists():
+                    self._tool_guard_window.grab_release()
+                    self._tool_guard_window.destroy()
+            except tk.TclError:
+                pass
+            self._tool_guard_window = None
         self._tool_running = None
         self._tool_window_titles = ()
         self._roi_editor_running = False
@@ -1260,7 +1310,7 @@ class SettingsDialog:
                 sys.argv = ["roi_selector", str(thermal), str(visual)]
             else:
                 sys.argv = ["roi_selector", str(thermal)]
-            roi_main(event_pump=self.win.update)
+            roi_main(event_pump=self._pump_tool_events)
             self.d.cfg = load_config(force_reload=True)
             self.d._add_operating_log("ROI 설정", "완료", f"{len(self.d.cfg.roi.rois)}개 영역 저장됨")
         except Exception as exc:
@@ -1287,7 +1337,7 @@ class SettingsDialog:
         try:
             from .calibration import run_calibration
             saved = bool(run_calibration(
-                str(thermal), str(visual), event_pump=self.win.update,
+                str(thermal), str(visual), event_pump=self._pump_tool_events,
             ))
             if saved:
                 self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
