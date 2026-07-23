@@ -185,7 +185,7 @@ class ProductDashboard:
             bg=COLORS["navy"], fg="#c7d6e5", font=("맑은 고딕", 10),
         )
         self.header_refresh_interval.pack(side="left", pady=(5, 0))
-        self.header_quality = tk.Label(right, text="영상 품질 100.0%", bg=COLORS["navy"],
+        self.header_quality = tk.Label(right, text="최근 영상 정상률 —", bg=COLORS["navy"],
                                        fg=COLORS["green"], font=("맑은 고딕", 10, "bold"))
         self.header_quality.pack(side="left", padx=(14, 0), pady=(5, 0))
 
@@ -419,6 +419,13 @@ class ProductDashboard:
         canvas.create_text(8, top, anchor="nw", text=f"{y_max:.0f}", fill=COLORS["muted"], font=("맑은 고딕", 8))
         canvas.create_text(8, bottom - 10, anchor="nw", text=f"{y_min:.0f}", fill=COLORS["muted"], font=("맑은 고딕", 8))
         if len(self.temperature_history) < 2:
+            if self.temperature_history:
+                captured_at, value = self.temperature_history[0]
+                canvas.create_text(left, bottom + 18, anchor="w",
+                                   text=captured_at.strftime("%H:%M:%S"),
+                                   fill=COLORS["muted"], font=("맑은 고딕", 8))
+                canvas.create_oval(left - 3, y_for(value) - 3, left + 3, y_for(value) + 3,
+                                   fill=COLORS["green"], outline="")
             canvas.create_text((left + right)//2, (top + bottom)//2,
                                text="촬영 데이터가 쌓이면 온도 추이가 표시됩니다.",
                                fill=COLORS["muted"], font=("맑은 고딕", 10))
@@ -429,10 +436,19 @@ class ProductDashboard:
             x = left + index / max(1, count - 1) * (right - left)
             points.extend((x, y_for(value)))
         canvas.create_line(*points, fill=COLORS["green"], width=3, smooth=True)
-        first_time = self.temperature_history[0][0].strftime("%H:%M")
-        last_time = self.temperature_history[-1][0].strftime("%H:%M")
-        canvas.create_text(left, bottom + 18, text=first_time, fill=COLORS["muted"], font=("맑은 고딕", 8))
-        canvas.create_text(right, bottom + 18, text=last_time, fill=COLORS["muted"], font=("맑은 고딕", 8))
+        tick_count = min(5, count)
+        tick_indexes = sorted({
+            round(position * (count - 1) / max(1, tick_count - 1))
+            for position in range(tick_count)
+        })
+        for tick_index in tick_indexes:
+            captured_at, _ = self.temperature_history[tick_index]
+            x = left + tick_index / max(1, count - 1) * (right - left)
+            canvas.create_line(x, bottom, x, bottom + 5, fill="#6f7b84")
+            anchor = "w" if tick_index == 0 else "e" if tick_index == count - 1 else "center"
+            canvas.create_text(x, bottom + 18, anchor=anchor,
+                               text=captured_at.strftime("%H:%M:%S"),
+                               fill=COLORS["muted"], font=("맑은 고딕", 8))
 
     def _set_system_state(self, text, color):
         self.header_state.configure(text=f"● {text}", fg=color)
@@ -714,6 +730,15 @@ class ProductDashboard:
         status = worst["status"]
         roi_result = worst["roi"]
         overall_max_roi = max(roi_results, key=lambda rr: rr.max_temp)
+        overall_max_temp = float(overall_max_roi.max_temp)
+        warning_temp = roi_cfg.baseline_temp + roi_cfg.warning_delta
+        critical_temp = roi_cfg.baseline_temp + roi_cfg.critical_delta
+        if overall_max_temp >= critical_temp:
+            status = Status.CRITICAL
+        elif overall_max_temp >= warning_temp:
+            status = Status.WARNING
+        else:
+            status = Status.NORMAL
 
         apply_roi_state_updates(self.state, per_roi_statuses)
 
@@ -739,7 +764,7 @@ class ProductDashboard:
             "hot_temp_95": roi_result.hot_temp_95,
             "hotspot_count": len(roi_result.hotspot_centroids),
             "status": status, "alarm": alarm,
-            "overall_max_temp": overall_max_roi.max_temp,
+            "overall_max_temp": overall_max_temp,
             "overall_max_roi_name": overall_max_roi.roi_name or "ROI-01",
             "roi_bounds": roi_result.roi_bounds,
             "roi_results": roi_results,
@@ -802,7 +827,7 @@ class ProductDashboard:
         status = result["status"]
         previous = self.latest_status
         self.state.status = status
-        if status != Status.NORMAL and (previous == Status.NORMAL or result.get("alarm", False)):
+        if status != Status.NORMAL and (previous != status or result.get("alarm", False)):
             self.metrics.anomaly_today += 1
             self._append_event(
                 status.value,
@@ -861,7 +886,12 @@ class ProductDashboard:
             else COLORS["orange"] if quality_rate >= 80.0
             else COLORS["red"]
         )
-        self.header_quality.configure(text=f"영상 품질 {quality_rate:.1f}%", fg=quality_color)
+        quality_ok_count = sum(self._image_quality_window)
+        quality_total = len(self._image_quality_window)
+        self.header_quality.configure(
+            text=f"최근 영상 정상률 {quality_rate:.1f}% ({quality_ok_count}/{quality_total})",
+            fg=quality_color,
+        )
         overall_max = result.get("overall_max_temp", result["max_temp"])
         overall_roi = result.get("overall_max_roi_name", "ROI-01")
         delta = overall_max - self.cfg.roi.baseline_temp
