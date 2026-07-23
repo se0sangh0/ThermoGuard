@@ -101,6 +101,8 @@ class ProductDashboard:
         self.operating_logs: list[tuple[str, str, str, str]] = []
         self.temperature_history: list[tuple[datetime, float]] = []
         self._last_history_capture: Optional[datetime] = None
+        self._last_alert_capture: Optional[datetime] = None
+        self._trend_hover_points: list[tuple[float, float, datetime, float]] = []
         # 최근 화면 품질을 기준으로 정상률을 계산한다. 누적 전체 기준보다
         # 현재 발생한 영상 이상이 즉시 수치에 반영된다.
         self._image_quality_window: list[bool] = []
@@ -319,6 +321,8 @@ class ProductDashboard:
         self.trend_canvas = tk.Canvas(panel, bg=COLORS["dark"], highlightthickness=0, height=230)
         self.trend_canvas.pack(fill="both", expand=True, padx=12, pady=(8, 12))
         self.trend_canvas.bind("<Configure>", lambda _e: self._draw_temperature_trend())
+        self.trend_canvas.bind("<Motion>", self._show_trend_hover)
+        self.trend_canvas.bind("<Leave>", lambda _e: self._clear_trend_hover())
 
     def _render_alert_cards(self):
         for child in self.alert_cards.winfo_children():
@@ -393,6 +397,7 @@ class ProductDashboard:
     def _draw_temperature_trend(self):
         canvas = self.trend_canvas
         canvas.delete("all")
+        self._trend_hover_points = []
         width = max(canvas.winfo_width(), 480)
         height = max(canvas.winfo_height(), 220)
         left, top, right, bottom = 54, 18, width - 18, height - 36
@@ -426,16 +431,22 @@ class ProductDashboard:
                                    fill=COLORS["muted"], font=("맑은 고딕", 8))
                 canvas.create_oval(left - 3, y_for(value) - 3, left + 3, y_for(value) + 3,
                                    fill=COLORS["green"], outline="")
+                self._trend_hover_points.append((left, y_for(value), captured_at, float(value)))
             canvas.create_text((left + right)//2, (top + bottom)//2,
                                text="촬영 데이터가 쌓이면 온도 추이가 표시됩니다.",
                                fill=COLORS["muted"], font=("맑은 고딕", 10))
             return
         points = []
         count = len(self.temperature_history)
-        for index, (_, value) in enumerate(self.temperature_history):
+        for index, (captured_at, value) in enumerate(self.temperature_history):
             x = left + index / max(1, count - 1) * (right - left)
-            points.extend((x, y_for(value)))
+            y = y_for(value)
+            points.extend((x, y))
+            self._trend_hover_points.append((x, y, captured_at, float(value)))
         canvas.create_line(*points, fill=COLORS["green"], width=3, smooth=True)
+        for x, y, _, _ in self._trend_hover_points:
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                               fill=COLORS["green"], outline=COLORS["dark"])
         tick_count = min(5, count)
         tick_indexes = sorted({
             round(position * (count - 1) / max(1, tick_count - 1))
@@ -449,6 +460,48 @@ class ProductDashboard:
             canvas.create_text(x, bottom + 18, anchor=anchor,
                                text=captured_at.strftime("%H:%M:%S"),
                                fill=COLORS["muted"], font=("맑은 고딕", 8))
+
+    def _show_trend_hover(self, event):
+        self._clear_trend_hover()
+        if not self._trend_hover_points:
+            return
+        nearest = min(
+            self._trend_hover_points,
+            key=lambda point: (point[0] - event.x) ** 2 + (point[1] - event.y) ** 2,
+        )
+        x, y, captured_at, temperature = nearest
+        if (x - event.x) ** 2 + (y - event.y) ** 2 > 14 ** 2:
+            return
+        text = f"{captured_at:%Y-%m-%d %H:%M:%S}\n최대 온도 {temperature:.1f} °C"
+        place_left = x > self.trend_canvas.winfo_width() - 190
+        place_below = y < 65
+        text_x = x - 12 if place_left else x + 12
+        text_y = y + 12 if place_below else y - 12
+        anchor = (
+            "ne" if place_left and place_below
+            else "se" if place_left
+            else "nw" if place_below
+            else "sw"
+        )
+        text_id = self.trend_canvas.create_text(
+            text_x, text_y, anchor=anchor, text=text,
+            fill="white", font=("맑은 고딕", 9, "bold"),
+            tags="trend_tooltip",
+        )
+        bbox = self.trend_canvas.bbox(text_id)
+        if bbox:
+            padding = 6
+            background_id = self.trend_canvas.create_rectangle(
+                bbox[0] - padding, bbox[1] - padding,
+                bbox[2] + padding, bbox[3] + padding,
+                fill="#202a32", outline=COLORS["green"],
+                tags="trend_tooltip",
+            )
+            self.trend_canvas.tag_lower(background_id, text_id)
+
+    def _clear_trend_hover(self):
+        if hasattr(self, "trend_canvas"):
+            self.trend_canvas.delete("trend_tooltip")
 
     def _set_system_state(self, text, color):
         self.header_state.configure(text=f"● {text}", fg=color)
@@ -826,15 +879,23 @@ class ProductDashboard:
 
         status = result["status"]
         previous = self.latest_status
+        captured_at = result.get("captured_at") or datetime.now()
+        quality_ok = bool(result.get("image_quality_ok", False))
         self.state.status = status
-        if status != Status.NORMAL and (previous != status or result.get("alarm", False)):
+        if (
+            quality_ok
+            and status != Status.NORMAL
+            and captured_at != self._last_alert_capture
+        ):
             self.metrics.anomaly_today += 1
             self._append_event(
                 status.value,
                 result.get("overall_max_temp", result["max_temp"]),
                 "확인 필요",
                 result.get("overall_max_roi_name", "ROI-01"),
+                event_time=captured_at,
             )
+            self._last_alert_capture = captured_at
         elif status == Status.NORMAL and previous != Status.NORMAL:
             if self.capture:
                 self.capture.set_warning_mode(False)
@@ -842,7 +903,6 @@ class ProductDashboard:
                                     f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
                                     else "정상 복귀")
 
-        quality_ok = bool(result.get("image_quality_ok", False))
         # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다. 한쪽씩
         # 갱신하면 캡처 저장 시차나 잘못된 파일 쌍 때문에 좌우 영상이
         # 뒤바뀌어 보일 수 있으므로, 이상 프레임은 표시하지 않고 직전의
@@ -949,8 +1009,8 @@ class ProductDashboard:
         if kind == "thermal": self.thermal_photo = photo
         else: self.visual_photo = photo
 
-    def _append_event(self, state, temp, action, roi_name="ROI-01"):
-        now = datetime.now()
+    def _append_event(self, state, temp, action, roi_name="ROI-01", event_time=None):
+        now = event_time or datetime.now()
         event = {
             "id": now.strftime("%Y%m%d%H%M%S_%f"),
             "time": now.strftime("%Y-%m-%d %H:%M:%S"),
