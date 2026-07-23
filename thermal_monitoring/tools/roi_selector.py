@@ -491,6 +491,17 @@ def main():
         cv2.imshow(wintitle, disp)
         key = cv2.waitKey(1)
 
+        # 제목 표시줄의 X 버튼도 Quit과 동일하게 저장 없이 종료한다.
+        try:
+            window_closed = cv2.getWindowProperty(
+                wintitle, cv2.WND_PROP_VISIBLE,
+            ) < 1
+        except cv2.error:
+            window_closed = True
+        if window_closed:
+            quit_without_save()
+            break
+
         # ── 종료 플래그 체크 (버튼 클릭으로 설정됨) ──
         if _quit_flag:
             break
