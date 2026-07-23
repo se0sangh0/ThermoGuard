@@ -30,12 +30,18 @@ from ..capture.capture import CaptureSession
 from ..data.checking import run_check
 from ..data.metadata import run_metadata
 from ..data.cleanup import run_cleanup_if_due
-from ..analysis.roi import load_roi_config, extract_roi_from_npy, extract_all_rois_from_npy, _get_roi_bounds_list
+from ..analysis.roi import (
+    load_roi_config,
+    extract_all_rois_from_npy,
+    _get_roi_bounds_list,
+    merge_roi_hotspot_centroids,
+)
 from ..analysis.threshold import (
     Status,
     MonitorState,
     evaluate_threshold,
-    evaluate_with_state,
+    evaluate_rois_with_state,
+    apply_roi_state_updates,
     _STATUS_RANK,
 )
 from ..analysis.overlay import create_overlay, save_overlay
@@ -254,22 +260,7 @@ class MonitorSequencer:
 
             roi_result = max(roi_results, key=_severity)
 
-            # 모든 ROI의 핫스팟 통합 + 5px 이내 중복 제거
-            all_hotspots = []
-            for rr in roi_results:
-                all_hotspots.extend(rr.hotspot_centroids)
-            unique_hotspots = []
-            for spot in all_hotspots:
-                is_dup = False
-                for idx, u in enumerate(unique_hotspots):
-                    if abs(spot[0] - u[0]) < 5 and abs(spot[1] - u[1]) < 5:
-                        if spot[2] > u[2]:
-                            unique_hotspots[idx] = spot
-                        is_dup = True
-                        break
-                if not is_dup:
-                    unique_hotspots.append(spot)
-            roi_result.hotspot_centroids = unique_hotspots
+            roi_result.hotspot_centroids = merge_roi_hotspot_centroids(roi_results)
 
             return {
                 "pair": pair,
@@ -304,37 +295,16 @@ class MonitorSequencer:
         roi_result = analysis["roi_result"]
         base = pair["base"]
         try:
-            # 2. Threshold + 상태 판정 — 모든 ROI 개별 평가
-            per_roi_statuses: list[dict] = []
-            for rr in roi_results:
-                s, a = evaluate_with_state(
-                    hot_temp=rr.hot_temp_95,
-                    max_temp=rr.max_temp,
-                    mean_temp=rr.mean_temp,
-                    baseline=self.roi_config.baseline_temp,
-                    warning_delta=self.roi_config.warning_delta,
-                    critical_delta=self.roi_config.critical_delta,
-                    state=self.state,
-                    over_temp_pixels=rr.over_temp_pixels,
-                    max_hotspot_size=rr.max_hotspot_size,
-                    roi_name=rr.roi_name if rr.roi_name else None,
-                )
-                per_roi_statuses.append({"roi_name": rr.roi_name, "status": s, "alarm": a, "roi": rr})
-
-            # 최악 ROI로 대표 상태 선정
-            worst = max(per_roi_statuses, key=lambda x: (_STATUS_RANK[x["status"]], x["roi"].hot_temp_95))
+            per_roi_statuses, worst, do_alarm = evaluate_rois_with_state(
+                roi_results,
+                baseline=self.roi_config.baseline_temp,
+                warning_delta=self.roi_config.warning_delta,
+                critical_delta=self.roi_config.critical_delta,
+                state=self.state,
+            )
             new_status = worst["status"]
-            do_alarm = any(ps["alarm"] for ps in per_roi_statuses)
 
-            # per-ROI 상태 갱신
-            for ps in per_roi_statuses:
-                rn = ps["roi_name"]
-                if rn:
-                    rs = self.state.roi_state(rn)
-                    rs.status = ps["status"]
-                    if ps["alarm"]:
-                        rs.last_alarm_time = time.time()
-                        rs.alarm_pending = False
+            apply_roi_state_updates(self.state, per_roi_statuses)
 
             prev_status = self.state.status
             self.state.status = new_status

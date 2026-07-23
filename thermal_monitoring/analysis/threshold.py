@@ -176,3 +176,45 @@ def evaluate_with_state(
         _log.info("ALARM SUPPRESSED: %scooldown active (%.0fs remaining)", context, cooldown_remaining)
 
     return new_status, do_alarm
+
+
+def evaluate_rois_with_state(
+    roi_results: list,
+    *,
+    baseline: float,
+    warning_delta: float,
+    critical_delta: float,
+    state: MonitorState,
+) -> tuple[list[dict], dict, bool]:
+    """다중 ROI를 개별 판정하고 최악 ROI/알람 여부를 집계한다."""
+    per_roi_statuses: list[dict] = []
+    for rr in roi_results:
+        s, a = evaluate_with_state(
+            hot_temp=rr.hot_temp_95,
+            max_temp=rr.max_temp,
+            mean_temp=rr.mean_temp,
+            baseline=baseline,
+            warning_delta=warning_delta,
+            critical_delta=critical_delta,
+            state=state,
+            over_temp_pixels=rr.over_temp_pixels,
+            max_hotspot_size=rr.max_hotspot_size,
+            roi_name=rr.roi_name if rr.roi_name else None,
+        )
+        per_roi_statuses.append({"roi_name": rr.roi_name, "status": s, "alarm": a, "roi": rr})
+
+    worst = max(per_roi_statuses, key=lambda x: (_STATUS_RANK[x["status"]], x["roi"].hot_temp_95))
+    do_alarm = any(ps["alarm"] for ps in per_roi_statuses)
+    return per_roi_statuses, worst, do_alarm
+
+
+def apply_roi_state_updates(state: MonitorState, per_roi_statuses: list[dict]) -> None:
+    """ROI별 상태/알람 시각을 MonitorState에 반영한다."""
+    for ps in per_roi_statuses:
+        roi_name = ps["roi_name"]
+        if roi_name:
+            roi_state = state.roi_state(roi_name)
+            roi_state.status = ps["status"]
+            if ps["alarm"]:
+                roi_state.last_alarm_time = time.time()
+                roi_state.alarm_pending = False
