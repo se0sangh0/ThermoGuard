@@ -113,7 +113,7 @@ def _draw_button_bar(canvas, image_height, button_rects):
         )
 
 
-def run_calibration(thermal_path=None, rgb_path=None):
+def run_calibration(thermal_path=None, rgb_path=None, event_pump=None):
     """GUI 또는 CLI에서 호출 가능한 캘리브레이션 진입점."""
     global thermal_pts, rgb_pts, pair_state, t_mouse_x, t_mouse_y, r_mouse_x, r_mouse_y
     thermal_pts.clear()
@@ -180,7 +180,8 @@ def run_calibration(thermal_path=None, rgb_path=None):
 
     thermal_scale = thermal.shape[1] / thermal_disp.shape[1]
     rgb_scale = rgb.shape[1] / rgb_disp.shape[1]
-    button_rects = _compute_button_rects(thermal_disp.shape[1], thermal_disp.shape[0])
+    # 제어 버튼은 작업 기준인 가시광(RGB) 이미지 아래에 표시한다.
+    button_rects = _compute_button_rects(rgb_disp.shape[1], rgb_disp.shape[0])
     button_action = {"value": None}
 
     def make_scaled_callback(original_callback, scale):
@@ -188,22 +189,38 @@ def run_calibration(thermal_path=None, rgb_path=None):
             return original_callback(event, int(x * scale), int(y * scale), flags, param)
         return wrapper
 
-    def thermal_callback(event, x, y, flags, param):
-        if y >= thermal_disp.shape[0]:
+    def rgb_callback(event, x, y, flags, param):
+        if y >= rgb_disp.shape[0]:
             if event == cv2.EVENT_LBUTTONDOWN:
                 for (_, _, action), (x1, y1, x2, y2) in zip(_BUTTONS, button_rects):
                     if x1 <= x <= x2 and y1 <= y <= y2:
                         button_action["value"] = action
                         break
             return
-        return click_thermal(
-            event, int(x * thermal_scale), int(y * thermal_scale), flags, param,
+        return click_rgb(
+            event, int(x * rgb_scale), int(y * rgb_scale), flags, param,
         )
 
-    cv2.setMouseCallback("Thermal", thermal_callback)
-    cv2.setMouseCallback("RGB", make_scaled_callback(click_rgb, rgb_scale))
+    cv2.setMouseCallback("Thermal", make_scaled_callback(click_thermal, thermal_scale))
+    cv2.setMouseCallback("RGB", rgb_callback)
 
+    windows_rendered = False
     while True:
+        # 닫힌 창을 다음 imshow가 다시 생성하기 전에 감지한다.
+        if windows_rendered:
+            try:
+                if any(
+                    cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1
+                    for title in ("Thermal", "RGB")
+                ):
+                    print("Quit without saving.")
+                    cv2.destroyAllWindows()
+                    return False
+            except cv2.error:
+                print("Quit without saving.")
+                cv2.destroyAllWindows()
+                return False
+
         t = thermal_disp.copy()
         r = rgb_disp.copy()
 
@@ -263,20 +280,32 @@ def run_calibration(thermal_path=None, rgb_path=None):
         cv2.putText(r, "RGB | S: save  R: reset  Z: undo  Q: quit",
                     (10, r.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        thermal_canvas = np.zeros(
-            (t.shape[0] + BUTTON_BAR_HEIGHT, t.shape[1], 3), dtype=np.uint8,
+        rgb_canvas = np.zeros(
+            (r.shape[0] + BUTTON_BAR_HEIGHT, r.shape[1], 3), dtype=np.uint8,
         )
-        thermal_canvas[:t.shape[0], :t.shape[1]] = t
-        _draw_button_bar(thermal_canvas, t.shape[0], button_rects)
+        rgb_canvas[:r.shape[0], :r.shape[1]] = r
+        _draw_button_bar(rgb_canvas, r.shape[0], button_rects)
 
-        cv2.imshow("Thermal", thermal_canvas)
-        cv2.imshow("RGB", r)
+        cv2.imshow("Thermal", t)
+        cv2.imshow("RGB", rgb_canvas)
+        windows_rendered = True
 
         key = cv2.waitKey(1)
+        if event_pump is not None:
+            event_pump()
         action = button_action["value"]
         button_action["value"] = None
 
-        if key == ord('q') or key == 27 or action == "quit":
+        # 두 창 중 하나라도 X로 닫히면 Quit과 동일하게 전체 작업을 종료한다.
+        try:
+            window_closed = any(
+                cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1
+                for title in ("Thermal", "RGB")
+            )
+        except cv2.error:
+            window_closed = True
+
+        if window_closed or key == ord('q') or key == 27 or action == "quit":
             print("Quit without saving.")
             cv2.destroyAllWindows()
             return False
