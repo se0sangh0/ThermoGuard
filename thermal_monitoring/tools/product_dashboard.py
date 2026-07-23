@@ -99,6 +99,8 @@ class ProductDashboard:
         self.thermal_photo = None
         self.events: list[dict] = []
         self.operating_logs: list[tuple[str, str, str, str]] = []
+        self.operating_log_window: Optional[tk.Toplevel] = None
+        self.settings_dialog: Optional[SettingsDialog] = None
         self.temperature_history: list[tuple[datetime, float]] = []
         self._last_history_capture: Optional[datetime] = None
         self._last_alert_capture: Optional[datetime] = None
@@ -1042,7 +1044,25 @@ class ProductDashboard:
             f"분석 정상 완료 {m.analysis_ok}회   ·   예외 처리 {m.exception_count}회"))
 
     def open_operating_log(self):
+        if self.operating_log_window:
+            try:
+                if self.operating_log_window.winfo_exists():
+                    self.operating_log_window.deiconify()
+                    self.operating_log_window.lift()
+                    self.operating_log_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self.operating_log_window = None
+
         win = tk.Toplevel(self.root); win.title("운영 로그"); win.geometry("920x520"); win.transient(self.root)
+        self.operating_log_window = win
+
+        def close_log_window():
+            self.operating_log_window = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close_log_window)
         summary = ttk.LabelFrame(win, text="운영 지표", padding=10); summary.pack(fill="x", padx=12, pady=(12,6))
         m = self.metrics
         ttk.Label(summary, text=(f"연결 성공률 {m.rate(m.connection_successes,m.connection_attempts):.1f}%   |   "
@@ -1066,7 +1086,17 @@ class ProductDashboard:
         _file_log.info("[%s] %s | %s", category, result, detail)
 
     def open_settings(self):
-        SettingsDialog(self)
+        if self.settings_dialog:
+            try:
+                if self.settings_dialog.win.winfo_exists():
+                    self.settings_dialog.win.deiconify()
+                    self.settings_dialog.win.lift()
+                    self.settings_dialog.win.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self.settings_dialog = None
+        self.settings_dialog = SettingsDialog(self)
 
     def on_close(self):
         if self.lifecycle != "running": return
@@ -1088,6 +1118,9 @@ class SettingsDialog:
     def __init__(self, dashboard: ProductDashboard):
         self.d = dashboard; self.win = tk.Toplevel(dashboard.root)
         self.win.title("환경설정"); self.win.geometry("720x620"); self.win.transient(dashboard.root); self.win.grab_set()
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self._roi_editor_running = False
+        self._calibration_running = False
         notebook = ttk.Notebook(self.win); notebook.pack(fill="both", expand=True, padx=14, pady=14)
         general = ttk.Frame(notebook, padding=16); roi = ttk.Frame(notebook, padding=16); advanced = ttk.Frame(notebook, padding=16)
         notebook.add(general, text="일반"); notebook.add(roi, text="감시 영역"); notebook.add(advanced, text="고급 설정")
@@ -1101,17 +1134,26 @@ class SettingsDialog:
         ttk.Label(general, text="촬영 이미지, 온도 배열과 오버레이가 선택한 폴더에 저장됩니다.").grid(
             row=2, column=0, columnspan=3, sticky="w", pady=12)
         ttk.Label(roi, text="가시광 이미지에서 감시할 설비 영역을 지정합니다.", font=("맑은 고딕", 11, "bold")).pack(anchor="w", pady=8)
-        ttk.Button(roi, text="가시광 이미지에서 ROI 설정", command=self.open_roi_editor).pack(anchor="w", pady=8)
+        self.roi_button = ttk.Button(roi, text="가시광 이미지에서 ROI 설정", command=self.open_roi_editor)
+        self.roi_button.pack(anchor="w", pady=8)
         ttk.Separator(roi, orient="horizontal").pack(fill="x", pady=14)
         ttk.Label(roi, text="Thermal-RGB 위치 보정", font=("맑은 고딕", 11, "bold")).pack(anchor="w", pady=(0,4))
         ttk.Label(roi, text="카메라 설치 위치가 바뀐 경우 두 영상의 대응점을 다시 지정합니다.").pack(anchor="w", pady=(0,8))
-        ttk.Button(roi, text="캘리브레이션 실행", command=self.open_calibration).pack(anchor="w", pady=4)
+        self.calibration_button = ttk.Button(roi, text="캘리브레이션 실행", command=self.open_calibration)
+        self.calibration_button.pack(anchor="w", pady=4)
         self._field(advanced, "정상 기준 온도(°C)", self.baseline, 0)
         self._field(advanced, "경고 상승폭(°C)", self.warning, 1)
         self._field(advanced, "위험 상승폭(°C)", self.critical, 2)
         buttons = ttk.Frame(self.win); buttons.pack(fill="x", padx=14, pady=(0,14))
-        ttk.Button(buttons, text="취소", command=self.win.destroy).pack(side="right", padx=4)
+        ttk.Button(buttons, text="취소", command=self.close).pack(side="right", padx=4)
         ttk.Button(buttons, text="저장", style="Action.TButton", command=self.save).pack(side="right", padx=4)
+
+    def close(self):
+        if self._roi_editor_running or self._calibration_running:
+            return
+        self.d.settings_dialog = None
+        if self.win.winfo_exists():
+            self.win.destroy()
 
     @staticmethod
     def _field(parent, label, variable, row):
@@ -1139,6 +1181,8 @@ class SettingsDialog:
             self.dataset_dir.set(os.path.normpath(selected))
 
     def open_roi_editor(self):
+        if self._roi_editor_running:
+            return
         dataset = Path(self.d.cfg.paths.dataset_dir)
         if not dataset.exists():
             messagebox.showwarning("ROI 설정", "데이터셋 폴더가 없습니다.", parent=self.win); return
@@ -1149,6 +1193,8 @@ class SettingsDialog:
         thermal = thermal_files[-1]
         visual = dataset / f"{thermal.stem}_visual.jpg"
         self.d._add_operating_log("ROI 설정", "시작", str(visual if visual.exists() else thermal))
+        self._roi_editor_running = True
+        self.roi_button.configure(state="disabled")
         self.win.grab_release()
         try:
             from .roi_selector import main as roi_main
@@ -1163,10 +1209,14 @@ class SettingsDialog:
             self.d._add_operating_log("ROI 설정", "예외 처리", str(exc))
             messagebox.showerror("ROI 설정", str(exc), parent=self.win)
         finally:
+            self._roi_editor_running = False
+            self.roi_button.configure(state="normal")
             if self.win.winfo_exists():
                 self.win.grab_set()
 
     def open_calibration(self):
+        if self._calibration_running:
+            return
         dataset = Path(self.d.cfg.paths.dataset_dir)
         thermal_files = sorted(p for p in dataset.glob("*.jpg") if "_visual" not in p.name) if dataset.exists() else []
         if not thermal_files:
@@ -1175,6 +1225,8 @@ class SettingsDialog:
         if not visual.exists():
             messagebox.showwarning("캘리브레이션", "대응하는 가시광 이미지가 없습니다.", parent=self.win); return
         self.d._add_operating_log("캘리브레이션", "시작", thermal.name)
+        self._calibration_running = True
+        self.calibration_button.configure(state="disabled")
         self.win.grab_release()
         try:
             from .calibration import run_calibration
@@ -1198,6 +1250,8 @@ class SettingsDialog:
             self.d._add_operating_log("캘리브레이션", "예외 처리", str(exc))
             messagebox.showerror("캘리브레이션", str(exc), parent=self.win)
         finally:
+            self._calibration_running = False
+            self.calibration_button.configure(state="normal")
             if self.win.winfo_exists():
                 self.win.grab_set()
 
@@ -1236,7 +1290,7 @@ class SettingsDialog:
                 self.d.root.after(300, self.d.start_monitoring)
 
             self.d._check_connection_async()
-            self.win.destroy()
+            self.close()
         except OSError as exc:
             messagebox.showerror("저장 경로 오류", f"폴더를 만들거나 사용할 수 없습니다.\n{exc}", parent=self.win)
         except ValueError:
