@@ -1194,16 +1194,21 @@ class SettingsDialog:
         guard.title("작업 진행 중")
         guard.transient(self.win)
         guard.resizable(False, False)
-        guard.geometry("260x90")
+        guard.geometry("320x130")
         guard.protocol("WM_DELETE_WINDOW", lambda: None)
 
         body = ttk.Frame(guard, padding=18)
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="작업 중입니다.",
+            text="실행 중인 작업창이 있습니다.",
             font=("맑은 고딕", 11, "bold"),
-        ).pack(expand=True)
+        ).pack(pady=(0, 16))
+        ttk.Button(
+            body,
+            text="확인",
+            command=self._focus_running_tool,
+        ).pack()
 
         guard.update_idletasks()
         x = self.win.winfo_rootx() + (self.win.winfo_width() - guard.winfo_width()) // 2
