@@ -30,6 +30,13 @@ ZOOM_SIZE = 80      # 확대경 영역 크기 (px)
 ZOOM_SCALE = 3.0    # 확대 배율
 MAX_MEAN_ERROR_PX = 5.0   # 평균 재투영 오차 허용 기준
 MAX_POINT_ERROR_PX = 10.0  # 개별 최대 오차 허용 기준
+BUTTON_BAR_HEIGHT = 44
+_BUTTONS = [
+    ("Save",  (50, 160, 50), "save"),
+    ("Undo",  (160, 160, 50), "undo"),
+    ("Reset", (180, 80, 50), "reset"),
+    ("Quit",  (50, 50, 180), "quit"),
+]
 
 
 def draw_crosshair(img, x, y, color, size=4, thickness=1, gap=2):
@@ -71,6 +78,39 @@ def resize_for_display(img, width):
     h, w = img.shape[:2]
     height = int(h * width / w)
     return cv2.resize(img, (width, height))
+
+
+def _compute_button_rects(canvas_width: int, image_height: int):
+    """ROI 설정 도구와 같은 방식으로 하단 버튼 위치를 계산한다."""
+    button_width, button_height, gap = 92, 30, 8
+    total_width = len(_BUTTONS) * button_width + (len(_BUTTONS) - 1) * gap
+    start_x = (canvas_width - total_width) // 2
+    y = image_height + (BUTTON_BAR_HEIGHT - button_height) // 2
+    return [
+        (start_x + index * (button_width + gap), y,
+         start_x + index * (button_width + gap) + button_width, y + button_height)
+        for index in range(len(_BUTTONS))
+    ]
+
+
+def _draw_button_bar(canvas, image_height, button_rects):
+    """Thermal 창 하단에 클릭 가능한 버튼 바를 그린다."""
+    cv2.rectangle(
+        canvas, (0, image_height), (canvas.shape[1], canvas.shape[0]),
+        (55, 55, 55), -1,
+    )
+    cv2.line(canvas, (0, image_height), (canvas.shape[1], image_height), (100, 100, 100), 1)
+    for (label, rgb, _), (x1, y1, x2, y2) in zip(_BUTTONS, button_rects):
+        bgr = (rgb[2], rgb[1], rgb[0])
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), bgr, -1)
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (180, 180, 180), 1)
+        size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)[0]
+        text_x = x1 + (x2 - x1 - size[0]) // 2
+        text_y = y1 + (y2 - y1 + size[1]) // 2
+        cv2.putText(
+            canvas, label, (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2,
+        )
 
 
 def run_calibration(thermal_path=None, rgb_path=None):
@@ -140,13 +180,27 @@ def run_calibration(thermal_path=None, rgb_path=None):
 
     thermal_scale = thermal.shape[1] / thermal_disp.shape[1]
     rgb_scale = rgb.shape[1] / rgb_disp.shape[1]
+    button_rects = _compute_button_rects(thermal_disp.shape[1], thermal_disp.shape[0])
+    button_action = {"value": None}
 
     def make_scaled_callback(original_callback, scale):
         def wrapper(event, x, y, flags, param):
             return original_callback(event, int(x * scale), int(y * scale), flags, param)
         return wrapper
 
-    cv2.setMouseCallback("Thermal", make_scaled_callback(click_thermal, thermal_scale))
+    def thermal_callback(event, x, y, flags, param):
+        if y >= thermal_disp.shape[0]:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                for (_, _, action), (x1, y1, x2, y2) in zip(_BUTTONS, button_rects):
+                    if x1 <= x <= x2 and y1 <= y <= y2:
+                        button_action["value"] = action
+                        break
+            return
+        return click_thermal(
+            event, int(x * thermal_scale), int(y * thermal_scale), flags, param,
+        )
+
+    cv2.setMouseCallback("Thermal", thermal_callback)
     cv2.setMouseCallback("RGB", make_scaled_callback(click_rgb, rgb_scale))
 
     while True:
@@ -209,21 +263,29 @@ def run_calibration(thermal_path=None, rgb_path=None):
         cv2.putText(r, "RGB | S: save  R: reset  Z: undo  Q: quit",
                     (10, r.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        cv2.imshow("Thermal", t)
+        thermal_canvas = np.zeros(
+            (t.shape[0] + BUTTON_BAR_HEIGHT, t.shape[1], 3), dtype=np.uint8,
+        )
+        thermal_canvas[:t.shape[0], :t.shape[1]] = t
+        _draw_button_bar(thermal_canvas, t.shape[0], button_rects)
+
+        cv2.imshow("Thermal", thermal_canvas)
         cv2.imshow("RGB", r)
 
         key = cv2.waitKey(1)
+        action = button_action["value"]
+        button_action["value"] = None
 
-        if key == ord('q') or key == 27:
+        if key == ord('q') or key == 27 or action == "quit":
             print("Quit without saving.")
             cv2.destroyAllWindows()
             return False
-        elif key == ord('r'):
+        elif key == ord('r') or action == "reset":
             thermal_pts.clear()
             rgb_pts.clear()
             pair_state = "thermal"
             print("[Reset] All points cleared.")
-        elif key == ord('z'):
+        elif key == ord('z') or action == "undo":
             if pair_state == "rgb" and thermal_pts:
                 thermal_pts.pop()
                 pair_state = "thermal"
@@ -234,7 +296,7 @@ def run_calibration(thermal_path=None, rgb_path=None):
                 print(f"[Undo] Last RGB point removed ({len(rgb_pts)} remaining)")
             else:
                 print("[Undo] Nothing to undo.")
-        elif key == ord('s'):
+        elif key == ord('s') or action == "save":
             if len(thermal_pts) < 4:
                 print(f"[Save] Need at least 4 point pairs, currently have {len(thermal_pts)}")
             elif len(thermal_pts) != len(rgb_pts):
