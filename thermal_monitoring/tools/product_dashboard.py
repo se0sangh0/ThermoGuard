@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1255,8 +1254,6 @@ class SettingsDialog:
         self._roi_editor_running = False
         self._calibration_running = False
         self._tool_running: Optional[str] = None
-        self._tool_window_titles: tuple[str, ...] = ()
-        self._tool_guard_window: Optional[tk.Toplevel] = None
         notebook = ttk.Notebook(self.win); notebook.pack(fill="both", expand=True, padx=14, pady=14)
         general = ttk.Frame(notebook, padding=16); roi = ttk.Frame(notebook, padding=16); advanced = ttk.Frame(notebook, padding=16)
         notebook.add(general, text="일반"); notebook.add(roi, text="감시 영역"); notebook.add(advanced, text="고급 설정")
@@ -1291,124 +1288,26 @@ class SettingsDialog:
         if self.win.winfo_exists():
             self.win.destroy()
 
-    def _focus_running_tool(self):
-        """이미 실행 중인 OpenCV 창을 새로 만들지 않고 앞으로 가져온다."""
-        for title in self._tool_window_titles:
-            try:
-                if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) >= 1:
-                    cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)
-            except cv2.error:
-                continue
-
-    def _show_tool_guard(self):
-        """설정창 클릭이 대기열에 쌓이지 않도록 모달 안내창이 입력을 선점한다."""
-        guard = tk.Toplevel(self.win)
-        guard.title("작업 진행 중")
-        guard.transient(self.win)
-        guard.resizable(False, False)
-        guard.geometry("320x130")
-        guard.protocol("WM_DELETE_WINDOW", lambda: None)
-
-        body = ttk.Frame(guard, padding=18)
-        body.pack(fill="both", expand=True)
-        ttk.Label(
-            body,
-            text="실행 중인 작업창이 있습니다.",
-            font=("맑은 고딕", 11, "bold"),
-        ).pack(pady=(0, 16))
-        ttk.Button(
-            body,
-            text="확인",
-            command=self._focus_running_tool,
-        ).pack()
-
-        guard.update_idletasks()
-        x = self.win.winfo_rootx() + (self.win.winfo_width() - guard.winfo_width()) // 2
-        y = self.win.winfo_rooty() + (self.win.winfo_height() - guard.winfo_height()) // 2
-        guard.geometry(f"+{max(0, x)}+{max(0, y)}")
-        guard.grab_set()
-        guard.lift()
-        guard.focus_force()
-        self._tool_guard_window = guard
-
-    def _pump_tool_events(self):
-        """OpenCV 루프 중 모달 안내창 이벤트만 처리해 클릭 적체를 비운다."""
-        if self._tool_guard_window and self._tool_guard_window.winfo_exists():
-            self._tool_guard_window.update()
-
-    def _tool_display_bounds(self):
-        """설정창이 위치한 모니터의 작업 영역을 OpenCV 도구에 전달한다."""
-        self.win.update_idletasks()
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                from ctypes import wintypes
-
-                class MONITORINFO(ctypes.Structure):
-                    _fields_ = [
-                        ("cbSize", wintypes.DWORD),
-                        ("rcMonitor", wintypes.RECT),
-                        ("rcWork", wintypes.RECT),
-                        ("dwFlags", wintypes.DWORD),
-                    ]
-
-                user32 = ctypes.windll.user32
-                user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
-                user32.MonitorFromWindow.restype = ctypes.c_void_p
-                user32.GetMonitorInfoW.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.POINTER(MONITORINFO),
-                ]
-                user32.GetMonitorInfoW.restype = wintypes.BOOL
-                monitor = user32.MonitorFromWindow(
-                    self.win.winfo_id(), 2,
-                )
-                info = MONITORINFO()
-                info.cbSize = ctypes.sizeof(info)
-                if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-                    work = info.rcWork
-                    return (
-                        work.left,
-                        work.top,
-                        work.right - work.left,
-                        work.bottom - work.top,
-                    )
-            except (AttributeError, OSError, tk.TclError):
-                pass
-        return (
-            self.win.winfo_vrootx(),
-            self.win.winfo_vrooty(),
-            self.win.winfo_vrootwidth(),
-            self.win.winfo_vrootheight(),
-        )
-
-    def _begin_tool(self, tool_name: str, window_titles: tuple[str, ...]) -> bool:
-        """OpenCV 도구는 프로세스에서 한 번에 하나만 실행한다."""
+    def _begin_tool(self, tool_name: str) -> bool:
+        """ROI/캘리브레이션 도구는 프로세스에서 한 번에 하나만 실행한다."""
         if self._tool_running:
-            self._focus_running_tool()
             self.d._add_operating_log(
-                tool_name, "기존 창 표시", f"{self._tool_running} 창을 앞으로 가져옴"
+                tool_name, "중복 실행 차단", f"{self._tool_running} 작업이 이미 실행 중"
+            )
+            messagebox.showinfo(
+                "작업 진행 중",
+                f"{self._tool_running} 작업이 이미 실행 중입니다.",
+                parent=self.win,
             )
             return False
         self._tool_running = tool_name
-        self._tool_window_titles = window_titles
         self._roi_editor_running = tool_name == "ROI 설정"
         self._calibration_running = tool_name == "캘리브레이션"
         self.win.grab_release()
-        self._show_tool_guard()
         return True
 
     def _end_tool(self):
-        if self._tool_guard_window:
-            try:
-                if self._tool_guard_window.winfo_exists():
-                    self._tool_guard_window.grab_release()
-                    self._tool_guard_window.destroy()
-            except tk.TclError:
-                pass
-            self._tool_guard_window = None
         self._tool_running = None
-        self._tool_window_titles = ()
         self._roi_editor_running = False
         self._calibration_running = False
         if self.win.winfo_exists():
@@ -1440,9 +1339,6 @@ class SettingsDialog:
             self.dataset_dir.set(os.path.normpath(selected))
 
     def open_roi_editor(self):
-        if self._tool_running:
-            self._focus_running_tool()
-            return
         dataset = Path(self.d.cfg.paths.dataset_dir)
         if not dataset.exists():
             messagebox.showwarning("ROI 설정", "데이터셋 폴더가 없습니다.", parent=self.win); return
@@ -1466,21 +1362,18 @@ class SettingsDialog:
                 parent=self.win,
             )
             return
-        if not self._begin_tool(
-            "ROI 설정",
-            ("ROI Selector - Visual (H)",),
-        ):
+        if not self._begin_tool("ROI 설정"):
             return
         self.d._add_operating_log("ROI 설정", "시작", str(visual))
         try:
-            from .roi_selector import main as roi_main
-            sys.argv = ["roi_selector", str(thermal), str(visual)]
-            roi_main(
-                event_pump=self._pump_tool_events,
-                display_bounds=self._tool_display_bounds(),
-            )
+            from .tk_image_dialogs import show_roi_dialog
+            saved = show_roi_dialog(self.win, str(thermal), str(visual))
             self.d.cfg = load_config(force_reload=True)
-            self.d._add_operating_log("ROI 설정", "완료", f"{len(self.d.cfg.roi.rois)}개 영역 저장됨")
+            result_text = "완료" if saved else "종료"
+            self.d._add_operating_log(
+                "ROI 설정", result_text,
+                f"{len(self.d.cfg.roi.rois)}개 영역 저장됨" if saved else "저장 없이 종료",
+            )
         except Exception as exc:
             self.d._add_operating_log("ROI 설정", "예외 처리", str(exc))
             messagebox.showerror("ROI 설정", str(exc), parent=self.win)
@@ -1488,9 +1381,6 @@ class SettingsDialog:
             self._end_tool()
 
     def open_calibration(self):
-        if self._tool_running:
-            self._focus_running_tool()
-            return
         dataset = Path(self.d.cfg.paths.dataset_dir)
         thermal_files = sorted(p for p in dataset.glob("*.jpg") if "_visual" not in p.name) if dataset.exists() else []
         if not thermal_files:
@@ -1498,20 +1388,13 @@ class SettingsDialog:
         thermal = thermal_files[-1]; visual = dataset / f"{thermal.stem}_visual.jpg"
         if not visual.exists():
             messagebox.showwarning("캘리브레이션", "대응하는 가시광 이미지가 없습니다.", parent=self.win); return
-        if not self._begin_tool(
-            "캘리브레이션", ("Calibration - Thermal | RGB",),
-        ):
+        if not self._begin_tool("캘리브레이션"):
             return
         self.d._add_operating_log("캘리브레이션", "시작", thermal.name)
         saved = False
         try:
-            from .calibration import run_calibration
-            saved = bool(run_calibration(
-                str(thermal),
-                str(visual),
-                event_pump=self._pump_tool_events,
-                display_bounds=self._tool_display_bounds(),
-            ))
+            from .tk_image_dialogs import show_calibration_dialog
+            saved = show_calibration_dialog(self.win, str(thermal), str(visual))
             if saved:
                 self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
             else:
