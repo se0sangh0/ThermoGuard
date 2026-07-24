@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +33,8 @@ from ..analysis.threshold import (
 )
 from ..capture.capture import CaptureSession, camera_image_url
 from ..data import pairs
+from ..data.pairs import capture_time_from_file, latest_analysis_pair
+from ..data.quality import assess_image_quality
 from ..config import load_config, save_config
 from ..logger import get_logger
 
@@ -836,7 +837,7 @@ class ProductDashboard:
             thermal = Path(thermal_path)
             visual = Path(visual_path) if visual_path else None
             npy = pairs.ensure_npy(thermal)
-            pair = (thermal.stem, thermal, visual, npy)
+            pair = {"base": thermal.stem, "thermal": thermal, "visual": visual, "npy": npy}
             result = self._process_pair_to_dict(pair)
             self.root.after(0, lambda: self._apply_capture_refresh_result(result))
         except Exception as exc:
@@ -905,41 +906,24 @@ class ProductDashboard:
 
     def _latest_pair(self):
         """Return the newest thermal, visual and NPY paths for analysis."""
-        thermal_files = pairs.thermal_jpgs(self.cfg.paths.dataset_dir)
-        if not thermal_files:
-            return None
+        return latest_analysis_pair(
+            self.cfg.paths.dataset_dir,
+            visual_mode=(self.cfg.tools.mode == "both"),
+        )
 
-        # Thermal과 Visual은 병렬 요청 후 각각 저장되므로 아주 짧은 시간
-        # 동안 Thermal 파일만 존재할 수 있다. 5초까지는 직전 완성 쌍을
-        # 사용하고, 그 이후에도 Visual이 없으면 최신 쌍을 품질 이상으로
-        # 전달해 정상률과 운영 로그에 즉시 반영한다.
-        if self.cfg.tools.mode == "both":
-            newest = thermal_files[-1]
-            newest_age = max(0.0, time.time() - newest.stat().st_mtime)
-            if pairs.visual_for(newest).exists() or newest_age >= 5.0:
-                thermal = newest
-            else:
-                thermal = next(
-                    (t for t in reversed(thermal_files[:-1]) if pairs.visual_for(t).exists()),
-                    None,
-                )
-            if thermal is None:
-                return None
-        else:
-            thermal = thermal_files[-1]
-        visual = pairs.visual_for(thermal)
-        npy = pairs.ensure_npy(thermal)
-        return thermal.stem, thermal, visual if visual.exists() else None, npy
-
-    def _process_pair_to_dict(self, pair) -> dict:
-        base, thermal, visual, npy = pair
-        captured_at = self._capture_time_from_file(base, thermal)
+    def _process_pair_to_dict(self, pair: dict) -> dict:
+        base = pair["base"]
+        thermal = pair["thermal"]
+        visual = pair["visual"]
+        npy = pair["npy"]
+        captured_at = capture_time_from_file(base, thermal)
         thermal_img = cv2.imread(str(thermal))
         visual_img = None
         if visual and visual.exists():
             visual_img = cv2.imread(str(visual))
-        image_quality_ok, image_quality_reason = self._assess_image_quality(
-            thermal_img, visual_img
+        image_quality_ok, image_quality_reason = assess_image_quality(
+            thermal_img, visual_img,
+            visual_mode=(self.cfg.tools.mode == "both"),
         )
 
         roi_cfg = load_roi_config()
@@ -1001,50 +985,6 @@ class ProductDashboard:
             "image_quality_ok": image_quality_ok,
             "image_quality_reason": image_quality_reason,
         }
-
-    @staticmethod
-    def _capture_time_from_file(base: str, thermal: Path) -> datetime:
-        """저장 파일명에 기록된 캡처 요청 시각을 읽는다.
-
-        CaptureSession은 촬영 직전에 YYYYmmddHHMMSS_ffffff 형식으로
-        파일명을 생성한다. 이전 형식의 파일도 표시할 수 있게 초 단위
-        형식을 함께 지원하고, 형식이 다른 외부 파일은 수정 시각을 쓴다.
-        """
-        for timestamp_format in ("%Y%m%d%H%M%S_%f", "%Y%m%d%H%M%S"):
-            try:
-                return datetime.strptime(base, timestamp_format)
-            except ValueError:
-                continue
-        return datetime.fromtimestamp(thermal.stat().st_mtime)
-
-    def _assess_image_quality(self, thermal_img, visual_img) -> tuple[bool, str]:
-        """화면에 표시할 Thermal/Visual 한 쌍이 서로 유효한지 검사한다."""
-        if thermal_img is None or thermal_img.size == 0:
-            return False, "열화상 이미지 누락 또는 읽기 실패"
-
-        if self.cfg.tools.mode != "both":
-            return True, "정상"
-
-        if visual_img is None or visual_img.size == 0:
-            return False, "가시광 이미지 누락 또는 읽기 실패"
-
-        thermal_shape = thermal_img.shape[:2]
-        visual_shape = visual_img.shape[:2]
-        if thermal_shape == visual_shape:
-            return False, "가시광·열화상 영상 종류 중복 의심(동일 해상도)"
-
-        # 현재 카메라 데이터 규격은 Visual이 Thermal보다 고해상도다.
-        # 역전되면 파일 종류가 뒤바뀌었을 가능성이 높다.
-        if thermal_img.size >= visual_img.size:
-            return False, "가시광·열화상 영상 종류 혼동 의심(해상도 역전)"
-
-        thermal_small = cv2.resize(thermal_img, (160, 120))
-        visual_small = cv2.resize(visual_img, (160, 120))
-        mean_difference = float(cv2.absdiff(thermal_small, visual_small).mean())
-        if mean_difference < 3.0:
-            return False, "가시광·열화상 동일 영상 감지"
-
-        return True, "정상"
 
     def _apply_analysis_result(self, result: dict, generation: int):
         if self.lifecycle != "running":
