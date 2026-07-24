@@ -1518,46 +1518,36 @@ class SettingsDialog:
 
         settings = notifier.get_settings()
         self._notification_login_running = False
+        self.telegram_login_window: Optional[tk.Toplevel] = None
         self.telegram_token = tk.StringVar(value=settings["bot_token"])
         self.telegram_chat_id = tk.StringVar(value=settings["chat_id"])
 
         ttk.Label(
             parent,
-            text="Telegram 알림 연결",
+            text="Telegram 알림",
             font=("맑은 고딕", 13, "bold"),
         ).pack(anchor="w", pady=(0, 5))
         ttk.Label(
             parent,
-            text="Bot Token과 Chat ID는 이 PC의 .env에만 저장되며 Git에는 업로드되지 않습니다.",
+            text="경고·위험 발생 시 등록된 Telegram 채팅으로 알림을 전송합니다.",
             foreground="#59636d",
-        ).pack(anchor="w", pady=(0, 16))
+        ).pack(anchor="w", pady=(0, 14))
 
-        form = ttk.LabelFrame(parent, text="로그인 정보", padding=14)
-        form.pack(fill="x")
-        ttk.Label(form, text="Bot Token", width=14).grid(
-            row=0, column=0, sticky="w", padx=(0, 10), pady=8,
+        state_box = ttk.LabelFrame(parent, text="연결 상태", padding=16)
+        state_box.pack(fill="x")
+        self.telegram_status_label = ttk.Label(
+            state_box,
+            font=("맑은 고딕", 11, "bold"),
         )
-        self.telegram_token_entry = ttk.Entry(
-            form,
-            textvariable=self.telegram_token,
-            show="●",
-        )
-        self.telegram_token_entry.grid(row=0, column=1, sticky="ew", pady=8)
-        ttk.Label(form, text="Chat ID", width=14).grid(
-            row=1, column=0, sticky="w", padx=(0, 10), pady=8,
-        )
-        ttk.Entry(form, textvariable=self.telegram_chat_id).grid(
-            row=1, column=1, sticky="ew", pady=8,
-        )
-        form.columnconfigure(1, weight=1)
+        self.telegram_status_label.pack(anchor="w")
 
-        controls = ttk.Frame(parent)
-        controls.pack(fill="x", pady=14)
+        controls = ttk.Frame(state_box)
+        controls.pack(fill="x", pady=(14, 0))
         self.telegram_login_button = ttk.Button(
             controls,
             text="로그인",
             style="Action.TButton",
-            command=self._login_telegram,
+            command=self._open_telegram_login_window,
         )
         self.telegram_login_button.pack(side="left", padx=(0, 6))
         self.telegram_logout_button = ttk.Button(
@@ -1566,16 +1556,8 @@ class SettingsDialog:
             command=self._logout_telegram,
         )
         self.telegram_logout_button.pack(side="left")
-
-        state_box = ttk.LabelFrame(parent, text="알림 전송", padding=14)
-        state_box.pack(fill="x")
-        self.telegram_status_label = ttk.Label(
-            state_box,
-            font=("맑은 고딕", 11, "bold"),
-        )
-        self.telegram_status_label.pack(anchor="w", pady=(0, 10))
         self.telegram_toggle_button = tk.Button(
-            state_box,
+            controls,
             command=self._toggle_telegram_delivery,
             relief="flat",
             bd=0,
@@ -1584,13 +1566,104 @@ class SettingsDialog:
             cursor="hand2",
             font=("맑은 고딕", 10, "bold"),
         )
-        self.telegram_toggle_button.pack(anchor="w")
+        self.telegram_toggle_button.pack(side="right")
         ttk.Label(
-            state_box,
-            text="비활성화하면 로그인 정보는 유지하고 자동 알림 전송만 중단합니다.",
+            parent,
+            text="로그인을 누르면 별도 창에서 Bot Token과 Chat ID를 입력할 수 있습니다.\n"
+                 "로그인 정보는 이 PC의 .env에만 저장되며 Git에는 업로드되지 않습니다.",
             foreground="#59636d",
-        ).pack(anchor="w", pady=(10, 0))
+            justify="left",
+        ).pack(anchor="w", pady=(12, 0))
         self._refresh_telegram_controls()
+
+    def _open_telegram_login_window(self):
+        if self.telegram_login_window:
+            try:
+                if self.telegram_login_window.winfo_exists():
+                    self.telegram_login_window.deiconify()
+                    self.telegram_login_window.lift()
+                    self.telegram_login_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self.telegram_login_window = None
+
+        win = tk.Toplevel(self.win, name="telegram_login")
+        win.title("Telegram 로그인")
+        win.geometry("500x285")
+        win.resizable(False, False)
+        win.transient(self.win)
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", self._close_telegram_login_window)
+        self.telegram_login_window = win
+        self.telegram_login_button.configure(style="Active.Action.TButton")
+
+        content = ttk.Frame(win, padding=20)
+        content.pack(fill="both", expand=True)
+        ttk.Label(
+            content,
+            text="Telegram Bot 연결",
+            font=("맑은 고딕", 13, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(
+            content,
+            text="BotFather에서 발급받은 Token과 알림을 받을 Chat ID를 입력하세요.",
+            foreground="#59636d",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        ttk.Label(content, text="Bot Token", width=12).grid(
+            row=2, column=0, sticky="w", padx=(0, 10), pady=7,
+        )
+        self.telegram_token_entry = ttk.Entry(
+            content,
+            textvariable=self.telegram_token,
+            show="●",
+        )
+        self.telegram_token_entry.grid(row=2, column=1, sticky="ew", pady=7)
+        ttk.Label(content, text="Chat ID", width=12).grid(
+            row=3, column=0, sticky="w", padx=(0, 10), pady=7,
+        )
+        ttk.Entry(content, textvariable=self.telegram_chat_id).grid(
+            row=3, column=1, sticky="ew", pady=7,
+        )
+        content.columnconfigure(1, weight=1)
+
+        self.telegram_login_status_label = ttk.Label(
+            content,
+            text="",
+            foreground=COLORS["orange"],
+        )
+        self.telegram_login_status_label.grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(8, 4),
+        )
+        buttons = ttk.Frame(content)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(6, 0))
+        ttk.Button(
+            buttons,
+            text="취소",
+            command=self._close_telegram_login_window,
+        ).pack(side="right", padx=(6, 0))
+        self.telegram_login_submit_button = ttk.Button(
+            buttons,
+            text="로그인",
+            style="Action.TButton",
+            command=self._login_telegram,
+        )
+        self.telegram_login_submit_button.pack(side="right")
+        self.telegram_token_entry.focus_set()
+
+    def _close_telegram_login_window(self):
+        if self._notification_login_running:
+            return
+        win = self.telegram_login_window
+        self.telegram_login_window = None
+        self.telegram_login_button.configure(style="Action.TButton")
+        if win:
+            try:
+                if win.winfo_exists():
+                    win.grab_release()
+                    win.destroy()
+            except tk.TclError:
+                pass
 
     def _refresh_telegram_controls(self):
         from ..analysis import notifier
@@ -1626,22 +1699,31 @@ class SettingsDialog:
             messagebox.showwarning(
                 "Telegram 로그인",
                 "Bot Token과 Chat ID를 모두 입력하세요.",
-                parent=self.win,
+                parent=self.telegram_login_window or self.win,
             )
             return
 
         self._notification_login_running = True
-        self.telegram_login_button.configure(text="연결 확인 중...", state="disabled")
-        self.telegram_status_label.configure(
-            text="● Telegram 연결 확인 중",
+        self.telegram_login_submit_button.configure(
+            text="연결 확인 중...",
+            state="disabled",
+        )
+        self.telegram_login_status_label.configure(
+            text="Telegram 서버와 연결을 확인하고 있습니다.",
             foreground=COLORS["orange"],
         )
 
         def work():
             from ..analysis import notifier
             result = notifier.test_connection(token, chat_id)
-            if self.win.winfo_exists():
-                self.win.after(0, lambda: self._finish_telegram_login(token, chat_id, result))
+            try:
+                if self.win.winfo_exists():
+                    self.win.after(
+                        0,
+                        lambda: self._finish_telegram_login(token, chat_id, result),
+                    )
+            except tk.TclError:
+                pass
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1649,24 +1731,26 @@ class SettingsDialog:
         from ..analysis import notifier
 
         self._notification_login_running = False
-        self.telegram_login_button.configure(text="로그인", state="normal")
+        if self.telegram_login_window and self.telegram_login_window.winfo_exists():
+            self.telegram_login_submit_button.configure(text="로그인", state="normal")
         connected, detail = result
         if connected:
             notifier.configure(token, chat_id, enabled=False, persist=True)
             self.d._add_operating_log("Telegram", "로그인 성공", detail)
             self._refresh_telegram_controls()
+            self._close_telegram_login_window()
             messagebox.showinfo(
                 "Telegram 로그인",
                 f"{detail}\n\n알림 전송 버튼을 활성화하면 경고·위험 알림을 받을 수 있습니다.",
                 parent=self.win,
             )
         else:
-            self.telegram_status_label.configure(
-                text="● 연결 실패",
-                foreground=COLORS["red"],
-            )
+            if self.telegram_login_window and self.telegram_login_window.winfo_exists():
+                self.telegram_login_status_label.configure(
+                    text=detail,
+                    foreground=COLORS["red"],
+                )
             self.d._add_operating_log("Telegram", "로그인 실패", detail)
-            messagebox.showerror("Telegram 로그인 실패", detail, parent=self.win)
 
     def _logout_telegram(self):
         from ..analysis import notifier
@@ -1703,6 +1787,10 @@ class SettingsDialog:
     def close(self):
         if self._tool_running:
             return
+        if self.telegram_login_window:
+            if self._notification_login_running:
+                return
+            self._close_telegram_login_window()
         self.d.settings_dialog = None
         self.d.settings_button.configure(style="Action.TButton")
         if self.win.winfo_exists():
