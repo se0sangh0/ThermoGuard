@@ -110,6 +110,9 @@ class ProductDashboard:
         self.last_update: Optional[datetime] = None
         self.visual_photo = None
         self.thermal_photo = None
+        self._visual_source = None
+        self._thermal_source = None
+        self._image_render_ids = {"visual": None, "thermal": None}
         self.events: list[dict] = []
         self.operating_logs: list[tuple[str, str, str, str]] = []
         self.operating_log_window: Optional[tk.Toplevel] = None
@@ -161,8 +164,8 @@ class ProductDashboard:
         body = tk.Frame(self.root, bg=COLORS["bg"])
         body.pack(fill="both", expand=True, padx=10, pady=10)
         body.grid_columnconfigure(0, weight=1)
-        body.grid_rowconfigure(1, weight=6, minsize=380)
-        body.grid_rowconfigure(3, weight=4, minsize=250)
+        body.grid_rowconfigure(1, weight=7, minsize=420)
+        body.grid_rowconfigure(3, weight=3, minsize=190)
 
         self._build_toolbar(body)
 
@@ -300,8 +303,13 @@ class ProductDashboard:
                  font=("맑은 고딕", 12, "bold")).pack(side="left")
         stamp = tk.Label(head, text="촬영 시각 —", bg=COLORS["card"], fg=COLORS["muted"], font=("맑은 고딕", 9))
         stamp.pack(side="right")
-        image = tk.Label(frame, text="첫 이미지 수신 대기 중", bg=COLORS["dark"], fg="#9aa9b6",
-                         font=("맑은 고딕", 11))
+        image = tk.Canvas(
+            frame,
+            bg=COLORS["dark"],
+            highlightthickness=0,
+            width=1,
+            height=1,
+        )
         image.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         return frame, image, stamp
 
@@ -310,6 +318,16 @@ class ProductDashboard:
         right, self.thermal_label, self.thermal_stamp = self._image_panel(parent, "열화상 이미지")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 5))
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 5))
+        self.visual_label.bind(
+            "<Configure>",
+            lambda _event: self._schedule_dashboard_image_render("visual"),
+        )
+        self.thermal_label.bind(
+            "<Configure>",
+            lambda _event: self._schedule_dashboard_image_render("thermal"),
+        )
+        self.root.after_idle(lambda: self._schedule_dashboard_image_render("visual"))
+        self.root.after_idle(lambda: self._schedule_dashboard_image_render("thermal"))
 
     def _build_robot_map(self, parent):
         panel = tk.Frame(parent, bg=COLORS["card"], highlightbackground=COLORS["line"], highlightthickness=1)
@@ -1114,25 +1132,58 @@ class ProductDashboard:
         cv2.putText(img, "ROI-01", (int(x1*sx), max(25, int(y1*sy)-8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-    def _show_image(self, label, image, kind):
-        if image is None:
-            missing_text = (
-                "열화상 이미지를 불러올 수 없습니다"
+    def _show_image(self, _canvas, image, kind):
+        source_name = "_thermal_source" if kind == "thermal" else "_visual_source"
+        setattr(self, source_name, image.copy() if image is not None else None)
+        self._schedule_dashboard_image_render(kind)
+
+    def _schedule_dashboard_image_render(self, kind):
+        previous = self._image_render_ids.get(kind)
+        if previous:
+            try:
+                self.root.after_cancel(previous)
+            except tk.TclError:
+                pass
+        self._image_render_ids[kind] = self.root.after(
+            40,
+            lambda selected=kind: self._render_dashboard_image(selected),
+        )
+
+    def _render_dashboard_image(self, kind):
+        self._image_render_ids[kind] = None
+        canvas = self.thermal_label if kind == "thermal" else self.visual_label
+        source = self._thermal_source if kind == "thermal" else self._visual_source
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        canvas.delete("all")
+        if source is None:
+            waiting_text = (
+                "열화상 이미지 수신 대기 중"
                 if kind == "thermal"
-                else "가시광 이미지를 불러올 수 없습니다"
+                else "가시광 이미지 수신 대기 중"
             )
-            label.configure(image="", text=missing_text)
+            canvas.create_text(
+                width // 2,
+                height // 2,
+                text=waiting_text,
+                fill="#9aa9b6",
+                font=("맑은 고딕", 11),
+            )
             if kind == "thermal":
                 self.thermal_photo = None
             else:
                 self.visual_photo = None
             return
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb); pil.thumbnail((720, 430), RESAMPLE_LANCZOS)
+
+        rgb = cv2.cvtColor(source, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        pil.thumbnail((width, height), RESAMPLE_LANCZOS)
         photo = ImageTk.PhotoImage(pil)
-        label.configure(image=photo, text="")
-        if kind == "thermal": self.thermal_photo = photo
-        else: self.visual_photo = photo
+        canvas.create_image(width // 2, height // 2, image=photo, anchor="center")
+        if kind == "thermal":
+            self.thermal_photo = photo
+        else:
+            self.visual_photo = photo
 
     def _append_event(self, state, temp, action, roi_name="ROI-01", event_time=None):
         now = event_time or datetime.now()
@@ -1402,23 +1453,33 @@ class SettingsDialog:
         if selected:
             self.dataset_dir.set(os.path.normpath(selected))
 
+    @staticmethod
+    def _latest_complete_image_pair(dataset: Path):
+        """가장 최신의 Thermal/Visual 완성 쌍을 반환한다."""
+        thermal_files = sorted(
+            path for path in dataset.glob("*.jpg")
+            if "_visual" not in path.name
+        )
+        for thermal in reversed(thermal_files):
+            visual = dataset / f"{thermal.stem}_visual.jpg"
+            if visual.exists():
+                return thermal, visual
+        return None
+
     def open_roi_editor(self):
         dataset = Path(self.d.cfg.paths.dataset_dir)
         if not dataset.exists():
             messagebox.showwarning("ROI 설정", "데이터셋 폴더가 없습니다.", parent=self.win); return
-        jpgs = sorted(dataset.glob("*.jpg"))
-        thermal_files = [p for p in jpgs if "_visual" not in p.name]
-        if not thermal_files:
-            messagebox.showwarning("ROI 설정", "이미지가 없습니다. 먼저 이미지를 수집하세요.", parent=self.win); return
-        thermal = thermal_files[-1]
-        visual = dataset / f"{thermal.stem}_visual.jpg"
-        if not visual.exists():
+        pair = self._latest_complete_image_pair(dataset)
+        if pair is None:
             messagebox.showwarning(
                 "ROI 설정",
-                "대응하는 가시광 이미지가 없습니다.\nROI는 가시광 이미지에서만 설정합니다.",
+                "완성된 열화상·가시광 이미지 쌍이 없습니다.\n"
+                "이미지 수집이 완료된 후 다시 시도하세요.",
                 parent=self.win,
             )
             return
+        thermal, visual = pair
         if not Path(self.d.cfg.paths.homography_path).exists():
             messagebox.showwarning(
                 "ROI 설정",
@@ -1446,12 +1507,16 @@ class SettingsDialog:
 
     def open_calibration(self):
         dataset = Path(self.d.cfg.paths.dataset_dir)
-        thermal_files = sorted(p for p in dataset.glob("*.jpg") if "_visual" not in p.name) if dataset.exists() else []
-        if not thermal_files:
-            messagebox.showwarning("캘리브레이션", "Thermal 이미지가 없습니다. 먼저 이미지를 수집하세요.", parent=self.win); return
-        thermal = thermal_files[-1]; visual = dataset / f"{thermal.stem}_visual.jpg"
-        if not visual.exists():
-            messagebox.showwarning("캘리브레이션", "대응하는 가시광 이미지가 없습니다.", parent=self.win); return
+        pair = self._latest_complete_image_pair(dataset) if dataset.exists() else None
+        if pair is None:
+            messagebox.showwarning(
+                "캘리브레이션",
+                "완성된 열화상·가시광 이미지 쌍이 없습니다.\n"
+                "이미지 수집이 완료된 후 다시 시도하세요.",
+                parent=self.win,
+            )
+            return
+        thermal, visual = pair
         if not self._begin_tool("캘리브레이션"):
             return
         self.d._add_operating_log("캘리브레이션", "시작", thermal.name)

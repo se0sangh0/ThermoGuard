@@ -67,6 +67,45 @@ def fit_image_rect(
     )
 
 
+def recommended_window_size(
+    screen_width: int,
+    screen_height: int,
+    width_ratio: float,
+    height_ratio: float,
+    minimum: tuple[int, int],
+    maximum: tuple[int, int],
+) -> tuple[int, int]:
+    """Return a resolution-aware initial size in Tk logical pixels."""
+    width = max(minimum[0], min(int(screen_width * width_ratio), maximum[0]))
+    height = max(minimum[1], min(int(screen_height * height_ratio), maximum[1]))
+    return width, height
+
+
+def apply_adaptive_geometry(
+    window,
+    parent,
+    width_ratio: float,
+    height_ratio: float,
+    minimum: tuple[int, int],
+    maximum: tuple[int, int],
+) -> None:
+    """Size a dialog for the current Tk display and center it over its parent."""
+    parent.update_idletasks()
+    width, height = recommended_window_size(
+        parent.winfo_screenwidth(),
+        parent.winfo_screenheight(),
+        width_ratio,
+        height_ratio,
+        minimum,
+        maximum,
+    )
+    center_x = parent.winfo_rootx() + parent.winfo_width() // 2
+    center_y = parent.winfo_rooty() + parent.winfo_height() // 2
+    window.geometry(
+        f"{width}x{height}+{center_x - width // 2}+{center_y - height // 2}",
+    )
+
+
 def _roi_values(entry) -> tuple[str, int, int, int, int]:
     if isinstance(entry, dict):
         return (
@@ -106,7 +145,14 @@ class RoiTkDialog:
 
         self.win = tk.Toplevel(parent)
         self.win.title("ROI 설정 · 작업 중")
-        self.win.geometry("800x430")
+        apply_adaptive_geometry(
+            self.win,
+            parent,
+            width_ratio=0.70,
+            height_ratio=0.70,
+            minimum=(600, 360),
+            maximum=(1400, 900),
+        )
         self.win.minsize(600, 360)
         self.win.resizable(True, True)
         self.win.transient(parent)
@@ -384,7 +430,14 @@ class CalibrationTkDialog:
 
         self.win = tk.Toplevel(parent)
         self.win.title("캘리브레이션 · 작업 중")
-        self.win.geometry("900x520")
+        apply_adaptive_geometry(
+            self.win,
+            parent,
+            width_ratio=0.82,
+            height_ratio=0.75,
+            minimum=(680, 400),
+            maximum=(1600, 950),
+        )
         self.win.minsize(680, 400)
         self.win.resizable(True, True)
         self.win.transient(parent)
