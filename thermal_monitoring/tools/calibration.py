@@ -82,7 +82,12 @@ def resize_for_display(img, width):
 
 def _compute_button_rects(canvas_width: int, image_height: int):
     """ROI 설정 도구와 같은 방식으로 하단 버튼 위치를 계산한다."""
-    button_width, button_height, gap = 92, 30, 8
+    gap = 8
+    button_width = min(
+        92,
+        max(52, (canvas_width - 16 - (len(_BUTTONS) - 1) * gap) // len(_BUTTONS)),
+    )
+    button_height = 30
     total_width = len(_BUTTONS) * button_width + (len(_BUTTONS) - 1) * gap
     start_x = (canvas_width - total_width) // 2
     y = image_height + (BUTTON_BAR_HEIGHT - button_height) // 2
@@ -113,7 +118,7 @@ def _draw_button_bar(canvas, image_height, button_rects):
         )
 
 
-def run_calibration(thermal_path=None, rgb_path=None, event_pump=None):
+def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_bounds=None):
     """GUI 또는 CLI에서 호출 가능한 캘리브레이션 진입점."""
     global thermal_pts, rgb_pts, pair_state, t_mouse_x, t_mouse_y, r_mouse_x, r_mouse_y
     thermal_pts.clear()
@@ -172,16 +177,45 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None):
     print("  Click alternating: Thermal -> RGB -> Thermal -> ...")
     print("  S = compute & save   R = reset   Z = undo   ESC/Q = quit without saving")
 
-    cv2.namedWindow("Thermal")
-    cv2.namedWindow("RGB")
+    screen_x, screen_y, screen_w, screen_h = display_bounds or (0, 0, 1920, 1080)
+    side_by_side = screen_w >= screen_h
+    if side_by_side:
+        max_window_width = max(240, (screen_w - 48) // 2)
+        max_window_height = max(200, screen_h - 96)
+    else:
+        max_window_width = max(240, screen_w - 32)
+        max_window_height = max(180, (screen_h - 72) // 2)
+
+    thermal_width_by_height = int(max_window_height * thermal.shape[1] / thermal.shape[0])
+    rgb_width_by_height = int(
+        max(1, max_window_height - BUTTON_BAR_HEIGHT) * rgb.shape[1] / rgb.shape[0]
+    )
+    responsive_width = max(
+        240,
+        min(DISPLAY_WIDTH, max_window_width, thermal_width_by_height, rgb_width_by_height),
+    )
+
+    cv2.namedWindow("Thermal", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("RGB", cv2.WINDOW_AUTOSIZE)
     for title in ("Thermal", "RGB"):
         try:
             cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)
         except cv2.error:
             pass
 
-    thermal_disp = resize_for_display(thermal, DISPLAY_WIDTH)
-    rgb_disp = resize_for_display(rgb, DISPLAY_WIDTH)
+    thermal_disp = resize_for_display(thermal, responsive_width)
+    rgb_disp = resize_for_display(rgb, responsive_width)
+
+    thermal_window_height = thermal_disp.shape[0]
+    rgb_window_height = rgb_disp.shape[0] + BUTTON_BAR_HEIGHT
+    if side_by_side:
+        cv2.moveWindow("Thermal", screen_x + 12, screen_y + 36)
+        cv2.moveWindow("RGB", screen_x + 24 + responsive_width, screen_y + 36)
+    else:
+        cv2.moveWindow("Thermal", screen_x + 12, screen_y + 28)
+        cv2.moveWindow(
+            "RGB", screen_x + 12, screen_y + 40 + thermal_window_height,
+        )
 
     thermal_scale = thermal.shape[1] / thermal_disp.shape[1]
     rgb_scale = rgb.shape[1] / rgb_disp.shape[1]
