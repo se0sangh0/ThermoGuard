@@ -166,6 +166,7 @@ class ProductDashboard:
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(1, weight=7, minsize=420)
         body.grid_rowconfigure(3, weight=3, minsize=190)
+        self.dashboard_body = body
 
         self._build_toolbar(body)
 
@@ -180,6 +181,7 @@ class ProductDashboard:
         carousel.grid(row=3, column=0, sticky="nsew")
         carousel.grid_columnconfigure(0, weight=1)
         carousel.grid_rowconfigure(0, weight=1)
+        self.carousel_container = carousel
         self.carousel_pages = []
         for _ in range(3):
             page = tk.Frame(carousel, bg=COLORS["bg"])
@@ -190,7 +192,9 @@ class ProductDashboard:
         self._build_trend_panel(self.carousel_pages[2])
         self._build_carousel_navigation(body)
         self.carousel_index = 0
-        self._show_carousel_page(0)
+        self.carousel_expanded = False
+        self._set_carousel_expanded(False)
+        self._update_carousel_navigation()
 
     def _build_header(self):
         header = tk.Frame(self.root, bg=COLORS["navy"], height=82,
@@ -282,18 +286,49 @@ class ProductDashboard:
             self.info_tab_buttons.append(button)
 
     def _show_carousel_page(self, index):
+        if self.carousel_expanded and self.carousel_index == index:
+            self._set_carousel_expanded(False)
+            self._update_carousel_navigation()
+            return
+
         self.carousel_index = index
         self.carousel_pages[index].tkraise()
+        self._set_carousel_expanded(True)
+        self._update_carousel_navigation()
+        if index == 1:
+            self.root.after_idle(self._draw_robot_map)
+        elif index == 2:
+            self.root.after_idle(self._draw_temperature_trend)
+
+    def _set_carousel_expanded(self, expanded):
+        self.carousel_expanded = expanded
+        if expanded:
+            self.carousel_container.grid()
+            self.dashboard_body.grid_rowconfigure(1, weight=7, minsize=420)
+            self.dashboard_body.grid_rowconfigure(3, weight=3, minsize=190)
+        else:
+            self.carousel_container.grid_remove()
+            self.dashboard_body.grid_rowconfigure(1, weight=1, minsize=420)
+            self.dashboard_body.grid_rowconfigure(3, weight=0, minsize=0)
+        self.root.after_idle(self._redraw_dashboard_content)
+
+    def _update_carousel_navigation(self):
         for button_index, button in enumerate(self.info_tab_buttons):
-            selected = button_index == index
+            selected = self.carousel_expanded and button_index == self.carousel_index
             button.configure(
                 bg=COLORS["blue"] if selected else COLORS["panel"],
                 fg="white" if selected else COLORS["muted"],
                 relief="sunken" if selected else "flat",
             )
-        if index == 1:
+
+    def _redraw_dashboard_content(self):
+        self._schedule_dashboard_image_render("visual")
+        self._schedule_dashboard_image_render("thermal")
+        if not self.carousel_expanded:
+            return
+        if self.carousel_index == 1:
             self.root.after_idle(self._draw_robot_map)
-        elif index == 2:
+        elif self.carousel_index == 2:
             self.root.after_idle(self._draw_temperature_trend)
 
     def _image_panel(self, parent, title):
