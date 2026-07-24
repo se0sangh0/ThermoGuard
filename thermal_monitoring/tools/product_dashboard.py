@@ -1452,18 +1452,29 @@ class SettingsDialog:
             messagebox.showwarning("ROI 설정", "이미지가 없습니다. 먼저 이미지를 수집하세요.", parent=self.win); return
         thermal = thermal_files[-1]
         visual = dataset / f"{thermal.stem}_visual.jpg"
+        if not visual.exists():
+            messagebox.showwarning(
+                "ROI 설정",
+                "대응하는 가시광 이미지가 없습니다.\nROI는 가시광 이미지에서만 설정합니다.",
+                parent=self.win,
+            )
+            return
+        if not Path(self.d.cfg.paths.homography_path).exists():
+            messagebox.showwarning(
+                "ROI 설정",
+                "캘리브레이션 정보가 없습니다.\n캘리브레이션을 먼저 실행하세요.",
+                parent=self.win,
+            )
+            return
         if not self._begin_tool(
             "ROI 설정",
-            ("ROI Selector - Visual (H)", "ROI Selector - Thermal"),
+            ("ROI Selector - Visual (H)",),
         ):
             return
-        self.d._add_operating_log("ROI 설정", "시작", str(visual if visual.exists() else thermal))
+        self.d._add_operating_log("ROI 설정", "시작", str(visual))
         try:
             from .roi_selector import main as roi_main
-            if visual.exists():
-                sys.argv = ["roi_selector", str(thermal), str(visual)]
-            else:
-                sys.argv = ["roi_selector", str(thermal)]
+            sys.argv = ["roi_selector", str(thermal), str(visual)]
             roi_main(
                 event_pump=self._pump_tool_events,
                 display_bounds=self._tool_display_bounds(),
@@ -1487,7 +1498,9 @@ class SettingsDialog:
         thermal = thermal_files[-1]; visual = dataset / f"{thermal.stem}_visual.jpg"
         if not visual.exists():
             messagebox.showwarning("캘리브레이션", "대응하는 가시광 이미지가 없습니다.", parent=self.win); return
-        if not self._begin_tool("캘리브레이션", ("Thermal", "RGB")):
+        if not self._begin_tool(
+            "캘리브레이션", ("Calibration - Thermal | RGB",),
+        ):
             return
         self.d._add_operating_log("캘리브레이션", "시작", thermal.name)
         saved = False

@@ -398,35 +398,34 @@ def main(event_pump=None, display_bounds=None):
         print("사용법: python roi_selector.py [thermal.jpg] [visual.jpg]")
         sys.exit(1)
 
-    # ── Homography 확인 ──
+    # ── 가시광 ROI 편집에 필요한 Homography 확인 ──
     HOMOGRAPHY_PATH = cfg.paths.homography_path
-    if os.path.isfile(HOMOGRAPHY_PATH) and visual_path and os.path.isfile(visual_path):
-        H = np.load(HOMOGRAPHY_PATH)
-        if H.shape == (3, 3):
-            H_inv = np.linalg.inv(H)
-            img = cv2.imread(visual_path)
-            use_visual = True
-            display_res = img.shape[:2]
-            print(f"Homography loaded → Visual mode: {os.path.basename(visual_path)}"
-                  f" ({display_res[1]}×{display_res[0]})")
-            print(f"  ROI coordinates will be auto-converted to thermal "
-                  f"{thermal_resolution[0]}×{thermal_resolution[1]} on save.")
-        else:
-            print(f"Invalid homography shape {H.shape}, falling back to thermal.")
-            use_visual = False
-    else:
-        use_visual = False
+    if not visual_path or not os.path.isfile(visual_path):
+        print("가시광 이미지를 찾을 수 없습니다. ROI는 가시광 이미지에서만 설정합니다.")
+        return False
+    if not os.path.isfile(HOMOGRAPHY_PATH):
+        print("캘리브레이션 정보가 없습니다. 캘리브레이션을 먼저 실행하세요.")
+        return False
 
-    if not use_visual:
-        img = cv2.imread(thermal_path)
-        H_inv = None
-        print(f"Thermal mode: {os.path.basename(thermal_path)}")
+    H = np.load(HOMOGRAPHY_PATH)
+    if H.shape != (3, 3):
+        print(f"캘리브레이션 행렬 형식이 올바르지 않습니다: {H.shape}")
+        return False
+
+    H_inv = np.linalg.inv(H)
+    img = cv2.imread(visual_path)
+    use_visual = True
+    display_res = img.shape[:2] if img is not None else (0, 0)
+    print(f"Homography loaded → Visual mode: {os.path.basename(visual_path)}"
+          f" ({display_res[1]}×{display_res[0]})")
+    print(f"  ROI coordinates will be auto-converted to thermal "
+          f"{thermal_resolution[0]}×{thermal_resolution[1]} on save.")
 
     if img is None:
         print("이미지를 불러올 수 없습니다.")
         sys.exit(1)
 
-    print(f"Loaded: {thermal_path if not use_visual else visual_path}  ({img.shape[1]}×{img.shape[0]})")
+    print(f"Loaded: {visual_path}  ({img.shape[1]}×{img.shape[0]})")
     print("  Drag mouse to set ROI | Buttons below | Shortcuts: N Tab Del Z R S Q")
 
     count = load_existing_rois()
@@ -445,7 +444,7 @@ def main(event_pump=None, display_bounds=None):
     _canvas_h = img_disp.shape[0] + BUTTON_BAR_HEIGHT
     _compute_button_rects(img_disp.shape[1])
 
-    wintitle = "ROI Selector - Visual (H)" if use_visual else "ROI Selector - Thermal"
+    wintitle = "ROI Selector - Visual (H)"
     cv2.namedWindow(wintitle, cv2.WINDOW_AUTOSIZE)
     cv2.moveWindow(wintitle, screen_x + 16, screen_y + 40)
     try:
@@ -501,7 +500,7 @@ def main(event_pump=None, display_bounds=None):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         # 상태 텍스트
-        mode_text = "Visual mode (H→thermal)" if use_visual else "Thermal mode"
+        mode_text = "Visual mode (H→thermal)"
         sel_name = rois[selected_idx]["name"] if 0 <= selected_idx < len(rois) else "(none)"
         status = f"{mode_text} | Selected: {sel_name} | ROIs: {len(rois)}"
         cv2.putText(disp, status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)

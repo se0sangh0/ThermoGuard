@@ -5,7 +5,7 @@ Thermal 이미지와 RGB 이미지에서 대응점을 선택하여 Homography �
 계산된 행렬은 thermal_to_rgb.npy로 저장됩니다.
 
 조작:
-    마우스 클릭 (좌우 교차) : Thermal → RGB 대응점 선택
+    마우스 클릭 (좌우 교차) : RGB → Thermal 대응점 선택
     S             : 현재까지의 점으로 Homography 계산 및 저장
     R             : 모든 선택점 초기화
     Z             : 마지막 선택점 취소 (Undo)
@@ -22,7 +22,7 @@ from ..config import load_config
 
 thermal_pts = []
 rgb_pts = []
-pair_state = "thermal"  # "thermal" or "rgb"
+pair_state = "rgb"  # "rgb" or "thermal"
 t_mouse_x, t_mouse_y = -1, -1  # Thermal 창 마우스 (원본 해상도)
 r_mouse_x, r_mouse_y = -1, -1  # RGB 창 마우스 (원본 해상도)
 
@@ -31,6 +31,7 @@ ZOOM_SCALE = 3.0    # 확대 배율
 MAX_MEAN_ERROR_PX = 5.0   # 평균 재투영 오차 허용 기준
 MAX_POINT_ERROR_PX = 10.0  # 개별 최대 오차 허용 기준
 BUTTON_BAR_HEIGHT = 44
+CALIBRATION_WINDOW_TITLE = "Calibration - Thermal | RGB"
 _BUTTONS = [
     ("Save",  (50, 160, 50), "save"),
     ("Undo",  (160, 160, 50), "undo"),
@@ -123,7 +124,7 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
     global thermal_pts, rgb_pts, pair_state, t_mouse_x, t_mouse_y, r_mouse_x, r_mouse_y
     thermal_pts.clear()
     rgb_pts.clear()
-    pair_state = "thermal"
+    pair_state = "rgb"
     t_mouse_x = t_mouse_y = r_mouse_x = r_mouse_y = -1
 
     cfg = load_config()
@@ -174,17 +175,12 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
 
     print(f"Thermal: {thermal_path}")
     print(f"RGB: {rgb_path}")
-    print("  Click alternating: Thermal -> RGB -> Thermal -> ...")
+    print("  Click alternating: RGB -> Thermal -> RGB -> ...")
     print("  S = compute & save   R = reset   Z = undo   ESC/Q = quit without saving")
 
     screen_x, screen_y, screen_w, screen_h = display_bounds or (0, 0, 1920, 1080)
-    side_by_side = screen_w >= screen_h
-    if side_by_side:
-        max_window_width = max(240, (screen_w - 48) // 2)
-        max_window_height = max(200, screen_h - 96)
-    else:
-        max_window_width = max(240, screen_w - 32)
-        max_window_height = max(180, (screen_h - 72) // 2)
+    max_window_width = max(240, min(DISPLAY_WIDTH // 2, (screen_w - 48) // 2))
+    max_window_height = max(200, screen_h - BUTTON_BAR_HEIGHT - 96)
 
     thermal_width_by_height = int(max_window_height * thermal.shape[1] / thermal.shape[0])
     rgb_width_by_height = int(
@@ -195,63 +191,59 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
         min(DISPLAY_WIDTH, max_window_width, thermal_width_by_height, rgb_width_by_height),
     )
 
-    cv2.namedWindow("Thermal", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("RGB", cv2.WINDOW_AUTOSIZE)
-    for title in ("Thermal", "RGB"):
-        try:
-            cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)
-        except cv2.error:
-            pass
+    cv2.namedWindow(CALIBRATION_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+    try:
+        cv2.setWindowProperty(
+            CALIBRATION_WINDOW_TITLE, cv2.WND_PROP_TOPMOST, 1,
+        )
+    except cv2.error:
+        pass
 
     thermal_disp = resize_for_display(thermal, responsive_width)
     rgb_disp = resize_for_display(rgb, responsive_width)
 
-    thermal_window_height = thermal_disp.shape[0]
-    rgb_window_height = rgb_disp.shape[0] + BUTTON_BAR_HEIGHT
-    if side_by_side:
-        cv2.moveWindow("Thermal", screen_x + 12, screen_y + 36)
-        cv2.moveWindow("RGB", screen_x + 24 + responsive_width, screen_y + 36)
-    else:
-        cv2.moveWindow("Thermal", screen_x + 12, screen_y + 28)
-        cv2.moveWindow(
-            "RGB", screen_x + 12, screen_y + 40 + thermal_window_height,
-        )
+    panel_width = responsive_width
+    image_height = max(thermal_disp.shape[0], rgb_disp.shape[0])
+    canvas_width = panel_width * 2
+    cv2.moveWindow(
+        CALIBRATION_WINDOW_TITLE,
+        screen_x + max(12, (screen_w - canvas_width) // 2),
+        screen_y + 36,
+    )
 
     thermal_scale = thermal.shape[1] / thermal_disp.shape[1]
     rgb_scale = rgb.shape[1] / rgb_disp.shape[1]
-    # 제어 버튼은 작업 기준인 가시광(RGB) 이미지 아래에 표시한다.
-    button_rects = _compute_button_rects(rgb_disp.shape[1], rgb_disp.shape[0])
+    button_rects = _compute_button_rects(canvas_width, image_height)
     button_action = {"value": None}
 
-    def make_scaled_callback(original_callback, scale):
-        def wrapper(event, x, y, flags, param):
-            return original_callback(event, int(x * scale), int(y * scale), flags, param)
-        return wrapper
-
-    def rgb_callback(event, x, y, flags, param):
-        if y >= rgb_disp.shape[0]:
+    def calibration_callback(event, x, y, flags, param):
+        if y >= image_height:
             if event == cv2.EVENT_LBUTTONDOWN:
                 for (_, _, action), (x1, y1, x2, y2) in zip(_BUTTONS, button_rects):
                     if x1 <= x <= x2 and y1 <= y <= y2:
                         button_action["value"] = action
                         break
             return
-        return click_rgb(
-            event, int(x * rgb_scale), int(y * rgb_scale), flags, param,
-        )
+        if x < panel_width and y < rgb_disp.shape[0]:
+            return click_rgb(
+                event, int(x * rgb_scale), int(y * rgb_scale), flags, param,
+            )
+        thermal_x = x - panel_width
+        if 0 <= thermal_x < panel_width and y < thermal_disp.shape[0]:
+            return click_thermal(
+                event, int(thermal_x * thermal_scale), int(y * thermal_scale), flags, param,
+            )
 
-    cv2.setMouseCallback("Thermal", make_scaled_callback(click_thermal, thermal_scale))
-    cv2.setMouseCallback("RGB", rgb_callback)
+    cv2.setMouseCallback(CALIBRATION_WINDOW_TITLE, calibration_callback)
 
     windows_rendered = False
     while True:
         # 닫힌 창을 다음 imshow가 다시 생성하기 전에 감지한다.
         if windows_rendered:
             try:
-                if any(
-                    cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1
-                    for title in ("Thermal", "RGB")
-                ):
+                if cv2.getWindowProperty(
+                    CALIBRATION_WINDOW_TITLE, cv2.WND_PROP_VISIBLE,
+                ) < 1:
                     print("Quit without saving.")
                     cv2.destroyAllWindows()
                     return False
@@ -319,14 +311,26 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
         cv2.putText(r, "RGB | S: save  R: reset  Z: undo  Q: quit",
                     (10, r.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        rgb_canvas = np.zeros(
-            (r.shape[0] + BUTTON_BAR_HEIGHT, r.shape[1], 3), dtype=np.uint8,
+        canvas = np.zeros(
+            (image_height + BUTTON_BAR_HEIGHT, canvas_width, 3), dtype=np.uint8,
         )
-        rgb_canvas[:r.shape[0], :r.shape[1]] = r
-        _draw_button_bar(rgb_canvas, r.shape[0], button_rects)
+        canvas[:r.shape[0], :panel_width] = r
+        canvas[:t.shape[0], panel_width:panel_width * 2] = t
+        cv2.line(
+            canvas, (panel_width, 0), (panel_width, image_height),
+            (120, 120, 120), 1,
+        )
+        cv2.putText(
+            canvas, "VISUAL (RGB)", (10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+        )
+        cv2.putText(
+            canvas, "THERMAL", (panel_width + 10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+        )
+        _draw_button_bar(canvas, image_height, button_rects)
 
-        cv2.imshow("Thermal", t)
-        cv2.imshow("RGB", rgb_canvas)
+        cv2.imshow(CALIBRATION_WINDOW_TITLE, canvas)
         windows_rendered = True
 
         key = cv2.waitKey(1)
@@ -337,10 +341,9 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
 
         # 두 창 중 하나라도 X로 닫히면 Quit과 동일하게 전체 작업을 종료한다.
         try:
-            window_closed = any(
-                cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1
-                for title in ("Thermal", "RGB")
-            )
+            window_closed = cv2.getWindowProperty(
+                CALIBRATION_WINDOW_TITLE, cv2.WND_PROP_VISIBLE,
+            ) < 1
         except cv2.error:
             window_closed = True
 
@@ -351,7 +354,7 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
         elif key == ord('r') or action == "reset":
             thermal_pts.clear()
             rgb_pts.clear()
-            pair_state = "thermal"
+            pair_state = "rgb"
             print("[Reset] All points cleared.")
         elif key == ord('z') or action == "undo":
             if pair_state == "rgb" and thermal_pts:
