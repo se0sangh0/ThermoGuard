@@ -183,7 +183,7 @@ def _compute_button_rects(canvas_w: int) -> None:
     global _button_rects
     _button_rects.clear()
     n = len(_BUTTONS)
-    btn_w = 68
+    btn_w = min(68, max(42, (canvas_w - 16 - (n - 1) * 5) // n))
     btn_h = 30
     gap = 5
     total_w = n * btn_w + (n - 1) * gap
@@ -371,7 +371,7 @@ def _get_color(idx: int) -> tuple:
 #  main
 # ───────────────────────────────────────────────────────────────
 
-def main(event_pump=None):
+def main(event_pump=None, display_bounds=None):
     global scale, selected_idx, rois, roi_start, roi_end, dragging
     global H_inv, use_visual, _running, _quit_flag, _save_flag
     global _canvas_h
@@ -433,7 +433,12 @@ def main(event_pump=None):
     if count > 0:
         print(f"  Loaded {count} existing ROI(s): {[r['name'] for r in rois]}")
 
-    img_disp = resize_for_display(img, DISPLAY_WIDTH)
+    screen_x, screen_y, screen_w, screen_h = display_bounds or (0, 0, 1920, 1080)
+    max_width = max(240, screen_w - 48)
+    max_image_height = max(180, screen_h - BUTTON_BAR_HEIGHT - 96)
+    aspect_width = int(max_image_height * img.shape[1] / img.shape[0])
+    display_width = max(240, min(DISPLAY_WIDTH, max_width, aspect_width))
+    img_disp = resize_for_display(img, display_width)
     scale = img.shape[1] / img_disp.shape[1]
 
     # 캔버스 = 이미지 + 버튼 바
@@ -441,7 +446,8 @@ def main(event_pump=None):
     _compute_button_rects(img_disp.shape[1])
 
     wintitle = "ROI Selector - Visual (H)" if use_visual else "ROI Selector - Thermal"
-    cv2.namedWindow(wintitle)
+    cv2.namedWindow(wintitle, cv2.WINDOW_AUTOSIZE)
+    cv2.moveWindow(wintitle, screen_x + 16, screen_y + 40)
     try:
         cv2.setWindowProperty(wintitle, cv2.WND_PROP_TOPMOST, 1)
     except cv2.error:

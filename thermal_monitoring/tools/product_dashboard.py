@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
@@ -66,10 +67,23 @@ class RuntimeMetrics:
     image_quality_successes: int = 0
     exception_count: int = 0
     anomaly_today: int = 0
+    api_successes: int = 0
+    api_timeouts: int = 0
+    api_http_4xx: int = 0
+    api_http_5xx: int = 0
+    api_connection_errors: int = 0
+    api_other_errors: int = 0
 
     @staticmethod
     def rate(ok: int, total: int) -> float:
         return 100.0 if total == 0 else ok * 100.0 / total
+
+    @property
+    def api_failures(self) -> int:
+        return (
+            self.api_timeouts + self.api_http_4xx + self.api_http_5xx
+            + self.api_connection_errors + self.api_other_errors
+        )
 
 
 class ProductDashboard:
@@ -111,6 +125,7 @@ class ProductDashboard:
         self._image_quality_window: list[bool] = []
         self._connection_ok: Optional[bool] = None
         self._connection_check_running = False
+        self._resume_after_connection_check = False
         self._last_quality_capture_id: Optional[str] = None
         self._latest_pair_quality_ok = False
         self._latest_pair_fresh = False
@@ -196,9 +211,9 @@ class ProductDashboard:
             bg=COLORS["navy"], fg="#c7d6e5", font=("맑은 고딕", 10),
         )
         self.header_refresh_interval.pack(side="left", pady=(5, 0))
-        self.header_quality = tk.Label(right, text="최근 영상 정상률 —", bg=COLORS["navy"],
-                                       fg=COLORS["green"], font=("맑은 고딕", 10, "bold"))
-        self.header_quality.pack(side="left", padx=(14, 0), pady=(5, 0))
+        self.header_stability = tk.Label(right, text="API 연결 안정성 —", bg=COLORS["navy"],
+                                         fg=COLORS["muted"], font=("맑은 고딕", 10, "bold"))
+        self.header_stability.pack(side="left", padx=(14, 0), pady=(5, 0))
 
     def _build_toolbar(self, parent):
         toolbar = tk.Frame(parent, bg=COLORS["panel"],
@@ -515,29 +530,50 @@ class ProductDashboard:
     def _set_system_state(self, text, color):
         self.header_state.configure(text=f"● {text}", fg=color)
 
-    def _check_connection_async(self):
+    def _check_connection_async(self, resume_on_success=False):
+        self._resume_after_connection_check |= bool(resume_on_success)
         if self._connection_check_running or self.lifecycle != "running":
             return
         self._connection_check_running = True
         self.metrics.connection_attempts += 1
         def work():
-            ok = False
+            result = {"ok": False, "status_code": None, "error_kind": None}
             try:
                 response = requests.get(f"http://{self.cfg.camera.ip}/api/image/current?imgformat=JPEG", timeout=5)
-                ok = response.status_code == 200
-            except Exception:
+                result["status_code"] = response.status_code
+                result["ok"] = response.status_code == 200
+                if not result["ok"]:
+                    result["error_kind"] = "http"
+            except requests.exceptions.Timeout:
+                result["error_kind"] = "timeout"
                 self.metrics.exception_count += 1
-            if ok:
+            except requests.exceptions.ConnectionError:
+                result["error_kind"] = "connection"
+                self.metrics.exception_count += 1
+            except Exception:
+                result["error_kind"] = "other"
+                self.metrics.exception_count += 1
+            if result["ok"]:
                 self.metrics.connection_successes += 1
             if self.lifecycle == "running":
-                self.root.after(0, lambda: self._connection_result(ok))
+                self.root.after(0, lambda: self._connection_result(result))
         threading.Thread(target=work, daemon=True).start()
 
-    def _connection_result(self, ok):
+    def _connection_result(self, result):
         self._connection_check_running = False
+        resume_on_success = self._resume_after_connection_check
+        self._resume_after_connection_check = False
+        ok = bool(result["ok"])
         self._connection_ok = ok
+        self._record_api_result(
+            ok,
+            status_code=result.get("status_code"),
+            error_kind=result.get("error_kind"),
+        )
         if ok:
             self._add_operating_log("연결", "성공", f"카메라 {self.cfg.camera.ip} 응답 확인")
+            if resume_on_success:
+                self.capture_paused_by_user = False
             if self.capture_paused_by_user:
                 self._set_system_state("촬영 정지", COLORS["orange"])
             else:
@@ -546,8 +582,14 @@ class ProductDashboard:
                 self.start_monitoring()
         else:
             self._set_system_state("연결 없음", COLORS["red"])
-            self._add_operating_log("연결", "실패", f"카메라 {self.cfg.camera.ip} 응답 없음")
-        self._update_quality_display()
+            detail = (
+                f"HTTP {result['status_code']}" if result.get("status_code")
+                else result.get("error_kind") or "응답 없음"
+            )
+            self._add_operating_log("연결", "실패", f"카메라 {self.cfg.camera.ip} · {detail}")
+            if resume_on_success:
+                self.capture_toggle_button.configure(text="▶  촬영 시작", state="normal")
+        self._update_connection_stability_display()
         self._update_metric_text()
 
     def start_monitoring(self):
@@ -587,9 +629,10 @@ class ProductDashboard:
         if self.monitoring:
             self.stop_monitoring()
         else:
-            self.start_monitoring()
-            self._set_system_state("정상 운영 중", COLORS["green"])
-            self._add_operating_log("촬영", "시작", "사용자가 촬영을 다시 시작함")
+            self._set_system_state("연결 확인 중", COLORS["orange"])
+            self.capture_toggle_button.configure(text="연결 확인 중...", state="disabled")
+            self._add_operating_log("촬영", "연결 확인", "촬영 시작 전 카메라 응답 확인")
+            self._check_connection_async(resume_on_success=True)
 
     def stop_monitoring(self):
         if not self.monitoring:
@@ -608,42 +651,59 @@ class ProductDashboard:
         if "saved" in message:
             self.metrics.capture_attempts += 1; self.metrics.capture_successes += 1
             self._add_operating_log("캡처", "성공", message)
+            self._record_api_result(True)
         elif any(word in message.lower() for word in ("error", "timeout", "http", "connection")):
             self.metrics.capture_attempts += 1; self.metrics.exception_count += 1
             self._add_operating_log("캡처", "예외 처리", message)
+            self._record_api_message(message)
             self.root.after(0, self._check_connection_async)
+        self.root.after(0, self._update_connection_stability_display)
         self._update_metric_text_async()
 
-    def _update_quality_display(self):
-        quality_ok_count = sum(self._image_quality_window)
-        quality_total = len(self._image_quality_window)
-        if (
-            self._connection_ok is not True
-            or not self._latest_pair_fresh
-            or quality_total == 0
-        ):
-            quality_rate = 0.0
+    def _record_api_result(self, success, status_code=None, error_kind=None):
+        if success:
+            self.metrics.api_successes += 1
+        elif error_kind == "timeout":
+            self.metrics.api_timeouts += 1
+        elif error_kind == "connection":
+            self.metrics.api_connection_errors += 1
+        elif status_code is not None and 400 <= int(status_code) < 500:
+            self.metrics.api_http_4xx += 1
+        elif status_code is not None and 500 <= int(status_code) < 600:
+            self.metrics.api_http_5xx += 1
         else:
-            quality_rate = 100.0 * quality_ok_count / quality_total
+            self.metrics.api_other_errors += 1
 
-        quality_color = (
-            COLORS["red"] if self._connection_ok is False
-            else COLORS["orange"] if not self._latest_pair_fresh and self._last_quality_capture_id
-            else COLORS["muted"] if quality_total == 0
-            else COLORS["green"] if quality_rate == 100.0
-            else COLORS["orange"] if quality_rate >= 80.0
+    def _record_api_message(self, message):
+        lower = message.lower()
+        match = re.search(r"http\s+(\d{3})", lower)
+        status_code = int(match.group(1)) if match else None
+        error_kind = (
+            "timeout" if "timeout" in lower
+            else "connection" if "connection" in lower
+            else "http" if status_code is not None
+            else "other"
+        )
+        self._record_api_result(False, status_code=status_code, error_kind=error_kind)
+
+    def _update_connection_stability_display(self):
+        failures = self.metrics.api_failures
+        total = self.metrics.api_successes + failures
+        if total == 0:
+            self.header_stability.configure(text="API 연결 안정성 —", fg=COLORS["muted"])
+            return
+        rate = 100.0 * self.metrics.api_successes / total
+        color = (
+            COLORS["green"] if rate >= 99.0
+            else COLORS["orange"] if rate >= 90.0
             else COLORS["red"]
         )
-        detail = (
-            "연결 없음" if self._connection_ok is False
-            else "연결 확인 중" if self._connection_ok is None
-            else "갱신 없음" if self._last_quality_capture_id and not self._latest_pair_fresh
-            else f"{quality_ok_count}/{quality_total}" if quality_total
-            else "측정 대기"
-        )
-        self.header_quality.configure(
-            text=f"최근 영상 정상률 {quality_rate:.1f}% ({detail})",
-            fg=quality_color,
+        self.header_stability.configure(
+            text=(
+                f"API 연결 안정성 {rate:.1f}% · Timeout {self.metrics.api_timeouts} · "
+                f"4xx {self.metrics.api_http_4xx} · 5xx {self.metrics.api_http_5xx}"
+            ),
+            fg=color,
         )
 
     def _schedule_refresh(self, delay_ms=None):
@@ -1006,7 +1066,7 @@ class ProductDashboard:
         s = result["status"]
         korean = {Status.NORMAL: "정상", Status.WARNING: "경고", Status.CRITICAL: "위험"}[s]
         color = {Status.NORMAL: COLORS["green"], Status.WARNING: COLORS["orange"], Status.CRITICAL: COLORS["red"]}[s]
-        self._update_quality_display()
+        self._update_connection_stability_display()
         overall_max = result.get("overall_max_temp", result["max_temp"])
         overall_roi = result.get("overall_max_roi_name", "ROI-01")
         delta = overall_max - self.cfg.roi.baseline_temp
@@ -1276,6 +1336,52 @@ class SettingsDialog:
         if self._tool_guard_window and self._tool_guard_window.winfo_exists():
             self._tool_guard_window.update()
 
+    def _tool_display_bounds(self):
+        """설정창이 위치한 모니터의 작업 영역을 OpenCV 도구에 전달한다."""
+        self.win.update_idletasks()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class MONITORINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD),
+                    ]
+
+                user32 = ctypes.windll.user32
+                user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+                user32.MonitorFromWindow.restype = ctypes.c_void_p
+                user32.GetMonitorInfoW.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(MONITORINFO),
+                ]
+                user32.GetMonitorInfoW.restype = wintypes.BOOL
+                monitor = user32.MonitorFromWindow(
+                    self.win.winfo_id(), 2,
+                )
+                info = MONITORINFO()
+                info.cbSize = ctypes.sizeof(info)
+                if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                    work = info.rcWork
+                    return (
+                        work.left,
+                        work.top,
+                        work.right - work.left,
+                        work.bottom - work.top,
+                    )
+            except (AttributeError, OSError, tk.TclError):
+                pass
+        return (
+            self.win.winfo_vrootx(),
+            self.win.winfo_vrooty(),
+            self.win.winfo_vrootwidth(),
+            self.win.winfo_vrootheight(),
+        )
+
     def _begin_tool(self, tool_name: str, window_titles: tuple[str, ...]) -> bool:
         """OpenCV 도구는 프로세스에서 한 번에 하나만 실행한다."""
         if self._tool_running:
@@ -1358,7 +1464,10 @@ class SettingsDialog:
                 sys.argv = ["roi_selector", str(thermal), str(visual)]
             else:
                 sys.argv = ["roi_selector", str(thermal)]
-            roi_main(event_pump=self._pump_tool_events)
+            roi_main(
+                event_pump=self._pump_tool_events,
+                display_bounds=self._tool_display_bounds(),
+            )
             self.d.cfg = load_config(force_reload=True)
             self.d._add_operating_log("ROI 설정", "완료", f"{len(self.d.cfg.roi.rois)}개 영역 저장됨")
         except Exception as exc:
@@ -1385,7 +1494,10 @@ class SettingsDialog:
         try:
             from .calibration import run_calibration
             saved = bool(run_calibration(
-                str(thermal), str(visual), event_pump=self._pump_tool_events,
+                str(thermal),
+                str(visual),
+                event_pump=self._pump_tool_events,
+                display_bounds=self._tool_display_bounds(),
             ))
             if saved:
                 self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
