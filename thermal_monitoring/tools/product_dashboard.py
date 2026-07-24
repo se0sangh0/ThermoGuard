@@ -1077,15 +1077,9 @@ class ProductDashboard:
                                     f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
                                     else "정상 복귀")
 
-        # CRITICAL 알람 시에만 텔레그램 전송. result["alarm"]은 상태 머신이
-        # 판정한 CRITICAL 전이(+쿨다운) 신호이며, 같은 캡처는 한 번만 보낸다.
-        if (
-            result.get("alarm")
-            and quality_ok
-            and captured_at != self._last_telegram_capture
-        ):
-            self._last_telegram_capture = captured_at
-            self._dispatch_critical_telegram(result)
+        # CRITICAL 알람이면 텔레그램 전송을 시도하되, 보내지 않는 경우(품질·중복)도
+        # 로그로 남긴다 → "알람이 안 온다"를 로그만으로 진단할 수 있게 한다.
+        self._maybe_dispatch_telegram(result, quality_ok, captured_at)
 
         # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다. 한쪽씩
         # 갱신하면 캡처 저장 시차나 잘못된 파일 쌍 때문에 좌우 영상이
@@ -1307,6 +1301,32 @@ class ProductDashboard:
         tree.pack(side="left",fill="both",expand=True); scroll.pack(side="right",fill="y")
         for row in self.operating_logs:
             tree.insert("", "end", values=row)
+
+    def _maybe_dispatch_telegram(self, result: dict, quality_ok: bool, captured_at) -> None:
+        """CRITICAL 알람이면 텔레그램 전송을 시도하고, 보내지 않는 경우도 로그로 남긴다.
+
+        result["alarm"]은 상태 머신이 판정한 CRITICAL 전이(+쿨다운) 신호.
+        품질 미달·동일 캡처 중복이면 전송을 건너뛰되 '보류' 사유를 기록해,
+        'ALARM TRIGGERED는 떴는데 텔레그램이 왜 안 왔는지'를 로그로 추적할 수 있게 한다.
+        """
+        if not result.get("alarm"):
+            return
+        if not quality_ok:
+            self._add_operating_log(
+                "텔레그램 알림", "보류",
+                result.get("image_quality_reason", "영상 품질 미달로 미발송"),
+            )
+        elif captured_at == self._last_telegram_capture:
+            self._add_operating_log(
+                "텔레그램 알림", "보류", "동일 캡처 재분석 — 중복 발송 방지",
+            )
+        else:
+            self._last_telegram_capture = captured_at
+            self._add_operating_log(
+                "텔레그램 알림", "전송 시도",
+                f"{result.get('overall_max_roi_name', 'ROI')} · {result['max_temp']:.1f}°C",
+            )
+            self._dispatch_critical_telegram(result)
 
     def _dispatch_critical_telegram(self, result: dict):
         """CRITICAL 알람을 텔레그램으로 전송한다.
