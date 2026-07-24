@@ -111,9 +111,11 @@ class RoiTkDialog:
         self.win.resizable(True, True)
         self.win.transient(parent)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self.win.columnconfigure(0, weight=1)
+        self.win.rowconfigure(1, weight=1)
 
         header = ttk.Frame(self.win, padding=(12, 8))
-        header.pack(fill="x")
+        header.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             header,
             text="가시광 이미지에서 감시 영역을 지정하세요.",
@@ -123,15 +125,15 @@ class RoiTkDialog:
         self.status.pack(side="right")
 
         self.canvas = tk.Canvas(self.win, background="#0b1014", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=10)
+        self.canvas.grid(row=1, column=0, sticky="nsew", padx=10)
         self.canvas.bind("<Configure>", self._schedule_redraw)
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
 
         toolbar = ttk.Frame(self.win, padding=10)
-        toolbar.pack(fill="x")
-        for text, command in (
+        toolbar.grid(row=2, column=0, sticky="ew")
+        for column, (text, command) in enumerate((
             ("New", self.add),
             ("Next", self.next),
             ("Del", self.delete),
@@ -139,9 +141,10 @@ class RoiTkDialog:
             ("Reset", self.reset),
             ("Save", self.save),
             ("Quit", self.close),
-        ):
-            ttk.Button(toolbar, text=text, command=command).pack(
-                side="left", expand=True, padx=3,
+        )):
+            toolbar.columnconfigure(column, weight=1)
+            ttk.Button(toolbar, text=text, command=command).grid(
+                row=0, column=column, sticky="ew", padx=3,
             )
 
         for key, command in (
@@ -386,9 +389,11 @@ class CalibrationTkDialog:
         self.win.resizable(True, True)
         self.win.transient(parent)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
+        self.win.columnconfigure(0, weight=1)
+        self.win.rowconfigure(1, weight=1)
 
         header = ttk.Frame(self.win, padding=(12, 8))
-        header.pack(fill="x")
+        header.grid(row=0, column=0, sticky="ew")
         ttk.Label(
             header,
             text="왼쪽 가시광과 오른쪽 열화상에서 같은 위치를 번갈아 선택하세요.",
@@ -398,20 +403,21 @@ class CalibrationTkDialog:
         self.status.pack(side="right")
 
         self.canvas = tk.Canvas(self.win, background="#0b1014", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=10)
+        self.canvas.grid(row=1, column=0, sticky="nsew", padx=10)
         self.canvas.bind("<Configure>", self._schedule_redraw)
         self.canvas.bind("<Button-1>", self._click)
 
         toolbar = ttk.Frame(self.win, padding=10)
-        toolbar.pack(fill="x")
-        for text, command in (
+        toolbar.grid(row=2, column=0, sticky="ew")
+        for column, (text, command) in enumerate((
             ("Save", self.save),
             ("Undo", self.undo),
             ("Reset", self.reset),
             ("Quit", self.close),
-        ):
-            ttk.Button(toolbar, text=text, command=command).pack(
-                side="left", expand=True, padx=4,
+        )):
+            toolbar.columnconfigure(column, weight=1)
+            ttk.Button(toolbar, text=text, command=command).grid(
+                row=0, column=column, sticky="ew", padx=4,
             )
         for key, command in (
             ("<Key-s>", self.save),
