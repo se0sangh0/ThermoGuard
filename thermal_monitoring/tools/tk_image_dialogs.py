@@ -385,18 +385,36 @@ class RoiTkDialog:
             ).reshape(2, 2)
             tx1, ty1 = thermal[0]
             tx2, ty2 = thermal[1]
+            x1 = max(0, min(int(round(min(tx1, tx2))), 639))
+            y1 = max(0, min(int(round(min(ty1, ty2))), 479))
+            x2 = max(0, min(int(round(max(tx1, tx2))), 639))
+            y2 = max(0, min(int(round(max(ty1, ty2))), 479))
+            if x1 >= x2 or y1 >= y2:
+                messagebox.showwarning(
+                    "ROI 설정",
+                    f"'{roi['name']}' 영역이 유효하지 않습니다.\n"
+                    f"좌표: ({x1},{y1})-({x2},{y2})\n"
+                    "ROI 박스가 너무 작거나 화면 밖으로 벗어났습니다.",
+                    parent=self.win,
+                )
+                return
             entries.append(RoiEntry(
                 name=roi["name"],
-                x1=max(0, min(int(round(min(tx1, tx2))), 639)),
-                y1=max(0, min(int(round(min(ty1, ty2))), 479)),
-                x2=max(0, min(int(round(max(tx1, tx2))), 639)),
-                y2=max(0, min(int(round(max(ty1, ty2))), 479)),
+                x1=x1, y1=y1, x2=x2, y2=y2,
             ))
         self.cfg.roi.rois = entries
         first = entries[0]
         self.cfg.roi.x1, self.cfg.roi.y1 = first.x1, first.y1
         self.cfg.roi.x2, self.cfg.roi.y2 = first.x2, first.y2
-        save_config(self.cfg)
+        try:
+            save_config(self.cfg)
+        except Exception as exc:
+            messagebox.showerror(
+                "ROI 저장 실패",
+                f"config.json 저장 중 오류가 발생했습니다.\n{exc}",
+                parent=self.win,
+            )
+            return
         self.result = True
         self.close()
 
