@@ -1105,9 +1105,15 @@ class ProductDashboard:
                                     f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
                                     else "정상 복귀")
 
-        # CRITICAL 알람이면 텔레그램 전송을 시도하되, 보내지 않는 경우(품질·중복)도
-        # 로그로 남긴다 → "알람이 안 온다"를 로그만으로 진단할 수 있게 한다.
-        self._maybe_dispatch_telegram(result, quality_ok, captured_at)
+        # 경고 상태 진입 또는 CRITICAL 알람이면 Telegram 전송을 시도한다.
+        # 동일 캡처·품질 미달·비활성화 상태도 운영 로그에 사유를 남긴다.
+        warning_transition = status == Status.WARNING and previous != Status.WARNING
+        self._maybe_dispatch_telegram(
+            result,
+            quality_ok,
+            captured_at,
+            warning_transition=warning_transition,
+        )
 
         # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다. 한쪽씩
         # 갱신하면 캡처 저장 시차나 잘못된 파일 쌍 때문에 좌우 영상이
@@ -1334,14 +1340,34 @@ class ProductDashboard:
         for row in self.operating_logs:
             tree.insert("", "end", values=row)
 
-    def _maybe_dispatch_telegram(self, result: dict, quality_ok: bool, captured_at) -> None:
-        """CRITICAL 알람이면 텔레그램 전송을 시도하고, 보내지 않는 경우도 로그로 남긴다.
+    def _maybe_dispatch_telegram(
+        self,
+        result: dict,
+        quality_ok: bool,
+        captured_at,
+        *,
+        warning_transition: bool = False,
+    ) -> None:
+        """경고 진입/위험 알람을 전송하고 보내지 않는 경우도 로그로 남긴다.
 
-        result["alarm"]은 상태 머신이 판정한 CRITICAL 전이(+쿨다운) 신호.
+        result["alarm"]은 상태 머신이 판정한 CRITICAL 전이(+쿨다운) 신호이며,
+        Warning은 최초 상태 전이 시 한 번만 전송한다.
         품질 미달·동일 캡처 중복이면 전송을 건너뛰되 '보류' 사유를 기록해,
         'ALARM TRIGGERED는 떴는데 텔레그램이 왜 안 왔는지'를 로그로 추적할 수 있게 한다.
         """
-        if not result.get("alarm"):
+        if not result.get("alarm") and not warning_transition:
+            return
+        from ..analysis import notifier
+        settings = notifier.get_settings()
+        if not settings["configured"]:
+            self._add_operating_log(
+                "텔레그램 알림", "보류", "미로그인 — 환경설정에서 Telegram에 로그인하세요",
+            )
+            return
+        elif not settings["enabled"]:
+            self._add_operating_log(
+                "텔레그램 알림", "보류", "알림 전송 비활성화",
+            )
             return
         if not quality_ok:
             self._add_operating_log(
@@ -1358,10 +1384,10 @@ class ProductDashboard:
                 "텔레그램 알림", "전송 시도",
                 f"{result.get('overall_max_roi_name', 'ROI')} · {result['max_temp']:.1f}°C",
             )
-            self._dispatch_critical_telegram(result)
+            self._dispatch_telegram(result)
 
-    def _dispatch_critical_telegram(self, result: dict):
-        """CRITICAL 알람을 텔레그램으로 전송한다.
+    def _dispatch_telegram(self, result: dict):
+        """경고 또는 위험 알람을 텔레그램으로 전송한다.
 
         send_alarm은 최대 수십 초 블로킹되는 HTTP 호출이므로 Tk 메인 스레드가
         아닌 데몬 스레드에서 실행하고, 결과 로그만 root.after로 메인 스레드에
@@ -1372,6 +1398,8 @@ class ProductDashboard:
         overlay = result.get("overlay")
         base = str(result.get("base", "")) or "latest"
         robot_id = self.cfg.identity.robot_id
+        status = result.get("status", Status.CRITICAL)
+        status_value = status.value if isinstance(status, Status) else str(status)
 
         def _log(kind: str, detail: str):
             if self.lifecycle == "running":
@@ -1394,7 +1422,7 @@ class ProductDashboard:
                 ok = send_alarm(
                     image_path=image_path,
                     temp=temp,
-                    status=Status.CRITICAL.value,
+                    status=status_value,
                     robot_id=robot_id,
                 )
                 _log("전송 성공" if ok else "전송 실패",
@@ -1459,8 +1487,14 @@ class SettingsDialog:
         self._calibration_running = False
         self._tool_running: Optional[str] = None
         notebook = ttk.Notebook(self.win); notebook.pack(fill="both", expand=True, padx=14, pady=14)
-        general = ttk.Frame(notebook, padding=16); roi = ttk.Frame(notebook, padding=16); advanced = ttk.Frame(notebook, padding=16)
-        notebook.add(general, text="일반"); notebook.add(roi, text="감시 영역"); notebook.add(advanced, text="고급 설정")
+        general = ttk.Frame(notebook, padding=16)
+        roi = ttk.Frame(notebook, padding=16)
+        advanced = ttk.Frame(notebook, padding=16)
+        notifications = ttk.Frame(notebook, padding=16)
+        notebook.add(general, text="일반")
+        notebook.add(roi, text="감시 영역")
+        notebook.add(advanced, text="고급 설정")
+        notebook.add(notifications, text="알림 전송 설정")
         self.ip = tk.StringVar(value=self.d.cfg.camera.ip)
         self.dataset_dir = tk.StringVar(value=self.d.cfg.paths.dataset_dir)
         self.baseline = tk.StringVar(value=str(self.d.cfg.roi.baseline_temp))
@@ -1481,9 +1515,197 @@ class SettingsDialog:
         self._field(advanced, "정상 기준 온도(°C)", self.baseline, 0)
         self._field(advanced, "경고 상승폭(°C)", self.warning, 1)
         self._field(advanced, "위험 상승폭(°C)", self.critical, 2)
+        self._build_notification_settings(notifications)
         buttons = ttk.Frame(self.win); buttons.pack(fill="x", padx=14, pady=(0,14))
         ttk.Button(buttons, text="취소", command=self.close).pack(side="right", padx=4)
         ttk.Button(buttons, text="저장", style="Action.TButton", command=self.save).pack(side="right", padx=4)
+
+    def _build_notification_settings(self, parent):
+        from ..analysis import notifier
+
+        settings = notifier.get_settings()
+        self._notification_login_running = False
+        self.telegram_token = tk.StringVar(value=settings["bot_token"])
+        self.telegram_chat_id = tk.StringVar(value=settings["chat_id"])
+
+        ttk.Label(
+            parent,
+            text="Telegram 알림 연결",
+            font=("맑은 고딕", 13, "bold"),
+        ).pack(anchor="w", pady=(0, 5))
+        ttk.Label(
+            parent,
+            text="Bot Token과 Chat ID는 이 PC의 .env에만 저장되며 Git에는 업로드되지 않습니다.",
+            foreground="#59636d",
+        ).pack(anchor="w", pady=(0, 16))
+
+        form = ttk.LabelFrame(parent, text="로그인 정보", padding=14)
+        form.pack(fill="x")
+        ttk.Label(form, text="Bot Token", width=14).grid(
+            row=0, column=0, sticky="w", padx=(0, 10), pady=8,
+        )
+        self.telegram_token_entry = ttk.Entry(
+            form,
+            textvariable=self.telegram_token,
+            show="●",
+        )
+        self.telegram_token_entry.grid(row=0, column=1, sticky="ew", pady=8)
+        ttk.Label(form, text="Chat ID", width=14).grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=8,
+        )
+        ttk.Entry(form, textvariable=self.telegram_chat_id).grid(
+            row=1, column=1, sticky="ew", pady=8,
+        )
+        form.columnconfigure(1, weight=1)
+
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x", pady=14)
+        self.telegram_login_button = ttk.Button(
+            controls,
+            text="로그인",
+            style="Action.TButton",
+            command=self._login_telegram,
+        )
+        self.telegram_login_button.pack(side="left", padx=(0, 6))
+        self.telegram_logout_button = ttk.Button(
+            controls,
+            text="로그아웃",
+            command=self._logout_telegram,
+        )
+        self.telegram_logout_button.pack(side="left")
+
+        state_box = ttk.LabelFrame(parent, text="알림 전송", padding=14)
+        state_box.pack(fill="x")
+        self.telegram_status_label = ttk.Label(
+            state_box,
+            font=("맑은 고딕", 11, "bold"),
+        )
+        self.telegram_status_label.pack(anchor="w", pady=(0, 10))
+        self.telegram_toggle_button = tk.Button(
+            state_box,
+            command=self._toggle_telegram_delivery,
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=9,
+            cursor="hand2",
+            font=("맑은 고딕", 10, "bold"),
+        )
+        self.telegram_toggle_button.pack(anchor="w")
+        ttk.Label(
+            state_box,
+            text="비활성화하면 로그인 정보는 유지하고 자동 알림 전송만 중단합니다.",
+            foreground="#59636d",
+        ).pack(anchor="w", pady=(10, 0))
+        self._refresh_telegram_controls()
+
+    def _refresh_telegram_controls(self):
+        from ..analysis import notifier
+
+        settings = notifier.get_settings()
+        configured = settings["configured"]
+        enabled = settings["enabled"] and configured
+        if not configured:
+            status_text, status_color = "● 미로그인", COLORS["red"]
+        elif enabled:
+            status_text, status_color = "● 연결됨 · 알림 전송 활성화", COLORS["green"]
+        else:
+            status_text, status_color = "● 연결됨 · 알림 전송 비활성화", COLORS["orange"]
+        self.telegram_status_label.configure(text=status_text, foreground=status_color)
+        self.telegram_toggle_button.configure(
+            text="알림 전송 비활성화" if enabled else "알림 전송 활성화",
+            bg=COLORS["green"] if enabled else "#c9ced3",
+            fg="white" if enabled else "#20252a",
+            activebackground=COLORS["green"] if enabled else "#b8bec4",
+            activeforeground="white" if enabled else "#20252a",
+            state="normal" if configured else "disabled",
+        )
+        self.telegram_logout_button.configure(
+            state="normal" if configured else "disabled",
+        )
+
+    def _login_telegram(self):
+        if self._notification_login_running:
+            return
+        token = self.telegram_token.get().strip()
+        chat_id = self.telegram_chat_id.get().strip()
+        if not token or not chat_id:
+            messagebox.showwarning(
+                "Telegram 로그인",
+                "Bot Token과 Chat ID를 모두 입력하세요.",
+                parent=self.win,
+            )
+            return
+
+        self._notification_login_running = True
+        self.telegram_login_button.configure(text="연결 확인 중...", state="disabled")
+        self.telegram_status_label.configure(
+            text="● Telegram 연결 확인 중",
+            foreground=COLORS["orange"],
+        )
+
+        def work():
+            from ..analysis import notifier
+            result = notifier.test_connection(token, chat_id)
+            if self.win.winfo_exists():
+                self.win.after(0, lambda: self._finish_telegram_login(token, chat_id, result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_telegram_login(self, token, chat_id, result):
+        from ..analysis import notifier
+
+        self._notification_login_running = False
+        self.telegram_login_button.configure(text="로그인", state="normal")
+        connected, detail = result
+        if connected:
+            notifier.configure(token, chat_id, enabled=False, persist=True)
+            self.d._add_operating_log("Telegram", "로그인 성공", detail)
+            self._refresh_telegram_controls()
+            messagebox.showinfo(
+                "Telegram 로그인",
+                f"{detail}\n\n알림 전송 버튼을 활성화하면 경고·위험 알림을 받을 수 있습니다.",
+                parent=self.win,
+            )
+        else:
+            self.telegram_status_label.configure(
+                text="● 연결 실패",
+                foreground=COLORS["red"],
+            )
+            self.d._add_operating_log("Telegram", "로그인 실패", detail)
+            messagebox.showerror("Telegram 로그인 실패", detail, parent=self.win)
+
+    def _logout_telegram(self):
+        from ..analysis import notifier
+
+        if not messagebox.askyesno(
+            "Telegram 로그아웃",
+            "저장된 Bot Token과 Chat ID를 이 PC에서 삭제하시겠습니까?",
+            parent=self.win,
+        ):
+            return
+        notifier.logout(persist=True)
+        self.telegram_token.set("")
+        self.telegram_chat_id.set("")
+        self.d._add_operating_log("Telegram", "로그아웃", "로컬 로그인 정보 삭제")
+        self._refresh_telegram_controls()
+
+    def _toggle_telegram_delivery(self):
+        from ..analysis import notifier
+
+        settings = notifier.get_settings()
+        try:
+            notifier.set_enabled(not settings["enabled"], persist=True)
+        except RuntimeError as exc:
+            messagebox.showwarning("알림 전송 설정", str(exc), parent=self.win)
+            return
+        updated = notifier.get_settings()["enabled"]
+        self.d._add_operating_log(
+            "Telegram",
+            "알림 활성화" if updated else "알림 비활성화",
+            "자동 경고·위험 알림 전송",
+        )
+        self._refresh_telegram_controls()
 
     def close(self):
         if self._tool_running:
