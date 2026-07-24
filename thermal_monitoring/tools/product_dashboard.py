@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
-import numpy as np
 import requests
 import tkinter as tk
 from PIL import Image, ImageTk
@@ -33,8 +32,8 @@ from ..analysis.threshold import (
     evaluate_rois_with_state,
     apply_roi_state_updates,
 )
-from ..capture.capture import CaptureSession
-from ..capture.thermal_utils import extract_from_jpeg
+from ..capture.capture import CaptureSession, camera_image_url
+from ..data import pairs
 from ..config import load_config, save_config
 from ..logger import get_logger
 
@@ -106,7 +105,8 @@ class ProductDashboard:
         self.state = MonitorState()
         self.metrics = RuntimeMetrics()
         self.latest_result: Optional[RoiResult] = None
-        self.latest_status = Status.NORMAL
+        self.latest_status = Status.NORMAL          # 표시용(raw) 이전 상태
+        self._last_alarm_status = Status.NORMAL     # 알람 판정용(API) 이전 상태
         self.last_update: Optional[datetime] = None
         self.visual_photo = None
         self.thermal_photo = None
@@ -620,7 +620,7 @@ class ProductDashboard:
         def work():
             result = {"ok": False, "status_code": None, "error_kind": None}
             try:
-                response = requests.get(f"http://{self.cfg.camera.ip}/api/image/current?imgformat=JPEG", timeout=5)
+                response = requests.get(camera_image_url(self.cfg.camera.ip), timeout=5)
                 result["status_code"] = response.status_code
                 result["ok"] = response.status_code == 200
                 if not result["ok"]:
@@ -835,9 +835,7 @@ class ProductDashboard:
 
             thermal = Path(thermal_path)
             visual = Path(visual_path) if visual_path else None
-            npy = thermal.with_name(f"{thermal.stem}_thermal.npy")
-            matrix, _ = extract_from_jpeg(str(thermal))
-            np.save(npy, matrix)
+            npy = pairs.ensure_npy(thermal)
             pair = (thermal.stem, thermal, visual, npy)
             result = self._process_pair_to_dict(pair)
             self.root.after(0, lambda: self._apply_capture_refresh_result(result))
@@ -907,14 +905,7 @@ class ProductDashboard:
 
     def _latest_pair(self):
         """Return the newest thermal, visual and NPY paths for analysis."""
-        dataset = Path(self.cfg.paths.dataset_dir)
-        if not dataset.exists():
-            return None
-
-        thermal_files = sorted(
-            path for path in dataset.glob("*.jpg")
-            if "_visual" not in path.name
-        )
+        thermal_files = pairs.thermal_jpgs(self.cfg.paths.dataset_dir)
         if not thermal_files:
             return None
 
@@ -924,29 +915,21 @@ class ProductDashboard:
         # 전달해 정상률과 운영 로그에 즉시 반영한다.
         if self.cfg.tools.mode == "both":
             newest = thermal_files[-1]
-            newest_visual = dataset / f"{newest.stem}_visual.jpg"
             newest_age = max(0.0, time.time() - newest.stat().st_mtime)
-            if newest_visual.exists() or newest_age >= 5.0:
+            if pairs.visual_for(newest).exists() or newest_age >= 5.0:
                 thermal = newest
             else:
                 thermal = next(
-                    (
-                        path for path in reversed(thermal_files[:-1])
-                        if (dataset / f"{path.stem}_visual.jpg").exists()
-                    ),
+                    (t for t in reversed(thermal_files[:-1]) if pairs.visual_for(t).exists()),
                     None,
                 )
             if thermal is None:
                 return None
         else:
             thermal = thermal_files[-1]
-        base = thermal.stem
-        visual = dataset / f"{base}_visual.jpg"
-        npy = dataset / f"{base}_thermal.npy"
-        if not npy.exists():
-            matrix, _ = extract_from_jpeg(str(thermal))
-            np.save(npy, matrix)
-        return base, thermal, visual if visual.exists() else None, npy
+        visual = pairs.visual_for(thermal)
+        npy = pairs.ensure_npy(thermal)
+        return thermal.stem, thermal, visual if visual.exists() else None, npy
 
     def _process_pair_to_dict(self, pair) -> dict:
         base, thermal, visual, npy = pair
@@ -969,10 +952,14 @@ class ProductDashboard:
             critical_delta=roi_cfg.critical_delta,
             state=self.state,
         )
-        status = worst["status"]
+        # 알람 판정용 상태: 클러스터 게이트·히스테리시스를 반영한 API 결과.
+        # 텔레그램/경고 전이는 이 값을 쓴다(표시용 status와 분리).
+        alarm_status = worst["status"]
         roi_result = worst["roi"]
         overall_max_roi = max(roi_results, key=lambda rr: rr.max_temp)
         overall_max_temp = float(overall_max_roi.max_temp)
+        # 화면 표시용 상태: raw 최대온도 기준(클러스터 무시). 작은 핫스팟도
+        # 온도가 높으면 위험/경고로 표시하되, 실제 알람은 alarm_status로 판단.
         warning_temp = roi_cfg.baseline_temp + roi_cfg.warning_delta
         critical_temp = roi_cfg.baseline_temp + roi_cfg.critical_delta
         if overall_max_temp >= critical_temp:
@@ -1005,7 +992,7 @@ class ProductDashboard:
             "max_temp": roi_result.max_temp, "mean_temp": roi_result.mean_temp,
             "hot_temp_95": roi_result.hot_temp_95,
             "hotspot_count": len(roi_result.hotspot_centroids),
-            "status": status, "alarm": alarm,
+            "status": status, "alarm_status": alarm_status, "alarm": alarm,
             "overall_max_temp": overall_max_temp,
             "overall_max_roi_name": overall_max_roi.roi_name or "ROI-01",
             "roi_bounds": roi_result.roi_bounds,
@@ -1106,8 +1093,14 @@ class ProductDashboard:
                                     else "정상 복귀")
 
         # 경고 상태 진입 또는 CRITICAL 알람이면 Telegram 전송을 시도한다.
+        # 경고 전이는 '표시용 status(raw)'가 아니라 알람 판정 상태(API,
+        # 클러스터 게이트 반영)를 기준으로 잡아, 표시와 알람을 분리한다.
         # 동일 캡처·품질 미달·비활성화 상태도 운영 로그에 사유를 남긴다.
-        warning_transition = status == Status.WARNING and previous != Status.WARNING
+        alarm_status = result.get("alarm_status", status)
+        warning_transition = (
+            alarm_status == Status.WARNING and self._last_alarm_status != Status.WARNING
+        )
+        self._last_alarm_status = alarm_status
         self._maybe_dispatch_telegram(
             result,
             quality_ok,
@@ -1776,16 +1769,8 @@ class SettingsDialog:
 
     @staticmethod
     def _latest_complete_image_pair(dataset: Path):
-        """가장 최신의 Thermal/Visual 완성 쌍을 반환한다."""
-        thermal_files = sorted(
-            path for path in dataset.glob("*.jpg")
-            if "_visual" not in path.name
-        )
-        for thermal in reversed(thermal_files):
-            visual = dataset / f"{thermal.stem}_visual.jpg"
-            if visual.exists():
-                return thermal, visual
-        return None
+        """가장 최신의 Thermal/Visual 완성 쌍을 반환한다 (공용 pairs 모듈 위임)."""
+        return pairs.latest_complete_pair(dataset)
 
     def open_roi_editor(self):
         dataset = Path(self.d.cfg.paths.dataset_dir)

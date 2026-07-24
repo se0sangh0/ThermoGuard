@@ -29,6 +29,12 @@ from .thermal_utils import probe_thermal_from_url
 
 _log = get_logger("capture")
 
+
+def camera_image_url(cam_ip: str, *, visual: bool = False) -> str:
+    """FLIR A50 현재 이미지 엔드포인트 URL. thermal/visual 공용 (URL 중복 제거)."""
+    fmt = "JPEG_visual" if visual else "JPEG"
+    return f"http://{cam_ip}/api/image/current?imgformat={fmt}"
+
 # 카메라 REST API의 일시적 오류(서버 busy·동시 요청 등) → 짧은 백오프로 재시도.
 _TRANSIENT_STATUSES = frozenset({502, 503, 504, 429})
 _MAX_TRANSIENT_RETRIES = 2               # 최초 1회 + 추가 재시도 2회
@@ -66,8 +72,8 @@ class CaptureSession:
         self._last_pair_lock = threading.Lock()
         # GUI-UPDATE: cam_ip 인자가 None이어도 config에서 확정된 self.cam_ip를 사용한다.
         self._urls = {
-            "thermal": f"http://{self.cam_ip}/api/image/current?imgformat=JPEG",
-            "visual": f"http://{self.cam_ip}/api/image/current?imgformat=JPEG_visual",
+            "thermal": camera_image_url(self.cam_ip),
+            "visual": camera_image_url(self.cam_ip, visual=True),
         }
         _log.info("CaptureSession initialized: ip=%s mode=%s interval=%.1fs save_dir=%s",
                   self.cam_ip, self.mode, self.interval, self.save_dir)
