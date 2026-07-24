@@ -80,6 +80,9 @@ _BUTTONS = [
 # 런타임에 계산됨
 _button_rects: list[tuple[int, int, int, int]] = []  # (x1, y1, x2, y2)
 _canvas_h = 0  # 전체 캔버스 높이 (이미지 + 버튼 바)
+_canvas_w = 0
+_image_x_offset = 0
+_display_image_h = 0
 
 
 # ───────────────────────────────────────────────────────────────
@@ -259,7 +262,10 @@ def mouse_callback(event, x, y, flags, param):
         return
 
     # 이미지 영역: ROI 드래그
-    ox = int(x * scale)
+    image_x = x - _image_x_offset
+    if image_x < 0 or image_x >= _canvas_w - (2 * _image_x_offset) or y >= _display_image_h:
+        return
+    ox = int(image_x * scale)
     oy = int(y * scale)
 
     if event == cv2.EVENT_LBUTTONDOWN:
@@ -374,7 +380,7 @@ def _get_color(idx: int) -> tuple:
 def main(event_pump=None, display_bounds=None):
     global scale, selected_idx, rois, roi_start, roi_end, dragging
     global H_inv, use_visual, _running, _quit_flag, _save_flag
-    global _canvas_h
+    global _canvas_h, _canvas_w, _image_x_offset, _display_image_h
 
     # ── 인자 파싱 ──
     thermal_path: str | None = None
@@ -433,20 +439,29 @@ def main(event_pump=None, display_bounds=None):
         print(f"  Loaded {count} existing ROI(s): {[r['name'] for r in rois]}")
 
     screen_x, screen_y, screen_w, screen_h = display_bounds or (0, 0, 1920, 1080)
-    max_width = max(240, screen_w - 48)
+    # 캘리브레이션 통합 창과 동일한 전체 폭을 사용한다.
+    panel_width = max(240, min(DISPLAY_WIDTH // 2, (screen_w - 48) // 2))
+    max_width = panel_width
     max_image_height = max(180, screen_h - BUTTON_BAR_HEIGHT - 96)
     aspect_width = int(max_image_height * img.shape[1] / img.shape[0])
-    display_width = max(240, min(DISPLAY_WIDTH, max_width, aspect_width))
+    display_width = max(240, min(max_width, aspect_width))
     img_disp = resize_for_display(img, display_width)
     scale = img.shape[1] / img_disp.shape[1]
 
-    # 캔버스 = 이미지 + 버튼 바
+    # 캔버스 전체 크기는 캘리브레이션 창과 같고, 가시광 이미지는 중앙 배치한다.
+    _canvas_w = display_width * 2
+    _image_x_offset = (_canvas_w - img_disp.shape[1]) // 2
+    _display_image_h = img_disp.shape[0]
     _canvas_h = img_disp.shape[0] + BUTTON_BAR_HEIGHT
-    _compute_button_rects(img_disp.shape[1])
+    _compute_button_rects(_canvas_w)
 
     wintitle = "ROI Selector - Visual (H)"
     cv2.namedWindow(wintitle, cv2.WINDOW_AUTOSIZE)
-    cv2.moveWindow(wintitle, screen_x + 16, screen_y + 40)
+    cv2.moveWindow(
+        wintitle,
+        screen_x + max(16, (screen_w - _canvas_w) // 2),
+        screen_y + 40,
+    )
     try:
         cv2.setWindowProperty(wintitle, cv2.WND_PROP_TOPMOST, 1)
     except cv2.error:
@@ -470,16 +485,19 @@ def main(event_pump=None, display_bounds=None):
                 break
 
         # 버튼 바 포함한 전체 캔버스
-        disp = np.zeros((_canvas_h, img_disp.shape[1], 3), dtype=np.uint8)
-        disp[0:img_disp.shape[0], 0:img_disp.shape[1]] = img_disp
+        disp = np.zeros((_canvas_h, _canvas_w, 3), dtype=np.uint8)
+        disp[
+            0:img_disp.shape[0],
+            _image_x_offset:_image_x_offset + img_disp.shape[1],
+        ] = img_disp
 
         # 모든 ROI 박스 그리기
         for i, r in enumerate(rois):
             color = _get_color(i)
             thickness = 3 if i == selected_idx else 1
-            dx1 = int(r["x1"] / scale)
+            dx1 = _image_x_offset + int(r["x1"] / scale)
             dy1 = int(r["y1"] / scale)
-            dx2 = int(r["x2"] / scale)
+            dx2 = _image_x_offset + int(r["x2"] / scale)
             dy2 = int(r["y2"] / scale)
             cv2.rectangle(disp, (dx1, dy1), (dx2, dy2), color, thickness)
             label = f"{r['name']} {'◀' if i == selected_idx else ''}"
@@ -489,9 +507,9 @@ def main(event_pump=None, display_bounds=None):
         box = get_roi_box()
         if box:
             x1, y1, x2, y2 = box
-            dx1 = int(x1 / scale)
+            dx1 = _image_x_offset + int(x1 / scale)
             dy1 = int(y1 / scale)
-            dx2 = int(x2 / scale)
+            dx2 = _image_x_offset + int(x2 / scale)
             dy2 = int(y2 / scale)
             color = _get_color(selected_idx) if 0 <= selected_idx < len(rois) else _get_color(len(rois))
             cv2.rectangle(disp, (dx1, dy1), (dx2, dy2), color, 2)
@@ -503,7 +521,10 @@ def main(event_pump=None, display_bounds=None):
         mode_text = "Visual mode (H→thermal)"
         sel_name = rois[selected_idx]["name"] if 0 <= selected_idx < len(rois) else "(none)"
         status = f"{mode_text} | Selected: {sel_name} | ROIs: {len(rois)}"
-        cv2.putText(disp, status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+        cv2.putText(
+            disp, status, (_image_x_offset + 10, 20),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1,
+        )
 
         # 버튼 바 그리기
         _draw_button_bar(disp)
