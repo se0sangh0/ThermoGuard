@@ -157,6 +157,28 @@ class ProductDashboard:
                         foreground=COLORS["text"])
         style.configure("Treeview.Heading", font=("맑은 고딕", 10, "bold"))
         style.configure("Action.TButton", font=("맑은 고딕", 10, "bold"), padding=8)
+        style.configure(
+            "Active.Action.TButton",
+            font=("맑은 고딕", 10, "bold"),
+            padding=8,
+            background=COLORS["blue"],
+            foreground="white",
+        )
+        style.map(
+            "Active.Action.TButton",
+            background=[("active", COLORS["blue"]), ("pressed", COLORS["blue"])],
+            foreground=[("active", "white"), ("pressed", "white")],
+        )
+        style.configure(
+            "Active.TButton",
+            background=COLORS["blue"],
+            foreground="white",
+        )
+        style.map(
+            "Active.TButton",
+            background=[("active", COLORS["blue"]), ("pressed", COLORS["blue"])],
+            foreground=[("active", "white"), ("pressed", "white")],
+        )
         style.configure("Side.TButton", font=("맑은 고딕", 11, "bold"), padding=11)
 
     def _build_ui(self):
@@ -236,10 +258,16 @@ class ProductDashboard:
         self.refresh_button = ttk.Button(controls, text="↻  새로고침", style="Action.TButton",
                                          command=self.capture_and_refresh)
         self.refresh_button.pack(side="left", padx=3)
-        ttk.Button(controls, text="▤  운영 로그", style="Action.TButton",
-                   command=self.open_operating_log).pack(side="left", padx=3)
-        ttk.Button(controls, text="⚙  환경설정", style="Action.TButton",
-                   command=self.open_settings).pack(side="left", padx=3)
+        self.operating_log_button = ttk.Button(
+            controls, text="▤  운영 로그", style="Action.TButton",
+            command=self.open_operating_log,
+        )
+        self.operating_log_button.pack(side="left", padx=3)
+        self.settings_button = ttk.Button(
+            controls, text="⚙  환경설정", style="Action.TButton",
+            command=self.open_settings,
+        )
+        self.settings_button.pack(side="left", padx=3)
 
     def _build_alert_panel(self, parent):
         panel = tk.Frame(parent, bg=COLORS["panel"],
@@ -1253,6 +1281,7 @@ class ProductDashboard:
         if self.operating_log_window:
             try:
                 if self.operating_log_window.winfo_exists():
+                    self.operating_log_button.configure(style="Active.Action.TButton")
                     self.operating_log_window.deiconify()
                     self.operating_log_window.lift()
                     self.operating_log_window.focus_force()
@@ -1266,6 +1295,7 @@ class ProductDashboard:
             existing = self.root.nametowidget(".operating_log")
             if existing.winfo_exists():
                 self.operating_log_window = existing
+                self.operating_log_button.configure(style="Active.Action.TButton")
                 existing.deiconify()
                 existing.lift()
                 existing.focus_force()
@@ -1278,11 +1308,13 @@ class ProductDashboard:
             win = tk.Toplevel(self.root, name="operating_log")
             win.title("운영 로그"); win.geometry("920x520"); win.transient(self.root)
             self.operating_log_window = win
+            self.operating_log_button.configure(style="Active.Action.TButton")
         finally:
             self._operating_log_opening = False
 
         def close_log_window():
             self.operating_log_window = None
+            self.operating_log_button.configure(style="Action.TButton")
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", close_log_window)
@@ -1391,6 +1423,7 @@ class ProductDashboard:
         if self.settings_dialog:
             try:
                 if self.settings_dialog.win.winfo_exists():
+                    self.settings_button.configure(style="Active.Action.TButton")
                     self.settings_dialog.win.deiconify()
                     self.settings_dialog.win.lift()
                     self.settings_dialog.win.focus_force()
@@ -1399,6 +1432,7 @@ class ProductDashboard:
                 pass
             self.settings_dialog = None
         self.settings_dialog = SettingsDialog(self)
+        self.settings_button.configure(style="Active.Action.TButton")
 
     def on_close(self):
         if self.lifecycle != "running": return
@@ -1455,6 +1489,7 @@ class SettingsDialog:
         if self._tool_running:
             return
         self.d.settings_dialog = None
+        self.d.settings_button.configure(style="Action.TButton")
         if self.win.winfo_exists():
             self.win.destroy()
 
@@ -1473,6 +1508,13 @@ class SettingsDialog:
         self._tool_running = tool_name
         self._roi_editor_running = tool_name == "ROI 설정"
         self._calibration_running = tool_name == "캘리브레이션"
+        self.roi_button.configure(
+            style="Active.TButton" if self._roi_editor_running else "TButton"
+        )
+        self.calibration_button.configure(
+            style="Active.TButton" if self._calibration_running else "TButton"
+        )
+        self.win.update_idletasks()
         self.win.grab_release()
         return True
 
@@ -1480,6 +1522,8 @@ class SettingsDialog:
         self._tool_running = None
         self._roi_editor_running = False
         self._calibration_running = False
+        self.roi_button.configure(style="TButton")
+        self.calibration_button.configure(style="TButton")
         if self.win.winfo_exists():
             self.win.grab_set()
 
