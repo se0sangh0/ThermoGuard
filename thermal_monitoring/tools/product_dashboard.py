@@ -118,6 +118,7 @@ class ProductDashboard:
         self.temperature_history: list[tuple[datetime, float]] = []
         self._last_history_capture: Optional[datetime] = None
         self._last_alert_capture: Optional[datetime] = None
+        self._last_telegram_capture: Optional[datetime] = None
         self._trend_hover_points: list[tuple[float, float, datetime, float]] = []
         # 최근 화면 품질을 기준으로 정상률을 계산한다. 누적 전체 기준보다
         # 현재 발생한 영상 이상이 즉시 수치에 반영된다.
@@ -1023,6 +1024,16 @@ class ProductDashboard:
                                     f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
                                     else "정상 복귀")
 
+        # CRITICAL 알람 시에만 텔레그램 전송. result["alarm"]은 상태 머신이
+        # 판정한 CRITICAL 전이(+쿨다운) 신호이며, 같은 캡처는 한 번만 보낸다.
+        if (
+            result.get("alarm")
+            and quality_ok
+            and captured_at != self._last_telegram_capture
+        ):
+            self._last_telegram_capture = captured_at
+            self._dispatch_critical_telegram(result)
+
         # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다. 한쪽씩
         # 갱신하면 캡처 저장 시차나 잘못된 파일 쌍 때문에 좌우 영상이
         # 뒤바뀌어 보일 수 있으므로, 이상 프레임은 표시하지 않고 직전의
@@ -1210,6 +1221,59 @@ class ProductDashboard:
         tree.pack(side="left",fill="both",expand=True); scroll.pack(side="right",fill="y")
         for row in self.operating_logs:
             tree.insert("", "end", values=row)
+
+    def _dispatch_critical_telegram(self, result: dict):
+        """CRITICAL 알람을 텔레그램으로 전송한다.
+
+        send_alarm은 최대 수십 초 블로킹되는 HTTP 호출이므로 Tk 메인 스레드가
+        아닌 데몬 스레드에서 실행하고, 결과 로그만 root.after로 메인 스레드에
+        되돌려 GUI가 멈추지 않게 한다. 오버레이(메모리 이미지)는 임시 파일로
+        저장해 사진으로 첨부하며, 전송 후 삭제한다.
+        """
+        temp = float(result.get("hot_temp_95", result.get("max_temp", 0.0)))
+        overlay = result.get("overlay")
+        base = str(result.get("base", "")) or "latest"
+        robot_id = self.cfg.identity.robot_id
+
+        def _log(kind: str, detail: str):
+            if self.lifecycle == "running":
+                self.root.after(0, lambda: self._add_operating_log("텔레그램 알림", kind, detail))
+
+        def work():
+            import tempfile
+            from ..analysis.notifier import send_alarm
+
+            tmp_path = None
+            image_path = ""
+            if overlay is not None:
+                tmp_path = os.path.join(tempfile.gettempdir(), f"thermoguard_alarm_{base}.jpg")
+                try:
+                    if cv2.imwrite(tmp_path, overlay):
+                        image_path = tmp_path
+                except Exception:
+                    image_path = ""
+            try:
+                ok = send_alarm(
+                    image_path=image_path,
+                    temp=temp,
+                    status=Status.CRITICAL.value,
+                    robot_id=robot_id,
+                )
+                _log("전송 성공" if ok else "전송 실패",
+                     f"{robot_id} · {temp:.1f}°C · {'사진' if image_path else '텍스트'}")
+            except RuntimeError:
+                _log("미설정", ".env의 BOT_TOKEN / CHAT_ID를 확인하세요")
+            except Exception as e:
+                _file_log.error("Telegram dispatch error: %s", e, exc_info=True)
+                _log("오류", str(e))
+            finally:
+                if tmp_path:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _add_operating_log(self, category: str, result: str, detail: str):
         row = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), category, result, detail)
