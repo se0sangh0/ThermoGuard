@@ -1,0 +1,15 @@
+# 비밀정보
+.env
+
+# Python 가상환경
+venv/
+
+# Python 자동 생성
+__pycache__/
+*.pyc
+
+# 실행 중 생성 데이터
+logs/
+
+# 이미지/열화상 등 런타임 저장 데이터라면 제외
+storage/
