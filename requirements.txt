@@ -3,3 +3,9 @@ numpy
 Pillow
 # GUI-UPDATE: 영상 표시, ROI·보정, 오버레이 생성에 필요
 opencv-python
+# backend: FastAPI + MariaDB
+fastapi
+uvicorn[standard]
+sqlalchemy
+pymysql
+python-dotenv
