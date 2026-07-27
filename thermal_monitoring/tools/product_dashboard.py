@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +34,9 @@ from ..analysis.threshold import (
 )
 from ..capture.capture import CaptureSession, camera_image_url
 from ..data import pairs
+from ..data.checking import run_check
+from ..data.cleanup import run_cleanup_if_due
+from ..data.metadata import run_metadata
 from ..data.pairs import capture_time_from_file, latest_analysis_pair
 from ..data.quality import assess_image_quality
 from ..config import load_config, save_config
@@ -140,6 +144,10 @@ class ProductDashboard:
         self._analysis_pending = False
         self._analysis_generation = 0
         self._manual_capture_running = False
+
+        self._last_integrity_check = 0.0
+        self._last_metadata_update = 0.0
+        self._last_cleanup_check = 0.0
 
         self._configure_style()
         self._build_ui()
@@ -800,10 +808,71 @@ class ProductDashboard:
         if self.lifecycle != "running":
             return
         self.timer_id = None
+        self._run_maintenance()
         self._schedule_analysis()
         self._update_metric_text()
         # 환경설정에서 지정한 화면 갱신 주기를 상태와 관계없이 적용한다.
         self._schedule_refresh(self.REFRESH_SECONDS * 1000)
+
+    def _run_maintenance(self):
+        """주기적 데이터 무결성 검사, 메타데이터 갱신, 오래된 파일 정리.
+
+        monitor.py의 주기적 유지보수와 동일한 data/ API를 사용한다.
+        스레드 풀에서 실행하므로 GUI 스레드를 블로킹하지 않는다.
+        """
+        now = time.time()
+        save_dir = self.cfg.paths.dataset_dir
+
+        if now - self._last_integrity_check >= self.cfg.monitoring.integrity_interval_sec:
+            self._last_integrity_check = now
+            self._analysis_executor.submit(self._run_integrity, save_dir)
+
+        if now - self._last_metadata_update >= self.cfg.monitoring.metadata_interval_sec:
+            self._last_metadata_update = now
+            self._analysis_executor.submit(self._run_metadata_update, save_dir)
+
+        if now - self._last_cleanup_check >= 3600:
+            self._last_cleanup_check = now
+            retention = self.cfg.monitoring.cleanup_retention_days
+            self._analysis_executor.submit(self._run_cleanup, save_dir, retention)
+
+    @staticmethod
+    def _run_integrity(save_dir: str):
+        try:
+            result = run_check(save_dir=save_dir, log_callback=None)
+            if result.missing_npy > 0 or result.orphan_npy > 0:
+                _file_log.info(
+                    "dashboard integrity: %d NPY recovered, %d orphans removed",
+                    result.fixed, result.removed,
+                )
+        except Exception as exc:
+            _file_log.warning("dashboard integrity check error: %s", exc)
+
+    @staticmethod
+    def _run_metadata_update(save_dir: str):
+        try:
+            result = run_metadata(save_dir=save_dir, log_callback=None)
+            if result.new > 0:
+                _file_log.info("dashboard metadata: %d new records", result.new)
+        except Exception as exc:
+            _file_log.warning("dashboard metadata update error: %s", exc)
+
+    @staticmethod
+    def _run_cleanup(save_dir: str, retention_days: int):
+        try:
+            result = run_cleanup_if_due(
+                save_dir=save_dir,
+                retention_days=retention_days,
+                log_callback=None,
+            )
+            if result is not None:
+                _file_log.info(
+                    "dashboard cleanup: %d pairs removed, %.1f MB freed",
+                    result.removed_pairs,
+                    result.freed_bytes / (1024 * 1024),
+                )
+        except Exception as exc:
+            _file_log.warning("dashboard cleanup error: %s", exc)
 
     def capture_and_refresh(self):
         """버튼 클릭 시 새 Thermal/Visual을 촬영하고 그 결과로 화면을 갱신한다."""
