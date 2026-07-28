@@ -233,14 +233,17 @@ class RoiTkDialog:
             )]
         for entry in entries:
             name, x1, y1, x2, y2 = _roi_values(entry)
-            thermal = np.array([[x1, y1], [x2, y2]], dtype=np.float32).reshape(-1, 1, 2)
-            visual = cv2.perspectiveTransform(thermal, self.homography).reshape(2, 2)
+            # thermal(640x480) ROI 네 꼭짓점을 visual 좌표로 변환
+            thermal = np.array([
+                [x1, y1], [x2, y1], [x2, y2], [x1, y2],
+            ], dtype=np.float32).reshape(-1, 1, 2)
+            visual = cv2.perspectiveTransform(thermal, self.homography).reshape(-1, 2)
             self.rois.append({
                 "name": name,
-                "x1": int(round(visual[0, 0])),
-                "y1": int(round(visual[0, 1])),
-                "x2": int(round(visual[1, 0])),
-                "y2": int(round(visual[1, 1])),
+                "x1": int(round(visual[:, 0].min())),
+                "y1": int(round(visual[:, 1].min())),
+                "x2": int(round(visual[:, 0].max())),
+                "y2": int(round(visual[:, 1].max())),
             })
         self.selected = 0 if self.rois else -1
 
@@ -392,20 +395,21 @@ class RoiTkDialog:
             return
         entries = []
         for roi in self.rois:
-            # hull boundary check
+            # hull boundary check: 네 꼭짓점이 모두 hull 안에 있어야 통과
             if self._calib_hull is not None:
-                cx = (roi["x1"] + roi["x2"]) / 2
-                cy = (roi["y1"] + roi["y2"]) / 2
-                dist = cv2.pointPolygonTest(self._calib_hull, (cx, cy), True)
-                if dist < 0:
-                    messagebox.showwarning(
-                        "ROI 범위 초과",
-                        f"'{roi['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
-                        f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
-                        f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
-                        parent=self.win,
-                    )
-                    return False
+                for corner in (
+                    (roi["x1"], roi["y1"]), (roi["x2"], roi["y1"]),
+                    (roi["x2"], roi["y2"]), (roi["x1"], roi["y2"]),
+                ):
+                    if cv2.pointPolygonTest(self._calib_hull, corner, False) < 0:
+                        messagebox.showwarning(
+                            "ROI 범위 초과",
+                            f"'{roi['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
+                            f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
+                            f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
+                            parent=self.win,
+                        )
+                        return False
 
             # 사각형 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스 사용.
             visual = np.array([
@@ -417,10 +421,29 @@ class RoiTkDialog:
             thermal = cv2.perspectiveTransform(
                 visual, self.inverse_homography,
             ).reshape(-1, 2)
-            x1 = max(0, min(int(round(thermal[:, 0].min())), 639))
-            y1 = max(0, min(int(round(thermal[:, 1].min())), 479))
-            x2 = max(0, min(int(round(thermal[:, 0].max())), 639))
-            y2 = max(0, min(int(round(thermal[:, 1].max())), 479))
+            raw_x1 = int(round(thermal[:, 0].min()))
+            raw_y1 = int(round(thermal[:, 1].min()))
+            raw_x2 = int(round(thermal[:, 0].max()))
+            raw_y2 = int(round(thermal[:, 1].max()))
+
+            # 클램핑 → 원하지 않은 위치로 바뀌므로 저장 거부
+            x1 = max(0, min(raw_x1, 639))
+            y1 = max(0, min(raw_y1, 479))
+            x2 = max(0, min(raw_x2, 639))
+            y2 = max(0, min(raw_y2, 479))
+
+            if raw_x1 != x1 or raw_y1 != y1 or raw_x2 != x2 or raw_y2 != y2:
+                messagebox.showwarning(
+                    "ROI 범위 초과",
+                    f"'{roi['name']}' ROI가 열화상 카메라 시야를 벗어납니다.\n\n"
+                    f"변환 좌표: ({raw_x1},{raw_y1})-({raw_x2},{raw_y2})\n"
+                    f"열화상 범위: 0~639 × 0~479\n\n"
+                    f"ROI를 카메라 중앙 쪽으로 옮기거나\n"
+                    f"캘리브레이션 대응점을 카메라 전체에 고르게 다시 지정하세요.",
+                    parent=self.win,
+                )
+                return False
+
             if x1 >= x2 or y1 >= y2:
                 messagebox.showwarning(
                     "ROI 설정",
@@ -429,11 +452,13 @@ class RoiTkDialog:
                     "ROI 박스가 너무 작거나 화면 밖으로 벗어났습니다.",
                     parent=self.win,
                 )
-                return
+                return False
             entries.append(RoiEntry(
                 name=roi["name"],
                 x1=x1, y1=y1, x2=x2, y2=y2,
             ))
+        if not entries:
+            return False
         self.cfg.roi.rois = entries
         first = entries[0]
         self.cfg.roi.x1, self.cfg.roi.y1 = first.x1, first.y1

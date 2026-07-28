@@ -345,25 +345,29 @@ def _save_all_rois():
     entries = []
     for r in rois:
         if use_visual and H_inv is not None:
-            # 캘리브레이션 hull 안에 있는지 먼저 검증
+            # 캘리브레이션 hull 밖이면 호모그래피 외삽으로 좌표가 튈 수 있다.
+            # ROI의 네 꼭짓점이 모두 hull 안에 있어야 통과시킨다.
+            hull_blocked = False
             if calib_hull is not None:
-                roi_center = np.array([[(r["x1"] + r["x2"]) / 2,
-                                        (r["y1"] + r["y2"]) / 2]], dtype=np.float32)
-                dist = cv2.pointPolygonTest(calib_hull, (float(roi_center[0, 0]),
-                                                          float(roi_center[0, 1])), True)
-                if dist < 0:
-                    print(f"  [{r['name']}] ROI가 캘리브레이션 영역 밖에 있습니다. "
-                          f"(중심점 hull과의 거리: {dist:.0f}px)\n"
-                          f"    → 호모그래피가 정확하지 않은 영역입니다. "
-                          f"ROI를 캘리브레이션 대응점 범위 안으로 옮기거나\n"
-                          f"    캘리브레이션을 다시 수행하세요.")
-                    messagebox.showwarning(
-                        "ROI 범위 초과",
-                        f"'{r['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
-                        f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
-                        f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
-                    )
-                    continue
+                for (cx, cy) in (
+                    (r["x1"], r["y1"]), (r["x2"], r["y1"]),
+                    (r["x2"], r["y2"]), (r["x1"], r["y2"]),
+                ):
+                    if cv2.pointPolygonTest(calib_hull, (float(cx), float(cy)), False) < 0:
+                        hull_blocked = True
+                        break
+            if hull_blocked:
+                print(f"  [{r['name']}] ROI가 캘리브레이션 영역 밖에 있습니다.\n"
+                      f"    → 호모그래피가 정확하지 않은 영역입니다. "
+                      f"ROI를 캘리브레이션 대응점 범위 안으로 옮기거나\n"
+                      f"    캘리브레이션을 다시 수행하세요.")
+                messagebox.showwarning(
+                    "ROI 범위 초과",
+                    f"'{r['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
+                    f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
+                    f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
+                )
+                continue
 
             # 사각형의 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스를 구한다.
             corners_vis = np.array([
@@ -378,16 +382,21 @@ def _save_all_rois():
             raw_x2 = int(round(thermal_pts[:, 0].max()))
             raw_y2 = int(round(thermal_pts[:, 1].max()))
 
-            # thermal 이미지 경계로 클램핑
+            # thermal 이미지 경계로 클램핑 → 원하는 위치가 아니면 저장 거부
             x1 = max(0, min(raw_x1, thermal_resolution[0] - 1))
             y1 = max(0, min(raw_y1, thermal_resolution[1] - 1))
             x2 = max(0, min(raw_x2, thermal_resolution[0] - 1))
             y2 = max(0, min(raw_y2, thermal_resolution[1] - 1))
 
-            # 클램핑 발생 시 경고
             if raw_x1 != x1 or raw_y1 != y1 or raw_x2 != x2 or raw_y2 != y2:
-                print(f"  [{r['name']}] ROI 일부가 thermal 범위를 벗어나 클램핑됨 "
-                      f"({raw_x1},{raw_y1})-({raw_x2},{raw_y2}) → ({x1},{y1})-({x2},{y2})")
+                msg = (f"'{r['name']}' ROI가 열화상 카메라 시야를 벗어납니다.\n\n"
+                       f"변환 좌표: ({raw_x1},{raw_y1})-({raw_x2},{raw_y2})\n"
+                       f"열화상 범위: 0~639 × 0~479\n\n"
+                       f"ROI를 카메라 중앙 쪽으로 옮기거나\n"
+                       f"캘리브레이션 대응점을 카메라 전체에 고르게 다시 지정하세요.")
+                print(f"  [{r['name']}] {msg}")
+                messagebox.showwarning("ROI 범위 초과", msg)
+                continue
 
             # zero-area 검증: ROI 전체가 thermal 밖에 있으면 건너뛰기
             if x1 >= x2 or y1 >= y2:
@@ -399,6 +408,9 @@ def _save_all_rois():
         else:
             x1, y1, x2, y2 = int(r["x1"]), int(r["y1"]), int(r["x2"]), int(r["y2"])
         entries.append({"name": r["name"], "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    if not entries:
+        print("[roi_selector] 모든 ROI가 유효하지 않아 저장을 취소합니다.")
+        return
     c.roi.rois = entries
     if entries:
         c.roi.x1 = entries[0]["x1"]
