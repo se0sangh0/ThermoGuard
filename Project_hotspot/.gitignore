@@ -10,6 +10,7 @@ __pycache__/
 
 # 실행 중 생성 데이터
 logs/
+junk_backup/
 
 # 이미지/열화상 등 런타임 저장 데이터라면 제외
 storage/
