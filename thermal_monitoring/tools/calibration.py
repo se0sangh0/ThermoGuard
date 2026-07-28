@@ -404,7 +404,13 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
         return False
 
     output_path = cfg.paths.homography_path
-    np.save(output_path, H)
+    # H + 대응점을 dict로 묶어서 저장 (기존 호환성을 위해 .npz 대신 .npy 확장자 유지)
+    calib_data = {
+        "H": H,
+        "thermal_pts": np.array(thermal_pts, dtype=np.float32),
+        "visual_pts": np.array(rgb_pts, dtype=np.float32),
+    }
+    np.save(output_path, calib_data)
     print(f"Homography saved: {output_path}")
     print("Homography matrix:")
     print(H)

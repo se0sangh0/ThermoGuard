@@ -135,10 +135,26 @@ class RoiTkDialog:
         homography_path = Path(self.cfg.paths.homography_path)
         if not homography_path.exists():
             raise FileNotFoundError("캘리브레이션 정보가 없습니다. 캘리브레이션을 먼저 실행하세요.")
-        self.homography = np.load(homography_path)
+        calib_data = np.load(homography_path, allow_pickle=True)
+        if isinstance(calib_data, np.ndarray) and calib_data.ndim == 0:
+            calib_data = calib_data.item()
+        if isinstance(calib_data, dict):
+            self.homography = calib_data["H"]
+            self._calib_visual_pts = calib_data.get("visual_pts")
+        else:
+            self.homography = calib_data
+            self._calib_visual_pts = None
         if self.homography.shape != (3, 3):
             raise ValueError("캘리브레이션 행렬 형식이 올바르지 않습니다.")
         self.inverse_homography = np.linalg.inv(self.homography)
+        
+        # convex hull for calibration boundary check
+        self._calib_hull = None
+        if self._calib_visual_pts is not None and len(self._calib_visual_pts) >= 3:
+            self._calib_hull = cv2.convexHull(
+                self._calib_visual_pts.reshape(-1, 1, 2).astype(np.float32)
+            )
+        
         self.image = Image.open(visual_path).convert("RGB")
         self.source_width, self.source_height = self.image.size
         self._load_rois()
@@ -376,6 +392,21 @@ class RoiTkDialog:
             return
         entries = []
         for roi in self.rois:
+            # hull boundary check
+            if self._calib_hull is not None:
+                cx = (roi["x1"] + roi["x2"]) / 2
+                cy = (roi["y1"] + roi["y2"]) / 2
+                dist = cv2.pointPolygonTest(self._calib_hull, (cx, cy), True)
+                if dist < 0:
+                    messagebox.showwarning(
+                        "ROI 범위 초과",
+                        f"'{roi['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
+                        f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
+                        f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
+                        parent=self.win,
+                    )
+                    return False
+
             # 사각형 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스 사용.
             visual = np.array([
                 [roi["x1"], roi["y1"]],  # top-left
@@ -619,7 +650,12 @@ class CalibrationTkDialog:
                 parent=self.win,
             )
             return
-        np.save(self.cfg.paths.homography_path, homography)
+        calib_data = {
+            "H": homography,
+            "thermal_pts": np.array(self.thermal_pts, dtype=np.float32),
+            "visual_pts": np.array(self.visual_pts, dtype=np.float32),
+        }
+        np.save(self.cfg.paths.homography_path, calib_data)
         self.result = True
         messagebox.showinfo(
             "캘리브레이션 완료",

@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import glob
+from tkinter import messagebox
 
 import cv2
 import numpy as np
@@ -49,6 +50,9 @@ scale = 1.0
 # ── Homography / Visual 모드 ──
 H_inv = None                    # inverse homography (visual→thermal)
 use_visual = False              # 가시광 이미지 표시 중이면 True
+calib_thermal_pts = None        # 캘리브레이션 대응점 (thermal 좌표)
+calib_visual_pts = None         # 캘리브레이션 대응점 (visual 좌표)
+calib_hull = None               # visual_pts의 convex hull (cv2.convexHull)
 thermal_resolution = (640, 480) # 최종 저장 좌표계 기준
 # ── 실행 상태 ──
 _running = False                # main loop 실행 중 여부
@@ -341,9 +345,27 @@ def _save_all_rois():
     entries = []
     for r in rois:
         if use_visual and H_inv is not None:
+            # 캘리브레이션 hull 안에 있는지 먼저 검증
+            if calib_hull is not None:
+                roi_center = np.array([[(r["x1"] + r["x2"]) / 2,
+                                        (r["y1"] + r["y2"]) / 2]], dtype=np.float32)
+                dist = cv2.pointPolygonTest(calib_hull, (float(roi_center[0, 0]),
+                                                          float(roi_center[0, 1])), True)
+                if dist < 0:
+                    print(f"  [{r['name']}] ROI가 캘리브레이션 영역 밖에 있습니다. "
+                          f"(중심점 hull과의 거리: {dist:.0f}px)\n"
+                          f"    → 호모그래피가 정확하지 않은 영역입니다. "
+                          f"ROI를 캘리브레이션 대응점 범위 안으로 옮기거나\n"
+                          f"    캘리브레이션을 다시 수행하세요.")
+                    messagebox.showwarning(
+                        "ROI 범위 초과",
+                        f"'{r['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
+                        f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
+                        f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
+                    )
+                    continue
+
             # 사각형의 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스를 구한다.
-            # 대각선 두 점만 변환하면 기하 왜곡 시 실제 ROI보다 작게 잡히거나
-            # 비뚤어진 영역이 생길 수 있다.
             corners_vis = np.array([
                 [r["x1"], r["y1"]],  # top-left
                 [r["x2"], r["y1"]],  # top-right
@@ -433,12 +455,33 @@ def main(event_pump=None, display_bounds=None):
         print("캘리브레이션 정보가 없습니다. 캘리브레이션을 먼저 실행하세요.")
         return False
 
-    H = np.load(HOMOGRAPHY_PATH)
+    calib_data = np.load(HOMOGRAPHY_PATH, allow_pickle=True)
+    if isinstance(calib_data, np.ndarray) and calib_data.ndim == 0:
+        calib_data = calib_data.item()
+    if isinstance(calib_data, dict):
+        H = calib_data["H"]
+        calib_thermal_pts = calib_data.get("thermal_pts")
+        calib_visual_pts = calib_data.get("visual_pts")
+    else:
+        H = calib_data
+        calib_thermal_pts = None
+        calib_visual_pts = None
+
     if H.shape != (3, 3):
         print(f"캘리브레이션 행렬 형식이 올바르지 않습니다: {H.shape}")
         return False
 
     H_inv = np.linalg.inv(H)
+    
+    # convex hull 계산 (시각상 ROI가 이 범위 안에 있어야 함)
+    calib_hull = None
+    if calib_visual_pts is not None and len(calib_visual_pts) >= 3:
+        calib_hull = cv2.convexHull(calib_visual_pts.reshape(-1, 1, 2).astype(np.float32))
+        print(f"Calibration hull loaded: {len(calib_visual_pts)} points → "
+              f"hull vertices: {len(calib_hull)}")
+    else:
+        print("경고: 캘리브레이션 대응점 정보가 없습니다. ROI 영역 검증을 건너뜁니다.")
+    
     img = cv2.imread(visual_path)
     use_visual = True
     display_res = img.shape[:2] if img is not None else (0, 0)

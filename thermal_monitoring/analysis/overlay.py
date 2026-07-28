@@ -48,10 +48,34 @@ def _status_color(status: str) -> tuple:
 
 
 def _load_homography() -> np.ndarray | None:
-    """Homography 행렬 로드, 없으면 None"""
+    """Homography 행렬 로드 (구/신 포맷 호환), 없으면 None.
+    
+    구 포맷: np.save("thermal_to_rgb.npy", H)           → shape (3,3)
+    신 포맷: np.save("thermal_to_rgb.npy", {"H": ..., ...}) → 0-d array wrapping dict
+    """
     if os.path.isfile(HOMOGRAPHY_PATH):
-        return np.load(HOMOGRAPHY_PATH)
+        data = np.load(HOMOGRAPHY_PATH, allow_pickle=True)
+        if isinstance(data, np.ndarray) and data.ndim == 0:
+            data = data.item()  # unwrap 0-d array (dict case)
+        if isinstance(data, dict):
+            return data.get("H")
+        if isinstance(data, np.ndarray) and data.shape == (3, 3):
+            return data
     return None
+
+
+def _load_calibration() -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """(H, thermal_pts, visual_pts) 반환. 대응점 없으면 (H, None, None)."""
+    if not os.path.isfile(HOMOGRAPHY_PATH):
+        return None, None, None
+    data = np.load(HOMOGRAPHY_PATH, allow_pickle=True)
+    if isinstance(data, np.ndarray) and data.ndim == 0:
+        data = data.item()
+    if isinstance(data, dict):
+        return data.get("H"), data.get("thermal_pts"), data.get("visual_pts")
+    if isinstance(data, np.ndarray) and data.shape == (3, 3):
+        return data, None, None
+    return None, None, None
 
 
 # ------------------------------------------------------------
