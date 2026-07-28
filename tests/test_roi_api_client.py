@@ -31,13 +31,14 @@ def test_sync_rois_posts_dragged_thermal_coordinates(monkeypatch):
         return FakeResponse({"status": "created", "roi_id": 11})
 
     monkeypatch.setattr(roi_api_client.requests, "post", fake_post)
-    result = roi_api_client.sync_rois(
+    result, roi_id_map = roi_api_client.sync_rois(
         "http://127.0.0.1:8000", "CAM-01", "192.168.0.51",
         [SimpleNamespace(name="ROI-1", x1=10, y1=20, x2=110, y2=220)],
     )
 
     assert result.camera_id == 7
     assert result.created == 1
+    assert roi_id_map == {"ROI-1": 11}
     assert posts[0][1] == {
         "camera_id": 7, "roi_name": "ROI-1",
         "x1": 10, "y1": 20, "x2": 110, "y2": 220,
@@ -64,7 +65,7 @@ def test_sync_rois_does_not_post_unchanged_definition(monkeypatch):
         ),
     )
 
-    result = roi_api_client.sync_rois(
+    result, roi_id_map = roi_api_client.sync_rois(
         "http://127.0.0.1:8000", "CAM-01", "192.168.0.51",
         [SimpleNamespace(name="ROI-1", x1=10, y1=20, x2=110, y2=220)],
     )

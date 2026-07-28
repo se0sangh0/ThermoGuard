@@ -115,6 +115,7 @@ def sync_rois(
 
     created = 0
     unchanged = 0
+    roi_id_map: dict[str, int] = {}
     for roi in rois:
         name = str(roi.name)
         coordinates = (int(roi.x1), int(roi.y1), int(roi.x2), int(roi.y2))
@@ -125,6 +126,7 @@ def sync_rois(
             )
             if old_coordinates == coordinates and bool(previous.get("enabled", True)):
                 unchanged += 1
+                roi_id_map[name] = int(previous["roi_id"])
                 continue
             version = int(previous.get("version", 1)) + 1
         else:
@@ -148,5 +150,6 @@ def sync_rois(
         if result.get("status") != "created" or result.get("roi_id") is None:
             raise RoiApiError(f"ROI 저장 응답을 확인할 수 없습니다: {result}")
         created += 1
+        roi_id_map[name] = int(result["roi_id"])
 
-    return RoiSyncResult(camera_id=camera_id, created=created, unchanged=unchanged)
+    return RoiSyncResult(camera_id=camera_id, created=created, unchanged=unchanged), roi_id_map

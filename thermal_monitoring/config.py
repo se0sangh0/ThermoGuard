@@ -55,6 +55,7 @@ class RoiEntry:
     y1: int = 0
     x2: int = 640
     y2: int = 480
+    db_roi_id: int | None = None
 
 
 @dataclass
@@ -152,6 +153,7 @@ def _from_dict(raw: dict) -> AppConfig:
                 y1=int(entry.get("y1", 0)),
                 x2=int(entry.get("x2", 640)),
                 y2=int(entry.get("y2", 480)),
+                db_roi_id=entry.get("db_roi_id"),
             ))
 
     roi_config = _dict_to_dataclass(roi_raw, RoiConfig)

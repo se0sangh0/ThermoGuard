@@ -1480,10 +1480,15 @@ class ProductDashboard:
         """측정값을 POST /api/measurements 로 전송 (데몬 스레드)."""
         if not self.cfg.backend.enabled:
             return
+        camera_id = self.cfg.identity.db_camera_id or 1
+        roi = result.get("overall_max_roi")
+        roi_id = getattr(roi, "db_roi_id", None) if roi is not None else 1
+        if roi_id is None:
+            roi_id = 1
         try:
             payload = {
-                "camera_id": 1,
-                "roi_id": 1,
+                "camera_id": camera_id,
+                "roi_id": roi_id,
                 "max_temp": result["max_temp"],
                 "min_temp": result.get("min_temp", 0.0),
                 "mean_temp": result["mean_temp"],
@@ -2035,7 +2040,7 @@ class SettingsDialog:
                         "Backend API 연동이 비활성화되어 있습니다. "
                         "환경설정의 Backend 설정을 확인하세요."
                     )
-                result = sync_rois(
+                result, roi_id_map = sync_rois(
                     self.d.cfg.backend.url,
                     self.d.cfg.identity.camera_id,
                     self.d.cfg.camera.ip,
@@ -2043,6 +2048,12 @@ class SettingsDialog:
                     timeout=self.d.cfg.backend.timeout_sec,
                     database_camera_id=self.d.cfg.identity.db_camera_id,
                 )
+                # 저장된 ROI ID를 config에 반영
+                for entry in entries:
+                    name = entry.name
+                    if name in roi_id_map:
+                        entry.db_roi_id = roi_id_map[name]
+                save_config(self.d.cfg)
                 self.d._add_operating_log(
                     "ROI DB 연동",
                     "저장 완료",
@@ -2179,6 +2190,7 @@ class SettingsDialog:
             self.d.cfg.roi.warning_delta = float(self.warning.get())
             self.d.cfg.roi.critical_delta = float(self.critical.get())
             save_config(self.d.cfg)
+            self._sync_thresholds_to_backend()
             self.d._add_operating_log(
                 "설비 DB 연동",
                 "저장 완료",
@@ -2208,6 +2220,48 @@ class SettingsDialog:
                 f"공장·생산라인·로봇 정보를 저장하지 못했습니다.\n\n{exc}",
                 parent=self.win,
             )
+
+    def _sync_thresholds_to_backend(self):
+        if not self.d.cfg.backend.enabled or not self.d.cfg.identity.db_camera_id:
+            return
+        def work():
+            try:
+                resp = requests.get(
+                    f"{self.d.cfg.backend.url}/api/thresholds",
+                    timeout=self.d.cfg.backend.timeout_sec,
+                )
+                if resp.status_code != 200:
+                    return
+                thresholds = resp.json().get("thresholds", [])
+                camera_id = self.d.cfg.identity.db_camera_id
+                matching = [t for t in thresholds if t.get("camera_id") == camera_id and t.get("valid_to") is None]
+                for t in matching:
+                    threshold_id = t["threshold_id"]
+                    requests.patch(
+                        f"{self.d.cfg.backend.url}/api/thresholds/{threshold_id}",
+                        json={
+                            "baseline_temp": self.d.cfg.roi.baseline_temp,
+                            "warning_delta": self.d.cfg.roi.warning_delta,
+                            "critical_delta": self.d.cfg.roi.critical_delta,
+                        },
+                        timeout=self.d.cfg.backend.timeout_sec,
+                    )
+                    _file_log.info("backend PATCH /api/thresholds/%s success", threshold_id)
+                    return
+                requests.post(
+                    f"{self.d.cfg.backend.url}/api/thresholds",
+                    json={
+                        "camera_id": camera_id,
+                        "baseline_temp": self.d.cfg.roi.baseline_temp,
+                        "warning_delta": self.d.cfg.roi.warning_delta,
+                        "critical_delta": self.d.cfg.roi.critical_delta,
+                    },
+                    timeout=self.d.cfg.backend.timeout_sec,
+                )
+                _file_log.info("backend POST /api/thresholds success")
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
 
 
 def main():
