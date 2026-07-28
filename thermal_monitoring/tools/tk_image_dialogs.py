@@ -117,7 +117,7 @@ def _roi_values(entry) -> tuple[str, int, int, int, int]:
 
 
 class RoiTkDialog:
-    def __init__(self, parent, thermal_path: str, visual_path: str):
+    def __init__(self, parent, thermal_path: str, visual_path: str, save_handler=None):
         self.parent = parent
         self.cfg = load_config(force_reload=True)
         self.thermal_path = thermal_path
@@ -131,6 +131,7 @@ class RoiTkDialog:
         self.photo = None
         self.image_rect: ImageRect | None = None
         self._redraw_id = None
+        self.save_handler = save_handler
 
         homography_path = Path(self.cfg.paths.homography_path)
         if not homography_path.exists():
@@ -417,10 +418,21 @@ class RoiTkDialog:
             thermal = cv2.perspectiveTransform(
                 visual, self.inverse_homography,
             ).reshape(-1, 2)
-            x1 = max(0, min(int(round(thermal[:, 0].min())), 639))
-            y1 = max(0, min(int(round(thermal[:, 1].min())), 479))
-            x2 = max(0, min(int(round(thermal[:, 0].max())), 639))
-            y2 = max(0, min(int(round(thermal[:, 1].max())), 479))
+            raw_x1 = int(round(thermal[:, 0].min()))
+            raw_y1 = int(round(thermal[:, 1].min()))
+            raw_x2 = int(round(thermal[:, 0].max()))
+            raw_y2 = int(round(thermal[:, 1].max()))
+            if raw_x1 < 0 or raw_y1 < 0 or raw_x2 > 639 or raw_y2 > 479:
+                messagebox.showwarning(
+                    "열화상 범위 확인",
+                    f"'{roi['name']}' 영역에 대응하는 열화상 좌표가 "
+                    "카메라 범위를 벗어났습니다.\n\n"
+                    f"변환 좌표: ({raw_x1},{raw_y1})-({raw_x2},{raw_y2})\n"
+                    "가시광 ROI를 열화상 촬영 범위 안쪽으로 다시 지정하세요.",
+                    parent=self.win,
+                )
+                return
+            x1, y1, x2, y2 = raw_x1, raw_y1, raw_x2, raw_y2
             if x1 >= x2 or y1 >= y2:
                 messagebox.showwarning(
                     "ROI 설정",
@@ -434,6 +446,19 @@ class RoiTkDialog:
                 name=roi["name"],
                 x1=x1, y1=y1, x2=x2, y2=y2,
             ))
+        if self.save_handler is not None:
+            try:
+                self.save_handler(entries)
+            except Exception as exc:
+                messagebox.showerror(
+                    "ROI DB 저장 실패",
+                    "ROI를 데이터베이스에 저장하지 못했습니다.\n"
+                    "입력한 영역은 유지되므로 연결 상태를 확인한 뒤 다시 저장하세요.\n\n"
+                    f"{exc}",
+                    parent=self.win,
+                )
+                return
+
         self.cfg.roi.rois = entries
         first = entries[0]
         self.cfg.roi.x1, self.cfg.roi.y1 = first.x1, first.y1
@@ -673,8 +698,18 @@ class CalibrationTkDialog:
             self.win.destroy()
 
 
-def show_roi_dialog(parent, thermal_path: str, visual_path: str) -> bool:
-    return RoiTkDialog(parent, thermal_path, visual_path).show()
+def show_roi_dialog(
+    parent,
+    thermal_path: str,
+    visual_path: str,
+    save_handler=None,
+) -> bool:
+    return RoiTkDialog(
+        parent,
+        thermal_path,
+        visual_path,
+        save_handler=save_handler,
+    ).show()
 
 
 def show_calibration_dialog(parent, thermal_path: str, visual_path: str) -> bool:

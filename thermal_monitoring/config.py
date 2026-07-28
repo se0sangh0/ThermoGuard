@@ -38,6 +38,13 @@ class CameraConfig:
 class IdentityConfig:
     camera_id: str = "CAM-01"
     robot_id: str = "Robot-01"
+    factory_name: str = ""
+    line_name: str = ""
+    robot_name: str = ""
+    factory_id: int | None = None
+    line_id: int | None = None
+    db_robot_id: int | None = None
+    db_camera_id: int | None = None
 
 
 @dataclass
