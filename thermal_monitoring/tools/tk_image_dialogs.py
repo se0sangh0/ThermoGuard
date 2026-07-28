@@ -376,19 +376,20 @@ class RoiTkDialog:
             return
         entries = []
         for roi in self.rois:
+            # 사각형 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스 사용.
             visual = np.array([
-                [roi["x1"], roi["y1"]],
-                [roi["x2"], roi["y2"]],
+                [roi["x1"], roi["y1"]],  # top-left
+                [roi["x2"], roi["y1"]],  # top-right
+                [roi["x2"], roi["y2"]],  # bottom-right
+                [roi["x1"], roi["y2"]],  # bottom-left
             ], dtype=np.float32).reshape(-1, 1, 2)
             thermal = cv2.perspectiveTransform(
                 visual, self.inverse_homography,
-            ).reshape(2, 2)
-            tx1, ty1 = thermal[0]
-            tx2, ty2 = thermal[1]
-            x1 = max(0, min(int(round(min(tx1, tx2))), 639))
-            y1 = max(0, min(int(round(min(ty1, ty2))), 479))
-            x2 = max(0, min(int(round(max(tx1, tx2))), 639))
-            y2 = max(0, min(int(round(max(ty1, ty2))), 479))
+            ).reshape(-1, 2)
+            x1 = max(0, min(int(round(thermal[:, 0].min())), 639))
+            y1 = max(0, min(int(round(thermal[:, 1].min())), 479))
+            x2 = max(0, min(int(round(thermal[:, 0].max())), 639))
+            y2 = max(0, min(int(round(thermal[:, 1].max())), 479))
             if x1 >= x2 or y1 >= y2:
                 messagebox.showwarning(
                     "ROI 설정",

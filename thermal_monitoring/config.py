@@ -100,6 +100,14 @@ class ToolsConfig:
 
 
 @dataclass
+class BackendConfig:
+    """thermal_monitoring ↔ Backend API 연동 설정"""
+    url: str = "http://127.0.0.1:8000"
+    enabled: bool = True
+    timeout_sec: float = 5.0
+
+
+@dataclass
 class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
@@ -109,6 +117,7 @@ class AppConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    backend: BackendConfig = field(default_factory=BackendConfig)
 
 
 # ════════════════════════════════════════════════════════════
@@ -150,6 +159,7 @@ def _from_dict(raw: dict) -> AppConfig:
         paths=_dict_to_dataclass(raw.get("paths", {}), PathsConfig),
         display=_dict_to_dataclass(raw.get("display", {}), DisplayConfig),
         tools=_dict_to_dataclass(raw.get("tools", {}), ToolsConfig),
+        backend=_dict_to_dataclass(raw.get("backend", {}), BackendConfig),
     )
 
 

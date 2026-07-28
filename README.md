@@ -222,6 +222,11 @@ tail -f logs/app.log
   "tools": {
     "exiftool_path": "",              // "" = 자동 감지
     "mode": "both"                    // 캡처 모드: "both" | "thermal"
+  },
+  "backend": {
+    "url": "http://127.0.0.1:8000",  // FastAPI 백엔드 주소
+    "enabled": true,                  // 백엔드 연동 활성화
+    "timeout_sec": 5.0               // HTTP 요청 타임아웃 (초)
   }
 }
 ```

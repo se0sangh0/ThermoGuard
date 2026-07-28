@@ -341,17 +341,37 @@ def _save_all_rois():
     entries = []
     for r in rois:
         if use_visual and H_inv is not None:
+            # 사각형의 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스를 구한다.
+            # 대각선 두 점만 변환하면 기하 왜곡 시 실제 ROI보다 작게 잡히거나
+            # 비뚤어진 영역이 생길 수 있다.
             corners_vis = np.array([
-                [r["x1"], r["y1"]],
-                [r["x2"], r["y2"]],
+                [r["x1"], r["y1"]],  # top-left
+                [r["x2"], r["y1"]],  # top-right
+                [r["x2"], r["y2"]],  # bottom-right
+                [r["x1"], r["y2"]],  # bottom-left
             ], dtype=np.float32).reshape(-1, 1, 2)
-            thermal_pts = cv2.perspectiveTransform(corners_vis, H_inv).reshape(2, 2)
-            tx1, ty1 = int(round(thermal_pts[0, 0])), int(round(thermal_pts[0, 1]))
-            tx2, ty2 = int(round(thermal_pts[1, 0])), int(round(thermal_pts[1, 1]))
-            x1 = max(0, min(min(tx1, tx2), thermal_resolution[0] - 1))
-            y1 = max(0, min(min(ty1, ty2), thermal_resolution[1] - 1))
-            x2 = max(0, min(max(tx1, tx2), thermal_resolution[0] - 1))
-            y2 = max(0, min(max(ty1, ty2), thermal_resolution[1] - 1))
+            thermal_pts = cv2.perspectiveTransform(corners_vis, H_inv).reshape(-1, 2)
+            raw_x1 = int(round(thermal_pts[:, 0].min()))
+            raw_y1 = int(round(thermal_pts[:, 1].min()))
+            raw_x2 = int(round(thermal_pts[:, 0].max()))
+            raw_y2 = int(round(thermal_pts[:, 1].max()))
+
+            # thermal 이미지 경계로 클램핑
+            x1 = max(0, min(raw_x1, thermal_resolution[0] - 1))
+            y1 = max(0, min(raw_y1, thermal_resolution[1] - 1))
+            x2 = max(0, min(raw_x2, thermal_resolution[0] - 1))
+            y2 = max(0, min(raw_y2, thermal_resolution[1] - 1))
+
+            # 클램핑 발생 시 경고
+            if raw_x1 != x1 or raw_y1 != y1 or raw_x2 != x2 or raw_y2 != y2:
+                print(f"  [{r['name']}] ROI 일부가 thermal 범위를 벗어나 클램핑됨 "
+                      f"({raw_x1},{raw_y1})-({raw_x2},{raw_y2}) → ({x1},{y1})-({x2},{y2})")
+
+            # zero-area 검증: ROI 전체가 thermal 밖에 있으면 건너뛰기
+            if x1 >= x2 or y1 >= y2:
+                print(f"  [{r['name']}] ROI가 thermal 범위를 완전히 벗어남 — 저장하지 않습니다.")
+                continue
+
             print(f"  [{r['name']}] visual({r['x1']},{r['y1']})-({r['x2']},{r['y2']})"
                   f" → thermal({x1},{y1})-({x2},{y2})")
         else:

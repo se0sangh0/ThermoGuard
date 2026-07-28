@@ -148,6 +148,7 @@ class ProductDashboard:
         self._last_integrity_check = 0.0
         self._last_metadata_update = 0.0
         self._last_cleanup_check = 0.0
+        self._last_backend_sync = 0.0
 
         self._configure_style()
         self._build_ui()
@@ -468,12 +469,13 @@ class ProductDashboard:
                           fill="x", padx=12, pady=(0, 10))
 
     def _acknowledge_event(self, event_id: str):
-        for event in self.events:
-            if event["id"] == event_id:
-                event["action"] = "확인 완료"
-                event["acknowledged_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._add_operating_log("알림", "확인 완료", f"{event['asset']} · {event['temp']:.1f}°C")
-                break
+        event = next((e for e in self.events if e["id"] == event_id), None)
+        if event is None:
+            return
+        event["action"] = "확인 완료"
+        event["acknowledged_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._acknowledge_event_backend(event)
+        self._add_operating_log("알림", "확인 완료", f"{event['asset']} · {event['temp']:.1f}°C")
         self._render_alert_cards()
 
     def _draw_robot_map(self):
@@ -815,7 +817,8 @@ class ProductDashboard:
         self._schedule_refresh(self.REFRESH_SECONDS * 1000)
 
     def _run_maintenance(self):
-        """주기적 데이터 무결성 검사, 메타데이터 갱신, 오래된 파일 정리.
+        """주기적 데이터 무결성 검사, 메타데이터 갱신, 오래된 파일 정리,
+        백엔드 알람 이벤트 동기화.
 
         monitor.py의 주기적 유지보수와 동일한 data/ API를 사용한다.
         스레드 풀에서 실행하므로 GUI 스레드를 블로킹하지 않는다.
@@ -835,6 +838,10 @@ class ProductDashboard:
             self._last_cleanup_check = now
             retention = self.cfg.monitoring.cleanup_retention_days
             self._analysis_executor.submit(self._run_cleanup, save_dir, retention)
+
+        if now - self._last_backend_sync >= 30 and self.cfg.backend.enabled:
+            self._last_backend_sync = now
+            self._analysis_executor.submit(self._sync_events_from_backend)
 
     @staticmethod
     def _run_integrity(save_dir: str):
@@ -1043,13 +1050,18 @@ class ProductDashboard:
         return {
             "base": base, "overlay": overlay, "visual_img": visual_img,
             "max_temp": roi_result.max_temp, "mean_temp": roi_result.mean_temp,
+            "min_temp": getattr(roi_result, 'min_temp', roi_result.max_temp),
             "hot_temp_95": roi_result.hot_temp_95,
+            "over_temp_pixels": getattr(roi_result, 'over_temp_pixels', 0),
+            "max_hotspot_size": getattr(roi_result, 'max_hotspot_size', 0),
             "hotspot_count": len(roi_result.hotspot_centroids),
             "status": status, "alarm_status": alarm_status, "alarm": alarm,
             "overall_max_temp": overall_max_temp,
             "overall_max_roi_name": overall_max_roi.roi_name or "ROI-01",
+            "overall_max_roi": overall_max_roi,
             "roi_bounds": roi_result.roi_bounds,
             "roi_results": roi_results,
+            "roi_name": roi_result.roi_name,
             "captured_at": captured_at,
             "image_quality_ok": image_quality_ok,
             "image_quality_reason": image_quality_reason,
@@ -1117,7 +1129,13 @@ class ProductDashboard:
             warning_transition=warning_transition,
         )
 
-        # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다. 한쪽씩
+        # 새로 촬영된 이미지일 때만 백엔드 DB에 측정값을 기록한다.
+        if is_new_capture and self._latest_pair_fresh:
+            threading.Thread(
+                target=self._post_to_backend, args=(result,), daemon=True
+            ).start()
+
+        # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다.
         # 갱신하면 캡처 저장 시차나 잘못된 파일 쌍 때문에 좌우 영상이
         # 뒤바뀌어 보일 수 있으므로, 이상 프레임은 표시하지 않고 직전의
         # 정상 화면을 유지한다.
@@ -1268,7 +1286,14 @@ class ProductDashboard:
         messagebox.showinfo("확인 처리", "왼쪽 미확인 알림 카드의 확인 버튼을 사용하세요.", parent=self.root)
 
     def show_all_events(self):
-        messagebox.showinfo("이상 이력", "현재 시제품은 실행 중 감지 이력을 표시합니다.\nDB 연동 시 전체 기간 조회가 제공됩니다.", parent=self.root)
+        if self.cfg.backend.enabled:
+            self._sync_events_from_backend()
+        messagebox.showinfo("이상 이력",
+                            "백엔드 DB 연동 상태:\n"
+                            f"· 운영 로그 {len(self.operating_logs)}건\n"
+                            f"· 이벤트 {len(self.events)}건\n\n"
+                            "전체 기간 조회는 웹 대시보드에서 제공됩니다.",
+                            parent=self.root)
 
     def _update_metric_text_async(self):
         if self.lifecycle == "running": self.root.after(0, self._update_metric_text)
@@ -1448,6 +1473,105 @@ class ProductDashboard:
         self.operating_logs.insert(0, row)
         del self.operating_logs[1000:]
         _file_log.info("[%s] %s | %s", category, result, detail)
+
+    # ── Backend API 연동 ──────────────────────────────────────────
+
+    def _post_to_backend(self, result: dict):
+        """측정값을 POST /api/measurements 로 전송 (데몬 스레드)."""
+        if not self.cfg.backend.enabled:
+            return
+        try:
+            payload = {
+                "camera_id": 1,
+                "roi_id": 1,
+                "max_temp": result["max_temp"],
+                "min_temp": result.get("min_temp", 0.0),
+                "mean_temp": result["mean_temp"],
+                "percentile_95_temp": result["hot_temp_95"],
+                "over_temp_pixels": result.get("over_temp_pixels", 0),
+                "max_hotspot_size": result.get("max_hotspot_size", 0),
+                "status": result["status"].value.lower(),
+                "algorithm_version": "v2.0",
+                "do_alarm": bool(result.get("alarm", False)),
+                "alarm_message": (
+                    f"{self.cfg.identity.robot_id} · {result['max_temp']:.1f}°C · {result['status'].value}"
+                ),
+            }
+            resp = requests.post(
+                f"{self.cfg.backend.url}/api/measurements",
+                json=payload,
+                timeout=self.cfg.backend.timeout_sec,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "created":
+                    self.metrics.api_successes += 1
+                    _file_log.info("backend POST ok: capture_id=%s", data.get("capture_id"))
+                else:
+                    _file_log.warning("backend POST rejected: %s", data)
+            else:
+                self._record_api_result(False, status_code=resp.status_code, error_kind="http")
+        except requests.exceptions.Timeout:
+            self.metrics.api_timeouts += 1
+        except requests.exceptions.ConnectionError:
+            self.metrics.api_connection_errors += 1
+        except Exception:
+            self.metrics.api_other_errors += 1
+
+    def _sync_events_from_backend(self):
+        """GET /api/alerts 로 영구 알람 이벤트 목록을 가져와 self.events와 병합."""
+        if not self.cfg.backend.enabled:
+            return
+        try:
+            resp = requests.get(
+                f"{self.cfg.backend.url}/api/alerts",
+                params={"limit": 50},
+                timeout=self.cfg.backend.timeout_sec,
+            )
+            if resp.status_code != 200:
+                return
+            data = resp.json()
+            for alert in data.get("alerts", []):
+                alert_id = str(alert.get("alert_id", ""))
+                if any(e.get("backend_id") == alert_id for e in self.events):
+                    continue
+                event_status = alert.get("event_status", "open")
+                action = "확인 완료" if event_status in ("acknowledged", "resolved") else "확인 필요"
+                self.events.insert(0, {
+                    "id": f"be_{alert_id}",
+                    "backend_id": alert_id,
+                    "time": alert.get("occurred_at", "")[:19].replace("T", " "),
+                    "asset": f"{alert.get('robot_code', 'Robot-01')} · {alert.get('roi_name', 'ROI')}",
+                    "state": alert.get("severity", "normal").capitalize(),
+                    "temp": float(alert.get("max_temp", 0)),
+                    "action": action,
+                    "acknowledged_at": alert.get("acknowledged_at"),
+                })
+            self.events.sort(key=lambda e: e["id"], reverse=True)
+            del self.events[200:]
+            self.root.after(0, self._render_alert_cards)
+        except Exception:
+            pass
+
+    def _acknowledge_event_backend(self, event: dict):
+        """이벤트 확인 처리 → PATCH /api/alerts/{id} 호출."""
+        backend_id = event.get("backend_id")
+        if not backend_id or not self.cfg.backend.enabled:
+            return
+        def work():
+            try:
+                resp = requests.patch(
+                    f"{self.cfg.backend.url}/api/alerts/{backend_id}",
+                    json={"event_status": "acknowledged"},
+                    timeout=self.cfg.backend.timeout_sec,
+                )
+                if resp.status_code == 200:
+                    _file_log.info("backend PATCH /api/alerts/%s → acknowledged", backend_id)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── Shutdown ─────────────────────────────────────────────────
 
     def open_settings(self):
         if self.settings_dialog:
