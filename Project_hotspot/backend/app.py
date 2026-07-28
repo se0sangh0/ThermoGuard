@@ -83,6 +83,12 @@ class MeasurementCreate(BaseModel):
     over_temp_pixels: int = 0
     max_hotspot_size: int = 0
 
+    # thermal_monitoring에서 전달하는 판정 결과
+    status: str = "normal"
+    algorithm_version: str = "v2.0"
+    do_alarm: bool = False
+    alarm_message: str | None = None
+
 class ThresholdUpdate(BaseModel):
     baseline_temp: float | None = None
     warning_delta: float | None = None
@@ -920,13 +926,13 @@ def create_measurement(data: MeasurementCreate):
             warning_temp = baseline + warning_delta
             critical_temp = baseline + critical_delta
 
-            # 2. 상태 자동 판정
-            if data.max_temp >= critical_temp:
-                status = "critical"
-            elif data.max_temp >= warning_temp:
-                status = "warning"
-            else:
-                status = "normal"
+            # 2. 상태 및 캡처 모드는 thermal_monitoring에서 전달한 값 사용
+            status = data.status
+
+            capture_mode = (
+                "warning" if status in ("warning", "critical") else "normal"
+            )
+            visual_status = "success" if status == "normal" else "skipped"
 
             # 3. 촬영 기록 생성
             capture_result = connection.execute(
@@ -946,20 +952,22 @@ def create_measurement(data: MeasurementCreate):
                         NOW(6),
                         NOW(6),
                         NOW(6),
-                        'normal',
+                        :capture_mode,
                         'success',
-                        'skipped',
+                        :visual_status,
                         'complete'
                     )
                 """),
                 {
-                    "camera_id": data.camera_id
+                    "camera_id": data.camera_id,
+                    "capture_mode": capture_mode,
+                    "visual_status": visual_status,
                 }
             )
 
             capture_id = capture_result.lastrowid
 
-            # 4. 분석 실행 기록 생성
+            # 4. 분석 실행 기록 생성 (thermal_monitoring의 algorithm_version 사용)
             analysis_result = connection.execute(
                 text("""
                     INSERT INTO analysis_runs (
@@ -974,17 +982,18 @@ def create_measurement(data: MeasurementCreate):
                         NOW(6),
                         NOW(6),
                         'success',
-                        'v1.0'
+                        :algorithm_version
                     )
                 """),
                 {
-                    "capture_id": capture_id
+                    "capture_id": capture_id,
+                    "algorithm_version": data.algorithm_version,
                 }
             )
 
             analysis_id = analysis_result.lastrowid
 
-            # 5. 측정 데이터 저장
+            # 5. 측정 데이터 저장 (thermal_monitoring의 status 사용)
             measurement_result = connection.execute(
                 text("""
                     INSERT INTO roi_measurements (
@@ -1030,7 +1039,7 @@ def create_measurement(data: MeasurementCreate):
                     "delta_temp": data.delta_temp,
                     "over_temp_pixels": data.over_temp_pixels,
                     "max_hotspot_size": data.max_hotspot_size,
-                    "status": status
+                    "status": status,
                 }
             )
 
@@ -1038,8 +1047,9 @@ def create_measurement(data: MeasurementCreate):
 
             alert_id = None
 
-            # 6. WARNING / CRITICAL이면 alert_events 자동 생성
-            if status in ("warning", "critical"):
+            # 6. do_alarm이 True인 경우만 alert_events 생성
+            #    (thermal_monitoring의 상태 머신 + 쿨다운을 통과한 알람만 기록)
+            if data.do_alarm:
 
                 robot_result = connection.execute(
                     text("""
@@ -1093,6 +1103,7 @@ def create_measurement(data: MeasurementCreate):
                         "severity": status,
                         "max_temp": data.max_temp,
                         "message": (
+                            data.alarm_message or
                             f"ROI {data.roi_id} 온도 이상 감지: "
                             f"{data.max_temp}°C / 상태: {status}"
                         )
@@ -1109,7 +1120,9 @@ def create_measurement(data: MeasurementCreate):
             "temperature_status": status,
             "warning_temp": warning_temp,
             "critical_temp": critical_temp,
-            "alert_id": alert_id
+            "alert_id": alert_id,
+            "do_alarm": data.do_alarm,
+            "algorithm_version": data.algorithm_version
         }
 
     except Exception as e:

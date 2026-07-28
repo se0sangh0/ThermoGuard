@@ -29,11 +29,10 @@ grab_flir_temperature.py
    │
    ▼
 FastAPI
-   │
-   ├─ 측정 데이터 수신
-   ├─ Warning / Critical 기준 확인
-   ├─ 상태 자동 판정
-   └─ MariaDB 저장
+    │
+    ├─ 측정 데이터 수신
+    ├─ thermal_monitoring 판정 결과(status, do_alarm) 그대로 기록
+    └─ MariaDB 저장
    │
    ▼
 MariaDB
@@ -1305,8 +1304,8 @@ Mono16 RAW 데이터
       FastAPI POST
           │
           ▼
-   임계값 자동 판정
-  Normal / Warning / Critical
+   thermal_monitoring 판정 결과 수신
+  (status, do_alarm 그대로 DB 저장)
           │
           ▼
        MariaDB
@@ -1483,7 +1482,11 @@ POST /api/measurements
   "ambient_temp": 25.85,
   "delta_temp": 9.29,
   "over_temp_pixels": 0,
-  "max_hotspot_size": 0
+  "max_hotspot_size": 0,
+  "status": "normal",
+  "algorithm_version": "v2.0",
+  "do_alarm": false,
+  "alarm_message": null
 }
 ```
 
@@ -1492,9 +1495,9 @@ FastAPI는 이 JSON을 받아서 다음 일을 한다.
 ```text
 1. 요청 데이터 읽기
 2. camera_id / roi_id 확인
-3. DB에서 Threshold 조회
-4. 온도 상태 판단
-5. captures 데이터 생성
+3. DB에서 Threshold 조회 (warning_temp, critical_temp 참조용)
+4. thermal_monitoring이 판정한 status, do_alarm을 그대로 사용
+5. captures 데이터 생성 (status에 따라 capture_mode, visual_status 결정)
 6. analysis_runs 데이터 생성
 7. roi_measurements 저장
 8. Warning/Critical이면 alert_events 생성
@@ -1754,22 +1757,20 @@ Warning 또는 Critical 발생 시 경고 이벤트 저장.
 
 ---
 
-# 10. 자동 위험도 판정
+# 10. 위험도 판정 (thermal_monitoring 연동)
 
-FastAPI는 단순히 데이터를 저장하는 것이 아니라 Threshold와 비교해 상태를 자동으로 판단한다.
+열화상 분석 엔진(`thermal_monitoring`)은 다음과 같은 이중 경로 판정을 수행한다.
+
+- **95th percentile 경로**: `95th >= baseline + delta` AND 클러스터 ≥ 3px
+- **max 온도 경로**: `max >= baseline + critical_delta` AND 클러스터 ≥ 10px
+
+엔진이 상태 머신(Normal → Warning → Critical)과 쿨다운(600초)을 거쳐 최종 판정을 내리면, 그 결과를 `POST /api/measurements`로 FastAPI에 전달한다. FastAPI는 자체 판정을 하지 않고 전달받은 `status`, `do_alarm` 값을 그대로 DB에 기록한다.
 
 ```text
-현재 최고온도 < 47°C
-→ Normal
-
-47°C 이상 ~ 55°C 미만
-→ Warning
-
-55°C 이상
-→ Critical
+thermal_monitoring 판정 → status="critical", do_alarm=True → FastAPI → DB alert_events INSERT
+thermal_monitoring 판정 → status="warning", do_alarm=False → FastAPI → DB roi_measurements만 저장
+thermal_monitoring 판정 → status="normal",  do_alarm=False → FastAPI → DB roi_measurements만 저장
 ```
-
-오늘 실제 응답 예:
 
 ```json
 {
@@ -1780,7 +1781,9 @@ FastAPI는 단순히 데이터를 저장하는 것이 아니라 Threshold와 비
   "temperature_status": "normal",
   "warning_temp": 47.0,
   "critical_temp": 55.0,
-  "alert_id": null
+  "alert_id": null,
+  "do_alarm": false,
+  "algorithm_version": "v2.0"
 }
 ```
 
@@ -1794,7 +1797,7 @@ measurement_id 14 생성
 현재 상태 Normal
 Warning 기준 47°C
 Critical 기준 55°C
-경고가 아니므로 alert_id 없음
+do_alarm=False → 알람 없음, alert_id 없음
 ```
 
 ---
@@ -2640,8 +2643,8 @@ FLIR 측정 및 FastAPI 전송 성공
 [3] FastAPI
      │
      ├─ JSON 수신
-     ├─ Threshold 조회
-     ├─ Normal/Warning/Critical 판정
+     ├─ Threshold 조회 (참조용)
+     ├─ 전달받은 status, do_alarm 그대로 DB 저장
      └─ DB 저장
      │
      ▼
@@ -3163,7 +3166,7 @@ Jetson이 부팅될 때 FastAPI와 Collector를 자동 실행하고, 프로그�
 [완료] MariaDB 구축
 [완료] FastAPI 구축
 [완료] FastAPI ↔ MariaDB
-[완료] Threshold 자동 판정
+[완료] Threshold 자동 판정 → thermal_monitoring 연동으로 변경
 [완료] Warning/Critical Alert 구조
 [완료] FLIR A50 네트워크 연결
 [완료] Aravis 장치 발견
@@ -3184,7 +3187,7 @@ Jetson이 부팅될 때 FastAPI와 Collector를 자동 실행하고, 프로그�
 
 # 42. 한 문장으로 프로젝트를 설명하면
 
-> **Jetson AGX Orin을 로컬 서버로 사용하고 FLIR A50 Radiometric 열화상 카메라의 실제 온도 데이터를 GigE Vision으로 수집하여 ROI 기반으로 분석한 뒤, FastAPI를 통해 MariaDB에 저장하고 임계온도 기반으로 Normal·Warning·Critical 상태를 자동 판정하며, systemd와 Collector를 이용해 무인 상태에서도 지속적으로 모니터링하는 산업 설비 과열 감시 시스템을 구축하였다.**
+> **Jetson AGX Orin을 로컬 서버로 사용하고 FLIR A50 Radiometric 열화상 카메라의 실제 온도 데이터를 GigE Vision으로 수집하여 ROI 기반으로 분석한 뒤, FastAPI를 통해 MariaDB에 저장하며, thermal_monitoring 엔진의 이중 경로 판정(95th percentile + 클러스터 분석) 결과를 연동받아 systemd와 Collector를 이용해 무인 상태에서도 지속적으로 모니터링하는 산업 설비 과열 감시 시스템을 구축하였다.**
 
 ---
 
@@ -3208,7 +3211,7 @@ Linux
 실제 센서 데이터
 → 실제 서버
 → 실제 DB
-→ 자동 위험 판정
+→ thermal_monitoring 판정 결과 그대로 DB 저장
 → 자동 반복
 → 자동 서비스 실행
 ```
