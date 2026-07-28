@@ -16,14 +16,14 @@ FLIR A50 → REST Snapshot → Temperature Matrix (.npy) → ROI 설정 → 온�
 | 카메라 | FLIR A50 Bi-spectrum (Thermal + Visible) |
 | Thermal 해상도 | 640 × 480 |
 | RGB 해상도 | 2592 × 1944 |
-| `data 수집 주기` | 평상시 30초, 과열 시 5초 (config.json에서 조정 가능) |
+| 데이터 수집 주기 | 평상시 30초, 과열 시 5초 (config.json에서 조정 가능) |
 
 ## 프로젝트 구조
 
 ```
 project/
 ├── monitor.py              # 진입점: 실시간 감시 시퀀서 → thermal_monitoring.pipeline.monitor
-├── dashboard.py          # 진입점: 운영 대시보드 GUI → thermal_monitoring.tools.product_dashboard
+├── dashboard.py            # 진입점: 운영 대시보드 GUI → thermal_monitoring.tools.product_dashboard
 ├── pipeline.py             # 진입점: 배치 분석 파이프라인 → thermal_monitoring.pipeline.pipeline
 │
 ├── thermal_monitoring/     # 메인 패키지
@@ -41,7 +41,9 @@ project/
 │   │   ├── __init__.py
 │   │   ├── checking.py     # 데이터셋 무결성 검사 및 복구 (병렬 NPY 추출)
 │   │   ├── metadata.py     # CSV 메타데이터 생성/업데이트
-│   │   └── cleanup.py      # 오래된 데이터셋 정리 (Normal만 삭제, Warning/Critical 이력 보존)
+│   │   ├── cleanup.py      # 오래된 데이터셋 정리 (Normal만 삭제, Warning/Critical 이력 보존)
+│   │   ├── pairs.py        # Thermal/Visual/NPY 파일 쌍 스캔·해석 공용 유틸
+│   │   └── quality.py      # 이미지 쌍 품질 검사 (해상도 중복·역전 감지, 동일 이미지 판별)
 │   │
 │   ├── analysis/           # 📊 핵심 분석
 │   │   ├── __init__.py
@@ -57,22 +59,36 @@ project/
 │   │
 │   └── tools/              # 🛠️ 운영 도구
 │       ├── __init__.py
-│       ├── product_dashboard.py # 운영 대시보드 GUI (ProductDashboard)
+│       ├── product_dashboard.py  # 운영 대시보드 GUI (ProductDashboard)
 │       ├── roi_selector.py # GUI ROI 영역 설정 도구
-│       └── calibration.py  # Thermal-RGB Homography 캘리브레이션
+│       ├── calibration.py   # Thermal-RGB Homography 캘리브레이션
+│       └── tk_image_dialogs.py   # 크기 조정 가능 Tkinter 다이얼로그 (ROI 편집, 캘리브레이션)
 │
 ├── tests/                  # 🧪 테스트
 │   ├── __init__.py
-│   ├── test_threshold.py   # Threshold 시뮬레이션 테스트
-│   ├── test_overlay.py     # 오버레이 생성 통합 테스트
-│   └── test_data_workflows.py # 데이터 워크플로우 단위 테스트
+│   ├── test_threshold.py         # Threshold 시뮬레이션 테스트
+│   ├── test_overlay.py           # 오버레이 생성 통합 테스트
+│   ├── test_data_workflows.py    # 데이터 워크플로우 단위 테스트
+│   ├── test_notifier_settings.py # 알림 설정 테스트
+│   └── test_tk_image_dialogs.py  # TkImageDialogs 단위 테스트
+│
+├── backend/                # 🖥️ 백엔드 서버
+│   └── collector/          # 데이터 수집기 (DB 연동 예정)
+│
+├── docs/                   # 📚 문서
+│   ├── 데이터_관리_구조.md      # 데이터 저장·관리·정리 흐름 (동료 DB 작업 진입용)
+│   ├── 시스템_아키텍처_보고서.md  # HW/SW 아키텍처, 시퀀스, 상태 머신
+│   ├── 기본 GUI 파이프라인.md    # GUI 파이프라인 설계
+│   ├── api 충돌.md              # API 충돌 이슈 정리
+│   └── 20260721~20260724.md  # 작업 일지 (4일)
 │
 ├── config.json             # 통합 설정 파일 (gitignore, 자동 생성)
 ├── .env.example            # 환경변수 템플릿 (BOT_TOKEN, CHAT_ID)
 ├── requirements.txt        # 의존성 패키지
+├── API_GUIDE.md            # GUI 연동 API 레퍼런스 (함수 시그니처, 예제 코드)
+├── ARCHITECTURE.md         # 시스템 아키텍처 상세 (스레드 모델, 데이터 흐름, 셧다운)
 ├── product_design.md       # 제품 설계 계획안
 ├── logs/                   # 운영 로그 (일자별 롤링, 30일 보존)
-│   └── app.log            #  │  예: app.log.2026-07-20
 └── thermal_dataset/        # 수집된 데이터셋
     ├── *.jpg               # Thermal 원본 이미지
     ├── *_thermal.npy       # 픽셀별 온도 행렬
@@ -90,6 +106,8 @@ from thermal_monitoring import load_config, save_config, AppConfig, setup_encodi
 # 서브패키지별 API
 from thermal_monitoring.capture import CaptureSession, extract_from_jpeg, raw2temp, probe_thermal_from_url
 from thermal_monitoring.data import run_check, run_metadata, run_cleanup, run_cleanup_if_due
+from thermal_monitoring.data.pairs import thermal_jpgs, latest_analysis_pair
+from thermal_monitoring.data.quality import assess_image_quality
 from thermal_monitoring.analysis import (
     load_roi_config, extract_roi_from_npy, extract_all_rois_from_npy,
     evaluate_threshold, evaluate_with_state,
@@ -179,15 +197,17 @@ tail -f logs/app.log
     ]
   },
   "monitoring": {
-    "process_interval_sec": 2.0,     // 신규 파일 스캔 주기
-    "integrity_interval_sec": 60.0,  // 무결성 검사 주기
-    "metadata_interval_sec": 120.0,  // 메타데이터 업데이트 주기
-    "max_processed_cache": 10000,    // 처리된 파일 캐시 크기
-    "alarm_cooldown_sec": 600        // 알림 쿨다운 (초, 기본 10분)
+    "process_interval_sec": 2.0,      // 신규 파일 스캔 주기
+    "integrity_interval_sec": 60.0,   // 무결성 검사 주기
+    "metadata_interval_sec": 120.0,   // 메타데이터 업데이트 주기
+    "cleanup_interval_sec": 3600.0,   // 데이터 정리 주기 (기본 1시간)
+    "cleanup_retention_days": 2,      // Normal 데이터 보존 기간 (일)
+    "max_processed_cache": 10000,     // 처리된 파일 캐시 크기
+    "alarm_cooldown_sec": 600         // 알림 쿨다운 (초, 기본 10분)
   },
   "hotspot": {
-    "min_size": 3,                   // 95th 경로 최소 클러스터 크기 (px)
-    "min_size_max": 10               // max 온도 경로 최소 클러스터 크기 (px)
+    "min_size": 3,                    // 95th 경로 최소 클러스터 크기 (px)
+    "min_size_max": 10                // max 온도 경로 최소 클러스터 크기 (px)
   },
   "paths": {
     "dataset_dir": "thermal_dataset",
@@ -195,13 +215,13 @@ tail -f logs/app.log
     "homography_path": "thermal_to_rgb.npy"
   },
   "display": {
-    "roi_display_width": 640,        // Thermal 이미지 표시 너비
+    "roi_display_width": 640,         // Thermal 이미지 표시 너비
     "roi_display_height": 480,
-    "display_width": 800             // GUI 표시 너비
+    "display_width": 800              // GUI 표시 너비
   },
   "tools": {
-    "exiftool_path": "",             // "" = 자동 감지
-    "mode": "both"                   // 캡처 모드: "both" | "thermal"
+    "exiftool_path": "",              // "" = 자동 감지
+    "mode": "both"                    // 캡처 모드: "both" | "thermal"
   }
 }
 ```
@@ -241,6 +261,7 @@ grep "unreachable\|restored" logs/app.log
 | 알림 | `analysis.notifier` | 전송 성공·실패·이미지 누락 |
 | 캡처 | `capture` | 프로브 온도, 주기 전환, 연결 끊김·복구 |
 | ExifTool | `capture.thermal_utils` | 서브프로세스 timeout·실패 (파일명 포함) |
+| 데이터 | `data.*` | 무결성 검사, 메타데이터 갱신, 정리 작업 |
 | float32 | 전역 | 온도 행렬 dtype → 메모리 절감, Planck 변환 정밀도 유지 |
 
 **주요 로깅 이벤트:**
@@ -277,8 +298,11 @@ grep "unreachable\|restored" logs/app.log
 | `checking.py` | 데이터셋 무결성 검사 — NPY 누락 시 JPG에서 복구 (병렬), 고아 NPY 정리 (`run_check()` 함수) |
 | `metadata.py` | JPG-NPY 파일쌍 스캔 후 `metadata.csv` 자동 생성, ROI 온도 분석·판정 결과 포함 (`run_metadata()` 함수) |
 | `cleanup.py` | 오래된 데이터셋 자동 정리 — Normal 상태의 보존 기간(기본 2일) 지난 쌍 삭제, Warning/Critical 이력 있는 데이터는 metadata.csv 참조하여 보존, 고아 NPY/JPG/오버레이는 무조건 삭제 (`run_cleanup()`, `run_cleanup_if_due()`) |
+| `pairs.py` | Thermal/Visual/NPY 파일 쌍 스캔·해석 공용 유틸 (`thermal_jpgs()`, `latest_analysis_pair()`) — 대시보드·monitor·도구의 공통 쌍 찾기 로직 통합 |
+| `quality.py` | 이미지 쌍 품질 검사 — 해상도 중복·역전 감지, 동일 이미지 판별 (`assess_image_quality()`) |
 | `calibration.py` | OpenCV GUI로 Thermal ↔ RGB 대응점 지정, Homography 행렬 계산 |
 | `roi_selector.py` | GUI ROI 영역 설정 도구 — **다중 ROI 지원** (N키 추가, Tab 전환, Del 삭제, 색상 구분), `config.json` 자동 저장 |
+| `tk_image_dialogs.py` | 크기 조정 가능 Tkinter 다이얼로그 — ROI 편집, 캘리브레이션용 공통 UI 컴포넌트 |
 
 ### 분석 파이프라인
 
@@ -315,11 +339,9 @@ grep "unreachable\|restored" logs/app.log
 
 ## 🚧 현재 작업 중
 
-- **DB 설계** — 온도 이력(test.py 히스토리)을 저장할 DB 스키마 설계 (동료 작업 대기)
+- **DB 연동** — `backend/collector/` 디렉토리 준비, 온도 이력 DB 스키마 설계 및 수집기 구현
 - **웹 대시보드** — 실시간 온도 트렌드, ROI 오버레이, 알림 상태 표시 (동료 작업 대기)
-- **실시간 모니터링 루프** — DB + 대시보드 완료 후 `pipeline.py`를 실시간 모드로 전환 예정
 - **공장 라인 실증 테스트** — 실제 로봇 발열 데이터 확보 시 검증
-- **오래된 데이터 자동 정리** — 1시간마다 보존 기간(기본 7일) 경과 데이터 정리
 - **ARM64 Ubuntu 지원** — AGX Orin 등 ARM64 환경에서 exiftool, python3-tk, libgl1 설치 필요
 
 ## 📋 앞으로 작업할 내용
@@ -335,15 +357,16 @@ grep "unreachable\|restored" logs/app.log
 | Telegram 알림     | ✅   | `notifier.py` — 이미지+캡션 전송, `.env` 토큰 관리                             |
 | Overlay 시각화     | ✅   | `overlay.py` — Thermal/RGB 이미지에 온도 정보 + 핫스팟 마커 표시, Homography 좌표 변환 |
 | 통합 파이프라인        | ✅   | `pipeline.py` — ROI → Threshold → Overlay → 알림                      |
-| 통합 모니터링 GUI     | ✅   | `dashboard.py` — 운영 대시보드, 백그라운드 분석 (UI 블로킹 없음), 캘리브레이션 보정 알림 |
-| 이력 관리           | ⬜   | 온도 트렌드 DB 저장 — DB 설계 완료 후 진행                                        |
-| 웹 대시보드          | ⬜   | 실시간 상태/트렌드/알림 표시 — 동료 작업 대기                                         |
-| 실시간 모니터링        | ⬜   | DB + 대시보드 연동 후 `pipeline.py` 실시간 전환                                 |
+| 통합 모니터링 GUI     | ✅   | `dashboard.py` — 운영 대시보드, 백그라운드 분석 (UI 블로킹 없음), 캘리브레이션 보정 알림        |
+| 이력 관리           | 🚧  | 온도 트렌드 DB 저장 — `backend/collector/` 디렉토리 준비, DB 설계 진행 중             |
+
 
 ### Phase 2 — 고도화
 
 - Robot Detection AI 모델 적용
 - 이상 탐지(Anomaly Detection) 모델
+- 웹 대시보드
+- 실시간 모니터링
 - 다중 카메라 지원
 - RTSP 스트리밍 지원
 - 다중 로봇 모니터링
@@ -383,11 +406,11 @@ grep "unreachable\|restored" logs/app.log
 ```
 평상시 (30초 주기)
   ├── 풀캡처: 30초마다 Thermal + Visual JPEG 저장
-  └── 프로브: 대기 시간 동안 매 1초마다 경량 Thermal 체크 (JPEG 다운로드 → 최고 온도만 추출)
+  └── 프로브: 대기 시간 동안 매 3초마다 경량 Thermal 체크 (JPEG 다운로드 → 최고 온도만 추출)
                 │
                 ▼ threshold 초과 감지 시
 과열 모드 (5초 주기)
-  └── 풀캡처: 5초마다 Thermal + Visual JPEG 저장 (정밀 추적)
+  └── 풀캡처: 5초마다 Thermal JPEG 저장 (정밀 추적, Visual 생략)
                 │
                 ▼ Normal 복귀 시
 평상시 (30초 주기) ← 복귀
@@ -395,10 +418,10 @@ grep "unreachable\|restored" logs/app.log
 
 | 모드 | 캡처 주기 | 설정 키 | 동작 |
 |------|-----------|---------|------|
-| Normal | 30초 | `camera.capture_interval_sec` | 프로브가 백그라운드에서 1초마다 온도 체크, 임계값 초과 시 즉시 전환 |
-| Warning/Critical | 5초 | `camera.warning_interval_sec` | 고속 풀캡처로 정밀 추적, Normal 복귀 시 자동 해제 |
+| Normal | 30초 | `camera.capture_interval_sec` | 프로브가 백그라운드에서 3초마다 온도 체크, 임계값 초과 시 즉시 전환 |
+| Warning/Critical | 5초 | `camera.warning_interval_sec` | 고속 풀캡처로 정밀 추적 (thermal only), Normal 복귀 시 자동 해제 |
 
-프로브는 JPEG 바이트를 exiftool stdin 파이프로 받아 Raw Thermal 추출 후 Planck 변환으로 온도를 계산하며, 디스크에 저장하지 않아 경량 동작합니다. 프로브 실패 시 5초 백오프로 카메라 부하를 방지합니다.
+프로브는 JPEG 바이트를 exiftool stdin 파이프로 받아 Raw Thermal 추출 후 Planck 변환으로 온도를 계산하며, 디스크에 저장하지 않아 경량 동작합니다. 프로브 실패 시 ~6초 백오프로 카메라 부하를 방지합니다. Planck 캘리브레이션 파라미터는 5분간 캐시되어 불필요한 exiftool 호출을 줄입니다.
 
 ## 알림 규칙
 
@@ -409,16 +432,16 @@ grep "unreachable\|restored" logs/app.log
 | 경보 (Critical) | 5초 | 전송 | 로봇ID, 상태, 최고 온도, 발생 시간, 과열 범위 이미지 |
 
 - Critical 상태 진입 시에만 Telegram 알림 전송
-- Warning은 캡처 주기만 1초로 전환 (조기 감지용, 알림 없음)
+- Warning은 캡처 주기만 5초로 전환 (조기 감지용, 알림 없음)
 - 연속 발송 방지를 위한 쿨다운: 10분
 
 ## 데이터 보존 정책 (Cleanup)
 
-`cleanup.py`는 1시간마다 자동 실행되며, `metadata.csv`의 `alarm_level`을 기준으로 다음과 같이 처리합니다.
+`cleanup.py`는 `config.json`의 `monitoring.cleanup_interval_sec` (기본 1시간)마다 자동 실행되며, `metadata.csv`의 `alarm_level`을 기준으로 다음과 같이 처리합니다.
 
 | 데이터 구분 | 보존 기한 경과 시 처리 |
 |-------------|----------------------|
-| Normal 상태 쌍 (JPG + NPY + Visual) | 2일 경과 시 **삭제** |
+| Normal 상태 쌍 (JPG + NPY + Visual) | `cleanup_retention_days`일 경과 시 **삭제** (기본 2일) |
 | Warning/Critical 이력 쌍 | 보존 기한 무시, **영구 보존** |
 | JPG 없는 고아 NPY | **즉시 삭제** |
 | NPY 없는 고아 JPG | **즉시 삭제** |
@@ -431,6 +454,18 @@ python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(
 # 보존 기한 조정
 python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(retention_days=7)"
 ```
+
+## 📖 참고 문서
+
+| 문서 | 설명 |
+|------|------|
+| `API_GUIDE.md` | GUI 연동 API 레퍼런스 — 모든 공개 함수 시그니처, 예제 코드, 완전한 GUI 통합 흐름 |
+| `ARCHITECTURE.md` | 시스템 아키텍처 상세 — 스레드 모델, Planck 캐시, 데이터 생명주기, 셧다운 시퀀스, 알람 흐름 |
+| `product_design.md` | 제품 설계 계획안 |
+| `docs/데이터_관리_구조.md` | 데이터 저장·관리·정리 흐름 — 동료 DB 작업 진입용 |
+| `docs/시스템_아키텍처_보고서.md` | HW/SW 아키텍처, 시퀀스, 상태 머신, 오버레이 시각화 상세 |
+| `docs/기본 GUI 파이프라인.md` | GUI 파이프라인 설계 문서 |
+| `docs/api 충돌.md` | API 충돌 이슈 정리 |
 
 ## 🔒 보안 및 개인정보 규칙
 
@@ -449,11 +484,15 @@ python -c "from thermal_monitoring.data.cleanup import run_cleanup; run_cleanup(
 /.vscode
 /thermal_dataset
 /thermal_to_rgb.npy
-/__pycache__
+/logs
+__pycache__/
 /.obsidian
 *.pyc
+*.bak
 .env
 config.json
+/docs
+/.commandcode
 ```
 
 ## 라이선스
