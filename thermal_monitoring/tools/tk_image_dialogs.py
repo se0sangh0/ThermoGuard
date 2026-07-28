@@ -117,7 +117,7 @@ def _roi_values(entry) -> tuple[str, int, int, int, int]:
 
 
 class RoiTkDialog:
-    def __init__(self, parent, thermal_path: str, visual_path: str):
+    def __init__(self, parent, thermal_path: str, visual_path: str, save_handler=None):
         self.parent = parent
         self.cfg = load_config(force_reload=True)
         self.thermal_path = thermal_path
@@ -131,6 +131,7 @@ class RoiTkDialog:
         self.photo = None
         self.image_rect: ImageRect | None = None
         self._redraw_id = None
+        self.save_handler = save_handler
 
         homography_path = Path(self.cfg.paths.homography_path)
         if not homography_path.exists():
@@ -459,6 +460,18 @@ class RoiTkDialog:
             ))
         if not entries:
             return False
+        if self.save_handler is not None:
+            try:
+                self.save_handler(entries)
+            except Exception as exc:
+                messagebox.showerror(
+                    "ROI DB 저장 실패",
+                    "ROI를 데이터베이스에 저장하지 못했습니다.\n"
+                    "입력한 영역은 유지되므로 연결 상태를 확인한 뒤 다시 저장하세요.\n\n"
+                    f"{exc}",
+                    parent=self.win,
+                )
+                return
         self.cfg.roi.rois = entries
         first = entries[0]
         self.cfg.roi.x1, self.cfg.roi.y1 = first.x1, first.y1
@@ -698,8 +711,18 @@ class CalibrationTkDialog:
             self.win.destroy()
 
 
-def show_roi_dialog(parent, thermal_path: str, visual_path: str) -> bool:
-    return RoiTkDialog(parent, thermal_path, visual_path).show()
+def show_roi_dialog(
+    parent,
+    thermal_path: str,
+    visual_path: str,
+    save_handler=None,
+) -> bool:
+    return RoiTkDialog(
+        parent,
+        thermal_path,
+        visual_path,
+        save_handler=save_handler,
+    ).show()
 
 
 def show_calibration_dialog(parent, thermal_path: str, visual_path: str) -> bool:
