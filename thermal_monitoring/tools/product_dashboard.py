@@ -1626,10 +1626,18 @@ class SettingsDialog:
         self.baseline = tk.StringVar(value=str(self.d.cfg.roi.baseline_temp))
         self.warning = tk.StringVar(value=str(self.d.cfg.roi.warning_delta))
         self.critical = tk.StringVar(value=str(self.d.cfg.roi.critical_delta))
-        self._field(general, "카메라 주소", self.ip, 0)
-        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 1)
+        self.factory_name = tk.StringVar(value=self.d.cfg.identity.factory_name)
+        self.line_name = tk.StringVar(value=self.d.cfg.identity.line_name)
+        self.robot_name = tk.StringVar(
+            value=self.d.cfg.identity.robot_name or self.d.cfg.identity.robot_id
+        )
+        self._field(general, "공장 이름", self.factory_name, 0)
+        self._field(general, "생산라인 이름", self.line_name, 1)
+        self._field(general, "로봇 이름", self.robot_name, 2)
+        self._field(general, "카메라 주소", self.ip, 3)
+        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 4)
         ttk.Label(general, text="촬영 이미지, 온도 배열과 오버레이가 선택한 폴더에 저장됩니다.").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=12)
+            row=5, column=0, columnspan=3, sticky="w", pady=12)
         ttk.Label(roi, text="가시광 이미지에서 감시할 설비 영역을 지정합니다.", font=("맑은 고딕", 11, "bold")).pack(anchor="w", pady=8)
         self.roi_button = ttk.Button(roi, text="가시광 이미지에서 ROI 설정", command=self.open_roi_editor)
         self.roi_button.pack(anchor="w", pady=8)
@@ -2019,7 +2027,35 @@ class SettingsDialog:
         self.d._add_operating_log("ROI 설정", "시작", str(visual))
         try:
             from .tk_image_dialogs import show_roi_dialog
-            saved = show_roi_dialog(self.win, str(thermal), str(visual))
+            from .roi_api_client import sync_rois
+
+            def save_rois_to_db(entries):
+                if not self.d.cfg.backend.enabled:
+                    raise RuntimeError(
+                        "Backend API 연동이 비활성화되어 있습니다. "
+                        "환경설정의 Backend 설정을 확인하세요."
+                    )
+                result = sync_rois(
+                    self.d.cfg.backend.url,
+                    self.d.cfg.identity.camera_id,
+                    self.d.cfg.camera.ip,
+                    entries,
+                    timeout=self.d.cfg.backend.timeout_sec,
+                    database_camera_id=self.d.cfg.identity.db_camera_id,
+                )
+                self.d._add_operating_log(
+                    "ROI DB 연동",
+                    "저장 완료",
+                    f"camera_id={result.camera_id}, "
+                    f"신규 버전 {result.created}개, 변경 없음 {result.unchanged}개",
+                )
+
+            saved = show_roi_dialog(
+                self.win,
+                str(thermal),
+                str(visual),
+                save_handler=save_rois_to_db,
+            )
             self.d.cfg = load_config(force_reload=True)
             result_text = "완료" if saved else "종료"
             self.d._add_operating_log(
@@ -2074,6 +2110,16 @@ class SettingsDialog:
     def save(self):
         try:
             camera_ip = self.ip.get().strip()
+            factory_name = self.factory_name.get().strip()
+            line_name = self.line_name.get().strip()
+            robot_name = self.robot_name.get().strip()
+            if not factory_name or not line_name or not robot_name:
+                messagebox.showerror(
+                    "설비 정보 입력 오류",
+                    "공장 이름, 생산라인 이름, 로봇 이름을 모두 입력하세요.",
+                    parent=self.win,
+                )
+                return
             dataset_value = self.dataset_dir.get().strip()
             if not dataset_value:
                 messagebox.showerror("입력 오류", "데이터 저장 폴더를 선택하세요.", parent=self.win)
@@ -2088,13 +2134,57 @@ class SettingsDialog:
                 camera_ip != self.d.cfg.camera.ip
                 or dataset_path != os.path.normpath(self.d.cfg.paths.dataset_dir)
             )
+
+            if not self.d.cfg.backend.enabled:
+                messagebox.showerror(
+                    "DB 연동 비활성화",
+                    "Backend API 연동이 비활성화되어 있어 설비 정보를 저장할 수 없습니다.",
+                    parent=self.win,
+                )
+                return
+
+            from .asset_api_client import register_asset_hierarchy
+
+            identity = self.d.cfg.identity
+            same_factory = factory_name == identity.factory_name
+            same_line = same_factory and line_name == identity.line_name
+            same_robot = same_line and robot_name == identity.robot_name
+            same_camera = same_robot and camera_ip == self.d.cfg.camera.ip
+            registration = register_asset_hierarchy(
+                base_url=self.d.cfg.backend.url,
+                timeout=self.d.cfg.backend.timeout_sec,
+                factory_name=factory_name,
+                line_name=line_name,
+                robot_code=identity.robot_id,
+                robot_name=robot_name,
+                camera_code=identity.camera_id,
+                camera_ip=camera_ip,
+                factory_id=identity.factory_id if same_factory else None,
+                line_id=identity.line_id if same_line else None,
+                robot_id=identity.db_robot_id if same_robot else None,
+                camera_id=identity.db_camera_id if same_camera else None,
+            )
+
             self.d.cfg.camera.ip = camera_ip
+            identity.factory_name = factory_name
+            identity.line_name = line_name
+            identity.robot_name = robot_name
+            identity.factory_id = registration.factory_id
+            identity.line_id = registration.line_id
+            identity.db_robot_id = registration.robot_id
+            identity.db_camera_id = registration.camera_id
             self.d.cfg.paths.dataset_dir = dataset_path
             self.d.cfg.paths.overlay_dir = overlay_path
             self.d.cfg.roi.baseline_temp = float(self.baseline.get())
             self.d.cfg.roi.warning_delta = float(self.warning.get())
             self.d.cfg.roi.critical_delta = float(self.critical.get())
             save_config(self.d.cfg)
+            self.d._add_operating_log(
+                "설비 DB 연동",
+                "저장 완료",
+                f"{factory_name} · {line_name} · {robot_name} "
+                f"(camera_id={registration.camera_id})",
+            )
             self.d._add_operating_log("환경설정", "저장 경로 변경", dataset_path)
             # 화면 갱신 주기는 운영 화면 정책에 따라 30초로 고정한다.
             self.d._schedule_refresh(self.d.REFRESH_SECONDS * 1000)
@@ -2111,6 +2201,13 @@ class SettingsDialog:
             messagebox.showerror("저장 경로 오류", f"폴더를 만들거나 사용할 수 없습니다.\n{exc}", parent=self.win)
         except ValueError:
             messagebox.showerror("입력 오류", "숫자 설정값을 확인하세요.", parent=self.win)
+        except Exception as exc:
+            self.d._add_operating_log("설비 DB 연동", "저장 실패", str(exc))
+            messagebox.showerror(
+                "설비 정보 DB 저장 실패",
+                f"공장·생산라인·로봇 정보를 저장하지 못했습니다.\n\n{exc}",
+                parent=self.win,
+            )
 
 
 def main():
