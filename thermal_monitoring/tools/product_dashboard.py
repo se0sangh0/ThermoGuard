@@ -1122,18 +1122,20 @@ class ProductDashboard:
             alarm_status == Status.WARNING and self._last_alarm_status != Status.WARNING
         )
         self._last_alarm_status = alarm_status
+
+        # 새로 촬영된 이미지일 때만 백엔드 DB에 측정값을 기록한다.
+        if is_new_capture and self._latest_pair_fresh:
+            result["_backend_posted_event"] = threading.Event()
+            threading.Thread(
+                target=self._post_to_backend, args=(result,), daemon=True
+            ).start()
+
         self._maybe_dispatch_telegram(
             result,
             quality_ok,
             captured_at,
             warning_transition=warning_transition,
         )
-
-        # 새로 촬영된 이미지일 때만 백엔드 DB에 측정값을 기록한다.
-        if is_new_capture and self._latest_pair_fresh:
-            threading.Thread(
-                target=self._post_to_backend, args=(result,), daemon=True
-            ).start()
 
         # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다.
         # 갱신하면 캡처 저장 시차나 잘못된 파일 쌍 때문에 좌우 영상이
@@ -1439,6 +1441,12 @@ class ProductDashboard:
             import tempfile
             from ..analysis.notifier import send_alarm
 
+            alert_id = None
+            backend_event = result.get("_backend_posted_event")
+            if backend_event is not None:
+                # backend measurement POST may be running concurrently; wait briefly for alert_id.
+                if backend_event.wait(12.0):
+                    alert_id = result.get("alert_id")
             tmp_path = None
             image_path = ""
             if overlay is not None:
@@ -1454,6 +1462,7 @@ class ProductDashboard:
                     temp=temp,
                     status=status_value,
                     robot_id=robot_id,
+                    alert_id=alert_id,
                 )
                 _log("전송 성공" if ok else "전송 실패",
                      f"{robot_id} · {temp:.1f}°C · {'사진' if image_path else '텍스트'}")
@@ -1535,6 +1544,7 @@ class ProductDashboard:
         roi_id = getattr(roi, "db_roi_id", None) if roi is not None else 1
         if roi_id is None:
             roi_id = 1
+        backend_event = result.get("_backend_posted_event")
         try:
             payload = {
                 "camera_id": camera_id,
@@ -1560,8 +1570,13 @@ class ProductDashboard:
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("status") == "created":
+                    result["alert_id"] = data.get("alert_id")
                     self.metrics.api_successes += 1
-                    _file_log.info("backend POST ok: capture_id=%s", data.get("capture_id"))
+                    _file_log.info(
+                        "backend POST ok: capture_id=%s alert_id=%s",
+                        data.get("capture_id"),
+                        data.get("alert_id"),
+                    )
                 else:
                     _file_log.warning("backend POST rejected: %s", data)
             else:
@@ -1572,6 +1587,12 @@ class ProductDashboard:
             self.metrics.api_connection_errors += 1
         except Exception:
             self.metrics.api_other_errors += 1
+        finally:
+            if backend_event is not None:
+                try:
+                    backend_event.set()
+                except Exception:
+                    pass
 
     def _sync_events_from_backend(self):
         """GET /api/alerts 로 영구 알람 이벤트 목록을 가져와 self.events와 병합."""

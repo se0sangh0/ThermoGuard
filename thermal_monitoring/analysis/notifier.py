@@ -56,6 +56,10 @@ TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "true").strip().lower() in
 
 TELEGRAM_API = "https://api.telegram.org"
 
+FASTAPI_URL = os.environ.get(
+    "FASTAPI_URL",
+    "http://127.0.0.1:8000"
+)
 
 def _is_configured() -> bool:
     return bool(BOT_TOKEN and CHAT_ID)
@@ -240,6 +244,56 @@ def build_text_message(
         f"Status    : {status}"
     )
 
+def save_delivery_result(
+    alert_id: int,
+    success: bool,
+    http_status: int | None = None,
+    error_message: str | None = None,
+    retry_count: int = 0,
+) -> bool:
+    """Telegram 전송 결과를 FastAPI를 통해 DB에 저장한다."""
+
+    try:
+        response = requests.post(
+            f"{FASTAPI_URL}/api/notification-deliveries",
+            json={
+                "alert_id": alert_id,
+                "delivery_status": (
+                    "success" if success else "failed"
+                ),
+                "http_status": http_status,
+                "retry_count": retry_count,
+                "error_message": error_message,
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get("status") != "created":
+            _log.error(
+                "notification_deliveries 저장 실패: %s",
+                result,
+            )
+            return False
+
+        _log.info(
+            "notification_deliveries 저장 성공: "
+            "alert_id=%s delivery_id=%s",
+            alert_id,
+            result.get("delivery_id"),
+        )
+        return True
+
+    except Exception as exc:
+        _log.error(
+            "notification delivery API 호출 실패: "
+            "alert_id=%s error=%s",
+            alert_id,
+            exc,
+        )
+        return False
 
 # ------------------------------------------------------------
 # 전송 함수
@@ -249,6 +303,7 @@ def send_alarm(
     temp: float,
     status: str,
     robot_id: str = "Robot-01",
+    alert_id: int | None = None,
 ) -> bool:
     """
     과열 알림 전송 (이미지 + 캡션).
@@ -280,6 +335,9 @@ def send_alarm(
 
     # 1. 이미지 + 캡션 전송 시도
     photo_sent = False
+    last_http_status: int | None = None
+    last_error_message: str | None = None
+
     if os.path.isfile(image_path):
         try:
             with open(image_path, "rb") as photo:
@@ -289,13 +347,18 @@ def send_alarm(
                     files={"photo": photo},
                     timeout=30,
                 )
+            last_http_status = resp.status_code
             if resp.status_code == 200:
                 photo_sent = True
                 _log.info("sendPhoto success: robot=%s temp=%.1f°C", robot_id, temp)
             else:
+                last_error_message = (
+                    f"Telegram sendPhoto 실패: HTTP {resp.status_code} {resp.text}"
+                )
                 _log.error("sendPhoto failed: HTTP %d %s", resp.status_code, resp.text)
                 print(f"[Telegram] sendPhoto failed: {resp.status_code} {resp.text}")
         except Exception as e:
+            last_error_message = f"Telegram sendPhoto 예외: {e}"
             _log.error("sendPhoto exception: %s", e)
             print(f"[Telegram] sendPhoto error - falling back to text")
     else:
@@ -310,14 +373,28 @@ def send_alarm(
                 data={"chat_id": CHAT_ID, "text": caption},
                 timeout=30,
             )
+            last_http_status = resp.status_code
             if resp.status_code == 200:
                 photo_sent = True
             else:
+                last_error_message = (
+                    f"Telegram sendMessage 실패: HTTP {resp.status_code} {resp.text}"
+                )
                 _log.error("sendMessage fallback failed: HTTP %d %s", resp.status_code, resp.text)
                 print(f"[Telegram] sendMessage failed: {resp.status_code} {resp.text}")
         except Exception as e:
+            last_error_message = f"Telegram sendMessage 예외: {e}"
             _log.error("sendMessage exception: %s", e)
             print(f"[Telegram] sendMessage error")
+
+    if alert_id is not None:
+        save_delivery_result(
+            alert_id=alert_id,
+            success=photo_sent,
+            http_status=last_http_status,
+            error_message=(None if photo_sent else last_error_message),
+            retry_count=0,
+        )
 
     return photo_sent
 

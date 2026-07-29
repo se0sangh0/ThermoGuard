@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from database import engine
 from pydantic import BaseModel
@@ -99,6 +100,13 @@ class ThresholdUpdate(BaseModel):
 
 class AlertUpdate(BaseModel):
     event_status: str
+
+class NotificationDeliveryCreate(BaseModel):
+    alert_id: int
+    delivery_status: str
+    http_status: int | None = None
+    retry_count: int = 0
+    error_message: str | None = None   
 # =============================
 # 기존 GET API들
 # =============================
@@ -405,6 +413,58 @@ def get_alerts(limit: int = 100):
             "error": str(e)
         }
 
+@app.get("/api/notification-deliveries")
+def get_notification_deliveries(limit: int = 100):
+    try:
+        with engine.connect() as connection:
+            result = connection.execute(
+                text("""
+                    SELECT
+                        delivery_id,
+                        alert_id,
+                        attempted_at,
+                        delivery_status,
+                        http_status,
+                        retry_count,
+                        sent_at,
+                        error_message
+                    FROM notification_deliveries
+                    ORDER BY delivery_id DESC
+                    LIMIT :limit
+                """),
+                {
+                    "limit": limit
+                }
+            )
+
+            deliveries = []
+
+            for row in result.mappings():
+                deliveries.append({
+                    "delivery_id": row["delivery_id"],
+                    "alert_id": row["alert_id"],
+                    "attempted_at": str(row["attempted_at"]),
+                    "delivery_status": row["delivery_status"],
+                    "http_status": row["http_status"],
+                    "retry_count": row["retry_count"],
+                    "sent_at": (
+                        str(row["sent_at"])
+                        if row["sent_at"] else None
+                    ),
+                    "error_message": row["error_message"]
+                })
+
+        return {
+            "count": len(deliveries),
+            "deliveries": deliveries
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
 @app.get("/api/dashboard/summary")
 def get_dashboard_summary():
     try:
@@ -604,6 +664,99 @@ def get_thresholds():
 
         
 #위는 get, 아래는 post
+
+@app.post("/api/notification-deliveries")
+def create_notification_delivery(
+    data: NotificationDeliveryCreate
+):
+    try:
+        allowed_statuses = {
+            "pending",
+            "success",
+            "failed"
+        }
+
+        if data.delivery_status not in allowed_statuses:
+            return {
+                "status": "error",
+                "error": (
+                    "delivery_status는 "
+                    "pending, success, failed 중 하나여야 합니다."
+                )
+            }
+
+        with engine.begin() as connection:
+
+            # 1. 연결할 alert_id가 실제로 존재하는지 확인
+            alert = connection.execute(
+                text("""
+                    SELECT alert_id
+                    FROM alert_events
+                    WHERE alert_id = :alert_id
+                """),
+                {
+                    "alert_id": data.alert_id
+                }
+            ).fetchone()
+
+            if alert is None:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"alert_id={data.alert_id}인 "
+                        "경고 이벤트가 없습니다."
+                    )
+                }
+
+            # 2. Telegram 전송 결과 저장
+            result = connection.execute(
+                text("""
+                    INSERT INTO notification_deliveries (
+                        alert_id,
+                        attempted_at,
+                        delivery_status,
+                        http_status,
+                        retry_count,
+                        sent_at,
+                        error_message
+                    )
+                    VALUES (
+                        :alert_id,
+                        NOW(6),
+                        :delivery_status,
+                        :http_status,
+                        :retry_count,
+                        CASE
+                            WHEN :delivery_status = 'success'
+                            THEN NOW(6)
+                            ELSE NULL
+                        END,
+                        :error_message
+                    )
+                """),
+                {
+                    "alert_id": data.alert_id,
+                    "delivery_status": data.delivery_status,
+                    "http_status": data.http_status,
+                    "retry_count": data.retry_count,
+                    "error_message": data.error_message
+                }
+            )
+
+            delivery_id = result.lastrowid
+
+        return {
+            "status": "created",
+            "delivery_id": delivery_id,
+            "alert_id": data.alert_id,
+            "delivery_status": data.delivery_status
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
 @app.post("/api/factories")
 def create_factory(factory: FactoryCreate):
