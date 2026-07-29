@@ -89,7 +89,7 @@ def sync_rois(
     *,
     timeout: float = 5.0,
     database_camera_id: int | None = None,
-) -> RoiSyncResult:
+) -> tuple[RoiSyncResult, dict[str, int]]:
     """Send changed thermal-coordinate ROIs through existing FastAPI routes."""
     camera_id = (
         int(database_camera_id)

@@ -41,6 +41,7 @@ from ..data.pairs import capture_time_from_file, latest_analysis_pair
 from ..data.quality import assess_image_quality
 from ..config import load_config, save_config
 from ..logger import get_logger
+from .telegram_dispatcher import TelegramDispatcher
 
 _file_log = get_logger("tools.dashboard")
 
@@ -126,7 +127,7 @@ class ProductDashboard:
         self.temperature_history: list[tuple[datetime, float]] = []
         self._last_history_capture: Optional[datetime] = None
         self._last_alert_capture: Optional[datetime] = None
-        self._last_telegram_capture: Optional[datetime] = None
+        self.telegram = TelegramDispatcher(self)
         self._trend_hover_points: list[tuple[float, float, datetime, float]] = []
         # 최근 화면 품질을 기준으로 정상률을 계산한다. 누적 전체 기준보다
         # 현재 발생한 영상 이상이 즉시 수치에 반영된다.
@@ -1127,10 +1128,10 @@ class ProductDashboard:
         if is_new_capture and self._latest_pair_fresh:
             result["_backend_posted_event"] = threading.Event()
             threading.Thread(
-                target=self._post_to_backend, args=(result,), daemon=True
+                target=self.telegram.post_measurement, args=(result,), daemon=True
             ).start()
 
-        self._maybe_dispatch_telegram(
+        self.telegram.maybe_dispatch(
             result,
             quality_ok,
             captured_at,
@@ -1369,230 +1370,11 @@ class ProductDashboard:
         for row in self.operating_logs:
             tree.insert("", "end", values=row)
 
-    def _maybe_dispatch_telegram(
-        self,
-        result: dict,
-        quality_ok: bool,
-        captured_at,
-        *,
-        warning_transition: bool = False,
-    ) -> None:
-        """경고 진입/위험 알람을 전송하고 보내지 않는 경우도 로그로 남긴다.
-
-        result["alarm"]은 상태 머신이 판정한 CRITICAL 전이(+쿨다운) 신호이며,
-        Warning은 최초 상태 전이 시 한 번만 전송한다.
-        품질 미달·동일 캡처 중복이면 전송을 건너뛰되 '보류' 사유를 기록해,
-        'ALARM TRIGGERED는 떴는데 텔레그램이 왜 안 왔는지'를 로그로 추적할 수 있게 한다.
-        """
-        if not result.get("alarm") and not warning_transition:
-            return
-        from ..analysis import notifier
-        settings = notifier.get_settings()
-        if not settings["configured"]:
-            self._add_operating_log(
-                "텔레그램 알림", "보류", "미로그인 — 환경설정에서 Telegram에 로그인하세요",
-            )
-            return
-        elif not settings["enabled"]:
-            self._add_operating_log(
-                "텔레그램 알림", "보류", "알림 전송 비활성화",
-            )
-            return
-        if not quality_ok:
-            self._add_operating_log(
-                "텔레그램 알림", "보류",
-                result.get("image_quality_reason", "영상 품질 미달로 미발송"),
-            )
-        elif captured_at == self._last_telegram_capture:
-            self._add_operating_log(
-                "텔레그램 알림", "보류", "동일 캡처 재분석 — 중복 발송 방지",
-            )
-        else:
-            self._last_telegram_capture = captured_at
-            self._add_operating_log(
-                "텔레그램 알림", "전송 시도",
-                f"{result.get('overall_max_roi_name', 'ROI')} · {result['max_temp']:.1f}°C",
-            )
-            self._dispatch_telegram(result)
-
-    def _dispatch_telegram(self, result: dict):
-        """경고 또는 위험 알람을 텔레그램으로 전송한다.
-
-        send_alarm은 최대 수십 초 블로킹되는 HTTP 호출이므로 Tk 메인 스레드가
-        아닌 데몬 스레드에서 실행하고, 결과 로그만 root.after로 메인 스레드에
-        되돌려 GUI가 멈추지 않게 한다. 오버레이(메모리 이미지)는 임시 파일로
-        저장해 사진으로 첨부하며, 전송 후 삭제한다.
-        """
-        temp = float(result.get("hot_temp_95", result.get("max_temp", 0.0)))
-        overall_max = float(result.get("overall_max_temp", temp))
-        mean_temp = float(result.get("mean_temp", 0.0))
-        overlay = result.get("overlay")
-        base = str(result.get("base", "")) or "latest"
-        robot_id = self.cfg.identity.robot_id
-        status = result.get("status", Status.CRITICAL)
-        status_value = status.value if isinstance(status, Status) else str(status)
-        roi_name = str(result.get("overall_max_roi_name", result.get("roi_name", "ROI-01")))
-
-        def _log(kind: str, detail: str):
-            if self.lifecycle == "running":
-                self.root.after(0, lambda: self._add_operating_log("텔레그램 알림", kind, detail))
-
-        def work():
-            import tempfile
-            from ..analysis.notifier import send_alarm
-
-            alert_id = None
-            backend_event = result.get("_backend_posted_event")
-            if backend_event is not None:
-                # backend measurement POST may be running concurrently; wait briefly for alert_id.
-                if backend_event.wait(12.0):
-                    alert_id = result.get("alert_id")
-            tmp_path = None
-            image_path = ""
-            if overlay is not None:
-                tmp_path = os.path.join(tempfile.gettempdir(), f"thermoguard_alarm_{base}.jpg")
-                try:
-                    if cv2.imwrite(tmp_path, overlay):
-                        image_path = tmp_path
-                except Exception:
-                    image_path = ""
-            try:
-                ok = send_alarm(
-                    image_path=image_path,
-                    temp=temp,
-                    status=status_value,
-                    robot_id=robot_id,
-                    alert_id=alert_id,
-                )
-                _log("전송 성공" if ok else "전송 실패",
-                     f"{robot_id} · {temp:.1f}°C · {'사진' if image_path else '텍스트'}")
-                self._post_notification_to_backend(ok, robot_id, roi_name, overall_max, temp, mean_temp, status_value)
-            except RuntimeError:
-                _log("미설정", ".env의 BOT_TOKEN / CHAT_ID를 확인하세요")
-            except Exception as e:
-                _file_log.error("Telegram dispatch error: %s", e, exc_info=True)
-                _log("오류", str(e))
-            finally:
-                if tmp_path:
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _post_notification_to_backend(
-        self,
-        success: bool,
-        robot_id: str,
-        roi_name: str,
-        overall_max_temp: float,
-        hot_temp_95: float,
-        mean_temp: float,
-        status: str,
-    ) -> None:
-        """텔레그램 전송 결과를 백엔드 DB에 notification_logs로 기록한다."""
-        if not self.cfg.backend.enabled:
-            return
-        try:
-            payload = {
-                "camera_id": self.cfg.identity.db_camera_id or 1,
-                "sent_at": datetime.now().isoformat(),
-                "status": "success" if success else "failed",
-                "method": "telegram",
-                "robot_code": robot_id,
-                "roi_name": roi_name,
-                "overall_max_temp": overall_max_temp,
-                "hot_temp_95": hot_temp_95,
-                "mean_temp": mean_temp,
-                "severity": status.lower(),
-                "error_message": "" if success else "Telegram sendPhoto/sendMessage failed",
-            }
-            resp = requests.post(
-                f"{self.cfg.backend.url}/api/notification-logs",
-                json=payload,
-                timeout=self.cfg.backend.timeout_sec,
-            )
-            if resp.status_code in (200, 201):
-                _file_log.info("backend POST /api/notification-logs ok: %s", robot_id)
-            else:
-                _file_log.warning(
-                    "backend POST /api/notification-logs failed: HTTP %d %s",
-                    resp.status_code, resp.text,
-                )
-        except requests.exceptions.Timeout:
-            _file_log.warning("backend POST /api/notification-logs timeout")
-        except requests.exceptions.ConnectionError:
-            _file_log.warning("backend POST /api/notification-logs connection error")
-        except Exception:
-            _file_log.warning("backend POST /api/notification-logs error", exc_info=True)
-
     def _add_operating_log(self, category: str, result: str, detail: str):
         row = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), category, result, detail)
         self.operating_logs.insert(0, row)
         del self.operating_logs[1000:]
         _file_log.info("[%s] %s | %s", category, result, detail)
-
-    # ── Backend API 연동 ──────────────────────────────────────────
-
-    def _post_to_backend(self, result: dict):
-        """측정값을 POST /api/measurements 로 전송 (데몬 스레드)."""
-        if not self.cfg.backend.enabled:
-            return
-        camera_id = self.cfg.identity.db_camera_id or 1
-        roi = result.get("overall_max_roi")
-        roi_id = getattr(roi, "db_roi_id", None) if roi is not None else 1
-        if roi_id is None:
-            roi_id = 1
-        backend_event = result.get("_backend_posted_event")
-        try:
-            payload = {
-                "camera_id": camera_id,
-                "roi_id": roi_id,
-                "max_temp": result["max_temp"],
-                "min_temp": result.get("min_temp", 0.0),
-                "mean_temp": result["mean_temp"],
-                "percentile_95_temp": result["hot_temp_95"],
-                "over_temp_pixels": result.get("over_temp_pixels", 0),
-                "max_hotspot_size": result.get("max_hotspot_size", 0),
-                "status": result["status"].value.lower(),
-                "algorithm_version": "v2.0",
-                "do_alarm": bool(result.get("alarm", False)),
-                "alarm_message": (
-                    f"{self.cfg.identity.robot_id} · {result['max_temp']:.1f}°C · {result['status'].value}"
-                ),
-            }
-            resp = requests.post(
-                f"{self.cfg.backend.url}/api/measurements",
-                json=payload,
-                timeout=self.cfg.backend.timeout_sec,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("status") == "created":
-                    result["alert_id"] = data.get("alert_id")
-                    self.metrics.api_successes += 1
-                    _file_log.info(
-                        "backend POST ok: capture_id=%s alert_id=%s",
-                        data.get("capture_id"),
-                        data.get("alert_id"),
-                    )
-                else:
-                    _file_log.warning("backend POST rejected: %s", data)
-            else:
-                self._record_api_result(False, status_code=resp.status_code, error_kind="http")
-        except requests.exceptions.Timeout:
-            self.metrics.api_timeouts += 1
-        except requests.exceptions.ConnectionError:
-            self.metrics.api_connection_errors += 1
-        except Exception:
-            self.metrics.api_other_errors += 1
-        finally:
-            if backend_event is not None:
-                try:
-                    backend_event.set()
-                except Exception:
-                    pass
 
     def _sync_events_from_backend(self):
         """GET /api/alerts 로 영구 알람 이벤트 목록을 가져와 self.events와 병합."""

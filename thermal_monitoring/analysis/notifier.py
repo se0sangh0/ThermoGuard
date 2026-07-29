@@ -252,6 +252,11 @@ def save_delivery_result(
     retry_count: int = 0,
 ) -> bool:
     """Telegram 전송 결과를 FastAPI를 통해 DB에 저장한다."""
+    _log.debug(
+        "[DBG-NOTIFIER] save_delivery_result ENTER: alert_id=%s success=%s "
+        "http_status=%s error=%s",
+        alert_id, success, http_status, error_message,
+    )
 
     try:
         response = requests.post(
@@ -312,6 +317,10 @@ def send_alarm(
     환경변수가 없으면 콘솔에 dry-run 출력 후 True 반환.
     """
     caption = build_caption(temp, status, robot_id)
+    _log.debug(
+        "[DBG-NOTIFIER] send_alarm ENTER: alert_id=%s robot=%s status=%s temp=%.1f image=%s",
+        alert_id, robot_id, status, temp, bool(image_path and os.path.isfile(image_path)),
+    )
 
     # --- dry-run (개발 중 테스트용) ---
     # if not _is_configured():
@@ -388,12 +397,21 @@ def send_alarm(
             print(f"[Telegram] sendMessage error")
 
     if alert_id is not None:
+        _log.debug(
+            "[DBG-NOTIFIER] send_alarm: calling save_delivery_result alert_id=%s "
+            "photo_sent=%s http_status=%s",
+            alert_id, photo_sent, last_http_status,
+        )
         save_delivery_result(
             alert_id=alert_id,
             success=photo_sent,
             http_status=last_http_status,
             error_message=(None if photo_sent else last_error_message),
             retry_count=0,
+        )
+    else:
+        _log.debug(
+            "[DBG-NOTIFIER] send_alarm: alert_id is None — skip save_delivery_result"
         )
 
     return photo_sent
