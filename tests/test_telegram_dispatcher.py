@@ -164,6 +164,41 @@ def test_valid_frame_replaces_unattempted_bad_trigger(monkeypatch):
     assert attempts == [("good", "capture-2")]
 
 
+def test_warning_frame_does_not_replace_bad_critical_trigger(monkeypatch):
+    dispatcher = _make_dispatcher()
+    attempts = []
+    monkeypatch.setattr(
+        notifier,
+        "get_settings",
+        lambda: {"configured": True, "enabled": True},
+    )
+    dispatcher._dispatch = lambda result, captured_at: attempts.append(
+        (result["base"], captured_at)
+    )
+    bad_critical = {
+        "base": "bad-critical",
+        "alarm": True,
+        "alarm_status": Status.CRITICAL,
+        "status": Status.CRITICAL,
+        "max_temp": 70.0,
+        "image_quality_reason": "corrupt",
+    }
+    warning = {
+        "base": "warning",
+        "alarm": False,
+        "alarm_status": Status.WARNING,
+        "status": Status.WARNING,
+        "max_temp": 52.0,
+    }
+
+    dispatcher.maybe_dispatch(bad_critical, False, "capture-1")
+    dispatcher.maybe_dispatch(warning, True, "capture-2")
+
+    assert attempts == []
+    assert dispatcher._pending_result is bad_critical
+    assert dispatcher._pending_quality_ok is False
+
+
 def test_synchronous_dispatch_start_failure_remains_retryable(monkeypatch):
     dispatcher = _make_dispatcher()
     now = [0.0]

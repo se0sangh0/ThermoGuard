@@ -81,7 +81,7 @@ def test_send_alarm_does_not_call_api_when_delivery_disabled(monkeypatch):
     assert notifier.send_alarm("", 55.0, "Warning", "Robot-01") is False
 
 
-def test_dashboard_dispatches_first_warning_transition(monkeypatch):
+def test_dashboard_does_not_dispatch_warning(monkeypatch):
     dispatched = []
     dispatcher = _dispatcher([])
     dispatcher._dispatch = (
@@ -103,10 +103,9 @@ def test_dashboard_dispatches_first_warning_transition(monkeypatch):
         result,
         quality_ok=True,
         captured_at="capture-1",
-        warning_transition=True,
     )
 
-    assert dispatched == [(result, "capture-1")]
+    assert dispatched == []
 
 
 def test_dashboard_does_not_dispatch_when_delivery_is_disabled(monkeypatch):

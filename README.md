@@ -62,7 +62,7 @@ project/
 │       ├── product_dashboard.py  # 운영 대시보드 GUI (ProductDashboard)
 │       ├── roi_selector.py # GUI ROI 영역 설정 도구
 │       ├── calibration.py   # Thermal-RGB Homography 캘리브레이션
-│       └── tk_image_dialogs.py   # 크기 조정 가능 Tkinter 다이얼로그 (ROI 편집, 캘리브레이션)
+│       └── tk_image_dialogs.py   # 크기 조정 가능 Tkinter ROI 편집 다이얼로그
 │
 ├── tests/                  # 🧪 테스트
 │   ├── __init__.py
@@ -70,6 +70,7 @@ project/
 │   ├── test_overlay.py           # 오버레이 생성 통합 테스트
 │   ├── test_data_workflows.py    # 데이터 워크플로우 단위 테스트
 │   ├── test_notifier_settings.py # 알림 설정 테스트
+│   ├── test_product_dashboard_calibration.py # 캘리브레이션 API 연동 테스트
 │   └── test_tk_image_dialogs.py  # TkImageDialogs 단위 테스트
 │
 ├── backend/                # 🖥️ 백엔드 서버
@@ -307,7 +308,7 @@ grep "unreachable\|restored" logs/app.log
 | `quality.py` | 이미지 쌍 품질 검사 — 해상도 중복·역전 감지, 동일 이미지 판별 (`assess_image_quality()`) |
 | `calibration.py` | OpenCV GUI로 Thermal ↔ RGB 대응점 지정, Homography 행렬 계산 |
 | `roi_selector.py` | GUI ROI 영역 설정 도구 — **다중 ROI 지원** (N키 추가, Tab 전환, Del 삭제, 색상 구분), `config.json` 자동 저장 |
-| `tk_image_dialogs.py` | 크기 조정 가능 Tkinter 다이얼로그 — ROI 편집, 캘리브레이션용 공통 UI 컴포넌트 |
+| `tk_image_dialogs.py` | 크기 조정 가능 Tkinter 다이얼로그 — ROI 편집 UI 컴포넌트 |
 
 ### 분석 파이프라인
 

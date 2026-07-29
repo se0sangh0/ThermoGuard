@@ -112,7 +112,6 @@ class ProductDashboard:
         self.metrics = RuntimeMetrics()
         self.latest_result: Optional[RoiResult] = None
         self.latest_status = Status.NORMAL          # 표시용(raw) 이전 상태
-        self._last_alarm_status = Status.NORMAL     # 알람 판정용(API) 이전 상태
         self.last_update: Optional[datetime] = None
         self.visual_photo = None
         self.thermal_photo = None
@@ -1175,16 +1174,6 @@ class ProductDashboard:
                                     f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
                                     else "정상 복귀")
 
-        # 경고 상태 진입 또는 CRITICAL 알람이면 Telegram 전송을 시도한다.
-        # 경고 전이는 '표시용 status(raw)'가 아니라 알람 판정 상태(API,
-        # 클러스터 게이트 반영)를 기준으로 잡아, 표시와 알람을 분리한다.
-        # 동일 캡처·품질 미달·비활성화 상태도 운영 로그에 사유를 남긴다.
-        alarm_status = result.get("alarm_status", status)
-        warning_transition = (
-            alarm_status == Status.WARNING and self._last_alarm_status != Status.WARNING
-        )
-        self._last_alarm_status = alarm_status
-
         # 새로 촬영된 이미지일 때만 백엔드 DB에 측정값을 기록한다.
         if (
             is_new_capture
@@ -1209,7 +1198,6 @@ class ProductDashboard:
             result,
             quality_ok,
             captured_at,
-            warning_transition=warning_transition,
         )
 
         # 두 영상은 검증을 통과한 한 쌍일 때만 동시에 교체한다.
@@ -1658,6 +1646,8 @@ class SettingsDialog:
         self._roi_editor_running = False
         self._calibration_running = False
         self._tool_running: Optional[str] = None
+        self._tool_window_titles: tuple[str, ...] = ()
+        self._tool_guard_window: Optional[tk.Toplevel] = None
         notebook = ttk.Notebook(self.win); notebook.pack(fill="both", expand=True, padx=14, pady=14)
         general = ttk.Frame(notebook, padding=16)
         roi = ttk.Frame(notebook, padding=16)
@@ -1716,7 +1706,7 @@ class SettingsDialog:
         ).pack(anchor="w", pady=(0, 5))
         ttk.Label(
             parent,
-            text="경고·위험 발생 시 등록된 Telegram 채팅으로 알림을 전송합니다.",
+            text="위험(Critical) 알람 발생 시 등록된 Telegram 채팅으로 알림을 전송합니다.",
             foreground="#59636d",
         ).pack(anchor="w", pady=(0, 14))
 
@@ -1928,7 +1918,7 @@ class SettingsDialog:
             self._close_telegram_login_window()
             messagebox.showinfo(
                 "Telegram 로그인",
-                f"{detail}\n\n알림 전송 버튼을 활성화하면 경고·위험 알림을 받을 수 있습니다.",
+                f"{detail}\n\n알림 전송 버튼을 활성화하면 위험(Critical) 알림을 받을 수 있습니다.",
                 parent=self.win,
             )
         else:
@@ -1967,7 +1957,7 @@ class SettingsDialog:
         self.d._add_operating_log(
             "Telegram",
             "알림 활성화" if updated else "알림 비활성화",
-            "자동 경고·위험 알림 전송",
+            "자동 위험(Critical) 알림 전송",
         )
         self._refresh_telegram_controls()
 
@@ -1982,6 +1972,55 @@ class SettingsDialog:
         self.d.settings_button.configure(style="Action.TButton")
         if self.win.winfo_exists():
             self.win.destroy()
+
+    def _focus_running_tool(self):
+        """실행 중인 OpenCV 도구 창을 새로 만들지 않고 앞으로 가져온다."""
+        for title in self._tool_window_titles:
+            try:
+                if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) >= 1:
+                    cv2.setWindowProperty(title, cv2.WND_PROP_TOPMOST, 1)
+            except cv2.error:
+                continue
+
+    def _show_tool_guard(self):
+        """OpenCV 도구 실행 중 대시보드 입력이 대기열에 쌓이지 않게 한다."""
+        guard = tk.Toplevel(self.win)
+        guard.title("작업 진행 중")
+        guard.transient(self.win)
+        guard.resizable(False, False)
+        guard.geometry("320x130")
+        guard.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        body = ttk.Frame(guard, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="캘리브레이션 창에서 작업을 완료하세요.",
+            font=("맑은 고딕", 11, "bold"),
+        ).pack(pady=(0, 16))
+        ttk.Button(
+            body,
+            text="캘리브레이션 창 보기",
+            command=self._focus_running_tool,
+        ).pack()
+
+        guard.update_idletasks()
+        x = self.win.winfo_rootx() + (self.win.winfo_width() - guard.winfo_width()) // 2
+        y = self.win.winfo_rooty() + (self.win.winfo_height() - guard.winfo_height()) // 2
+        guard.geometry(f"+{max(0, x)}+{max(0, y)}")
+        guard.grab_set()
+        guard.lift()
+        guard.focus_force()
+        self._tool_guard_window = guard
+
+    def _pump_tool_events(self):
+        """OpenCV 루프 중 모달 가드의 Tk 이벤트를 처리한다."""
+        try:
+            if self._tool_guard_window and self._tool_guard_window.winfo_exists():
+                self._tool_guard_window.update()
+        except tk.TclError:
+            # 종료 경합으로 가드가 먼저 파괴돼도 OpenCV 도구는 계속 종료할 수 있다.
+            pass
 
     def _begin_tool(self, tool_name: str) -> bool:
         """ROI/캘리브레이션 도구는 프로세스에서 한 번에 하나만 실행한다."""
@@ -2009,13 +2048,32 @@ class SettingsDialog:
         return True
 
     def _end_tool(self):
+        if self._tool_guard_window:
+            try:
+                if self._tool_guard_window.winfo_exists():
+                    self._tool_guard_window.grab_release()
+                    self._tool_guard_window.destroy()
+            except tk.TclError:
+                pass
+            self._tool_guard_window = None
         self._tool_running = None
+        self._tool_window_titles = ()
         self._roi_editor_running = False
         self._calibration_running = False
         self.roi_button.configure(style="TButton")
         self.calibration_button.configure(style="TButton")
         if self.win.winfo_exists():
             self.win.grab_set()
+
+    def _tool_display_bounds(self):
+        """현재 Tk 가상 화면 영역을 OpenCV 도구에 전달한다."""
+        self.win.update_idletasks()
+        return (
+            self.win.winfo_vrootx(),
+            self.win.winfo_vrooty(),
+            self.win.winfo_vrootwidth(),
+            self.win.winfo_vrootheight(),
+        )
 
     @staticmethod
     def _field(parent, label, variable, row):
@@ -2136,9 +2194,18 @@ class SettingsDialog:
             return
         self.d._add_operating_log("캘리브레이션", "시작", thermal.name)
         saved = False
+        calibration_window_title = None
         try:
-            from .tk_image_dialogs import show_calibration_dialog
-            saved = show_calibration_dialog(self.win, str(thermal), str(visual))
+            from .calibration import CALIBRATION_WINDOW_TITLE, run_calibration
+            calibration_window_title = CALIBRATION_WINDOW_TITLE
+            self._tool_window_titles = (CALIBRATION_WINDOW_TITLE,)
+            self._show_tool_guard()
+            saved = bool(run_calibration(
+                str(thermal),
+                str(visual),
+                event_pump=self._pump_tool_events,
+                display_bounds=self._tool_display_bounds(),
+            ))
             if saved:
                 self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
             else:
@@ -2149,6 +2216,15 @@ class SettingsDialog:
             messagebox.showerror("캘리브레이션", str(exc), parent=self.win)
             saved = False
         finally:
+            if calibration_window_title:
+                try:
+                    if cv2.getWindowProperty(
+                        calibration_window_title,
+                        cv2.WND_PROP_VISIBLE,
+                    ) >= 0:
+                        cv2.destroyWindow(calibration_window_title)
+                except cv2.error:
+                    pass
             self._end_tool()
         if saved and self.win.winfo_exists() and messagebox.askyesno(
             "ROI 설정",

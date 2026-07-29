@@ -59,11 +59,9 @@ class TelegramDispatcher:
         result: dict,
         quality_ok: bool,
         captured_at,
-        *,
-        warning_transition: bool = False,
     ) -> None:
-        """경고 진입/위험 알람을 전송하고 보내지 않는 경우도 로그로 남긴다."""
-        triggered = bool(result.get("alarm")) or warning_transition
+        """상태 머신이 승인한 Critical 알람만 전송한다."""
+        triggered = bool(result.get("alarm"))
         current_status = result.get("alarm_status", result.get("status"))
 
         with self._state_lock:
@@ -89,7 +87,7 @@ class TelegramDispatcher:
                 and self._pending_attempt_count == 0
                 and not self._pending_quality_ok
                 and quality_ok
-                and current_status != Status.NORMAL
+                and current_status == Status.CRITICAL
             ):
                 # A trigger detected from a bad frame must never send that frame
                 # later. Replace it with the first valid frame while the same
@@ -104,8 +102,8 @@ class TelegramDispatcher:
 
         if pending_result is None:
             self._trace(
-                "SKIP — no trigger (alarm=%s warning_transition=%s)",
-                result.get("alarm", False), warning_transition,
+                "SKIP — no critical alarm trigger (alarm=%s status=%s)",
+                result.get("alarm", False), current_status,
             )
             return
 
