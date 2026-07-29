@@ -11,3 +11,4 @@ config.json
 /docs
 /.commandcode
 .DS_Store
+AGENTS.md
