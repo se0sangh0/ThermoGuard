@@ -13,8 +13,8 @@ class AssetApiError(RuntimeError):
 
 @dataclass(frozen=True)
 class AssetRegistration:
-    factory_id: int
-    line_id: int
+    factory_id: int | None
+    line_id: int | None
     robot_id: int
     camera_id: int
 
@@ -47,24 +47,52 @@ def _create(base_url: str, path: str, body: dict, id_key: str, timeout: float) -
     return int(payload[id_key])
 
 
-def _find_camera(
+def _find_asset_hierarchy(
     base_url: str,
     camera_code: str,
     camera_ip: str,
     timeout: float,
-) -> int | None:
+) -> AssetRegistration | None:
     payload = _request(
         "GET",
         f"{base_url.rstrip('/')}/api/cameras",
         timeout=timeout,
     )
-    for camera in payload.get("cameras", []):
+    cameras = [
+        camera
+        for camera in payload.get("cameras", [])
+        if isinstance(camera, dict)
+    ]
+    matches = []
+    for camera in cameras:
         if (
             str(camera.get("camera_code", "")).strip() == camera_code
             or str(camera.get("ip_address", "")).strip() == camera_ip
         ):
-            return int(camera["camera_id"])
-    return None
+            matches.append(camera)
+    if not matches and len(cameras) == 1:
+        matches = cameras
+    if not matches:
+        return None
+
+    camera = matches[0]
+    required = ("robot_id", "camera_id")
+    if any(camera.get(key) is None for key in required):
+        return None
+    return AssetRegistration(
+        factory_id=(
+            int(camera["factory_id"])
+            if camera.get("factory_id") is not None
+            else None
+        ),
+        line_id=(
+            int(camera["line_id"])
+            if camera.get("line_id") is not None
+            else None
+        ),
+        robot_id=int(camera["robot_id"]),
+        camera_id=int(camera["camera_id"]),
+    )
 
 
 def register_asset_hierarchy(
@@ -83,6 +111,22 @@ def register_asset_hierarchy(
     camera_id: int | None = None,
 ) -> AssetRegistration:
     """Persist missing hierarchy levels using the existing FastAPI routes."""
+    if not all((factory_id, line_id, robot_id, camera_id)):
+        existing = _find_asset_hierarchy(
+            base_url, camera_code, camera_ip, timeout,
+        )
+        if existing is not None:
+            return AssetRegistration(
+                factory_id=(
+                    int(factory_id)
+                    if factory_id
+                    else existing.factory_id
+                ),
+                line_id=int(line_id) if line_id else existing.line_id,
+                robot_id=existing.robot_id,
+                camera_id=existing.camera_id,
+            )
+
     if not factory_id:
         factory_id = _create(
             base_url, "/api/factories",
@@ -113,8 +157,6 @@ def register_asset_hierarchy(
             },
             "robot_id", timeout,
         )
-    if not camera_id:
-        camera_id = _find_camera(base_url, camera_code, camera_ip, timeout)
     if not camera_id:
         camera_id = _create(
             base_url, "/api/cameras",

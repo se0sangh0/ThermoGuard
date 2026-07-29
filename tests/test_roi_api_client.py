@@ -73,3 +73,23 @@ def test_sync_rois_does_not_post_unchanged_definition(monkeypatch):
     assert result.created == 0
     assert result.unchanged == 1
     assert roi_id_map == {"ROI-1": 12}
+
+
+def test_resolve_camera_id_falls_back_to_the_only_camera(monkeypatch):
+    monkeypatch.setattr(
+        roi_api_client.requests,
+        "get",
+        lambda *_args, **_kwargs: FakeResponse({
+            "cameras": [{
+                "camera_id": 7,
+                "camera_code": "OLD-CAM",
+                "ip_address": "192.168.0.10",
+            }]
+        }),
+    )
+
+    assert roi_api_client.resolve_camera_id(
+        "http://127.0.0.1:8000",
+        "CAM-01",
+        "192.168.0.51",
+    ) == 7

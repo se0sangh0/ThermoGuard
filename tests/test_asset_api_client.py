@@ -15,10 +15,10 @@ class FakeResponse:
 def test_register_asset_hierarchy_uses_existing_api_order(monkeypatch):
     calls = []
     responses = iter([
+        {"cameras": []},
         {"status": "created", "factory_id": 1},
         {"status": "created", "line_id": 2},
         {"status": "created", "robot_id": 3},
-        {"cameras": []},
         {"status": "created", "camera_id": 4},
     ])
 
@@ -40,11 +40,41 @@ def test_register_asset_hierarchy_uses_existing_api_order(monkeypatch):
 
     assert result == asset_api_client.AssetRegistration(1, 2, 3, 4)
     assert [call[1].rsplit("/", 1)[-1] for call in calls] == [
-        "factories", "production-lines", "robots", "cameras", "cameras",
+        "cameras", "factories", "production-lines", "robots", "cameras",
     ]
-    assert calls[1][2]["factory_id"] == 1
-    assert calls[2][2]["line_id"] == 2
+    assert calls[2][2]["factory_id"] == 1
+    assert calls[3][2]["line_id"] == 2
     assert calls[4][2]["robot_id"] == 3
+
+
+def test_register_asset_hierarchy_reuses_the_only_backend_camera(monkeypatch):
+    calls = []
+
+    def fake_request(method, url, timeout, **kwargs):
+        calls.append((method, url, kwargs.get("json")))
+        return FakeResponse({
+            "cameras": [{
+                "robot_id": 3,
+                "camera_id": 4,
+                "camera_code": "OLD-CAM",
+                "ip_address": "192.168.0.10",
+            }]
+        })
+
+    monkeypatch.setattr(asset_api_client.requests, "request", fake_request)
+    result = asset_api_client.register_asset_hierarchy(
+        base_url="http://127.0.0.1:8000",
+        timeout=5,
+        factory_name="변경된 공장명",
+        line_name="변경된 라인명",
+        robot_code="Robot-01",
+        robot_name="변경된 로봇명",
+        camera_code="CAM-01",
+        camera_ip="192.168.0.51",
+    )
+
+    assert result == asset_api_client.AssetRegistration(None, None, 3, 4)
+    assert [call[0] for call in calls] == ["GET"]
 
 
 def test_register_asset_hierarchy_reuses_saved_database_ids(monkeypatch):

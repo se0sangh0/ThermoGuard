@@ -2274,10 +2274,6 @@ class SettingsDialog:
             from .asset_api_client import register_asset_hierarchy
 
             identity = self.d.cfg.identity
-            same_factory = factory_name == identity.factory_name
-            same_line = same_factory and line_name == identity.line_name
-            same_robot = same_line and robot_name == identity.robot_name
-            same_camera = same_robot and camera_ip == self.d.cfg.camera.ip
             registration = register_asset_hierarchy(
                 base_url=self.d.cfg.backend.url,
                 timeout=self.d.cfg.backend.timeout_sec,
@@ -2287,10 +2283,10 @@ class SettingsDialog:
                 robot_name=robot_name,
                 camera_code=identity.camera_id,
                 camera_ip=camera_ip,
-                factory_id=identity.factory_id if same_factory else None,
-                line_id=identity.line_id if same_line else None,
-                robot_id=identity.db_robot_id if same_robot else None,
-                camera_id=identity.db_camera_id if same_camera else None,
+                factory_id=identity.factory_id,
+                line_id=identity.line_id,
+                robot_id=identity.db_robot_id,
+                camera_id=identity.db_camera_id,
             )
 
             self.d.cfg.camera.ip = camera_ip

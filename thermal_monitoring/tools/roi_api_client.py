@@ -68,13 +68,18 @@ def resolve_camera_id(
 
     wanted_code = str(camera_code).strip()
     wanted_ip = str(camera_ip).strip()
+    candidates = []
     for camera in cameras:
         if not isinstance(camera, dict):
             continue
+        candidates.append(camera)
         if wanted_code and str(camera.get("camera_code", "")).strip() == wanted_code:
             return int(camera["camera_id"])
         if wanted_ip and str(camera.get("ip_address", "")).strip() == wanted_ip:
             return int(camera["camera_id"])
+
+    if len(candidates) == 1:
+        return int(candidates[0]["camera_id"])
 
     raise RoiApiError(
         f"DB에서 카메라를 찾지 못했습니다. camera_code={wanted_code}, ip={wanted_ip}"
