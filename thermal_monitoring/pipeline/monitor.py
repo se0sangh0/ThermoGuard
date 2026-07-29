@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
+import requests
 
 from ..config import load_config
 from ..capture.capture import CaptureSession
@@ -94,6 +95,51 @@ class MonitorSequencer:
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] {msg}")
+
+    def _post_notification_log(
+        self,
+        success: bool,
+        max_temp: float,
+        hot_temp_95: float,
+        mean_temp: float,
+        status,
+        roi_name: str,
+    ) -> None:
+        """텔레그램 전송 결과를 백엔드 DB에 notification_logs로 기록한다."""
+        if not _cfg.backend.enabled:
+            return
+        try:
+            payload = {
+                "camera_id": _cfg.identity.db_camera_id or 1,
+                "sent_at": datetime.now().isoformat(),
+                "status": "success" if success else "failed",
+                "method": "telegram",
+                "robot_code": _cfg.identity.robot_id,
+                "roi_name": roi_name or "ROI-01",
+                "overall_max_temp": max_temp,
+                "hot_temp_95": hot_temp_95,
+                "mean_temp": mean_temp,
+                "severity": status.value.lower(),
+                "error_message": "" if success else "Telegram sendPhoto/sendMessage failed",
+            }
+            resp = requests.post(
+                f"{_cfg.backend.url}/api/notification-logs",
+                json=payload,
+                timeout=_cfg.backend.timeout_sec,
+            )
+            if resp.status_code in (200, 201):
+                _log_monitor.info("backend POST /api/notification-logs ok")
+            else:
+                _log_monitor.warning(
+                    "backend POST /api/notification-logs failed: HTTP %d %s",
+                    resp.status_code, resp.text,
+                )
+        except requests.exceptions.Timeout:
+            _log_monitor.warning("backend POST /api/notification-logs timeout")
+        except requests.exceptions.ConnectionError:
+            _log_monitor.warning("backend POST /api/notification-logs connection error")
+        except Exception:
+            _log_monitor.warning("backend POST /api/notification-logs error", exc_info=True)
 
     # ── 파일 스캔 ─────────────────────────────────────────────
     def _scan_all_existing_bases(self) -> set:
@@ -393,6 +439,14 @@ class MonitorSequencer:
                         image_path=overlay_path or pair["thermal_jpg"],
                         temp=roi_result.hot_temp_95,
                         status=new_status.value,
+                    )
+                    self._post_notification_log(
+                        success,
+                        roi_result.max_temp,
+                        roi_result.hot_temp_95,
+                        roi_result.mean_temp,
+                        new_status,
+                        roi_result.roi_name,
                     )
                     if success:
                         self.state.last_alarm_time = time.time()

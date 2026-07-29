@@ -1422,11 +1422,14 @@ class ProductDashboard:
         저장해 사진으로 첨부하며, 전송 후 삭제한다.
         """
         temp = float(result.get("hot_temp_95", result.get("max_temp", 0.0)))
+        overall_max = float(result.get("overall_max_temp", temp))
+        mean_temp = float(result.get("mean_temp", 0.0))
         overlay = result.get("overlay")
         base = str(result.get("base", "")) or "latest"
         robot_id = self.cfg.identity.robot_id
         status = result.get("status", Status.CRITICAL)
         status_value = status.value if isinstance(status, Status) else str(status)
+        roi_name = str(result.get("overall_max_roi_name", result.get("roi_name", "ROI-01")))
 
         def _log(kind: str, detail: str):
             if self.lifecycle == "running":
@@ -1454,6 +1457,7 @@ class ProductDashboard:
                 )
                 _log("전송 성공" if ok else "전송 실패",
                      f"{robot_id} · {temp:.1f}°C · {'사진' if image_path else '텍스트'}")
+                self._post_notification_to_backend(ok, robot_id, roi_name, overall_max, temp, mean_temp, status_value)
             except RuntimeError:
                 _log("미설정", ".env의 BOT_TOKEN / CHAT_ID를 확인하세요")
             except Exception as e:
@@ -1467,6 +1471,52 @@ class ProductDashboard:
                         pass
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _post_notification_to_backend(
+        self,
+        success: bool,
+        robot_id: str,
+        roi_name: str,
+        overall_max_temp: float,
+        hot_temp_95: float,
+        mean_temp: float,
+        status: str,
+    ) -> None:
+        """텔레그램 전송 결과를 백엔드 DB에 notification_logs로 기록한다."""
+        if not self.cfg.backend.enabled:
+            return
+        try:
+            payload = {
+                "camera_id": self.cfg.identity.db_camera_id or 1,
+                "sent_at": datetime.now().isoformat(),
+                "status": "success" if success else "failed",
+                "method": "telegram",
+                "robot_code": robot_id,
+                "roi_name": roi_name,
+                "overall_max_temp": overall_max_temp,
+                "hot_temp_95": hot_temp_95,
+                "mean_temp": mean_temp,
+                "severity": status.lower(),
+                "error_message": "" if success else "Telegram sendPhoto/sendMessage failed",
+            }
+            resp = requests.post(
+                f"{self.cfg.backend.url}/api/notification-logs",
+                json=payload,
+                timeout=self.cfg.backend.timeout_sec,
+            )
+            if resp.status_code in (200, 201):
+                _file_log.info("backend POST /api/notification-logs ok: %s", robot_id)
+            else:
+                _file_log.warning(
+                    "backend POST /api/notification-logs failed: HTTP %d %s",
+                    resp.status_code, resp.text,
+                )
+        except requests.exceptions.Timeout:
+            _file_log.warning("backend POST /api/notification-logs timeout")
+        except requests.exceptions.ConnectionError:
+            _file_log.warning("backend POST /api/notification-logs connection error")
+        except Exception:
+            _file_log.warning("backend POST /api/notification-logs error", exc_info=True)
 
     def _add_operating_log(self, category: str, result: str, detail: str):
         row = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), category, result, detail)
