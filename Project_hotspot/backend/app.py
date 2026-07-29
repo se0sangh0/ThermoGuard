@@ -507,9 +507,11 @@ def get_dashboard_summary():
                         critical_delta
                     FROM threshold_profiles
                     WHERE camera_id = :camera_id
-                      AND roi_id = :roi_id
+                      AND (roi_id = :roi_id OR roi_id IS NULL)
                       AND valid_to IS NULL
-                    ORDER BY valid_from DESC
+                    ORDER BY
+                        CASE WHEN roi_id = :roi_id THEN 0 ELSE 1 END,
+                        valid_from DESC
                     LIMIT 1
                 """),
                 {
@@ -1044,7 +1046,29 @@ def create_measurement(data: MeasurementCreate):
     try:
         with engine.begin() as connection:
 
-            # 1. 해당 ROI의 현재 임계값 설정 조회
+            # 1. ROI가 실제로 요청 카메라에 속하는지 확인
+            roi_owner = connection.execute(
+                text("""
+                    SELECT roi_id
+                    FROM roi_definitions
+                    WHERE roi_id = :roi_id
+                      AND camera_id = :camera_id
+                      AND enabled = 1
+                    LIMIT 1
+                """),
+                {
+                    "camera_id": data.camera_id,
+                    "roi_id": data.roi_id
+                }
+            ).fetchone()
+
+            if roi_owner is None:
+                return {
+                    "status": "error",
+                    "error": "ROI가 요청한 카메라에 속하지 않거나 비활성 상태입니다."
+                }
+
+            # 2. 해당 ROI의 현재 임계값 설정 조회
             threshold = connection.execute(
                 text("""
                     SELECT
@@ -1055,9 +1079,11 @@ def create_measurement(data: MeasurementCreate):
                         min_hotspot_size_max
                     FROM threshold_profiles
                     WHERE camera_id = :camera_id
-                      AND roi_id = :roi_id
+                      AND (roi_id = :roi_id OR roi_id IS NULL)
                       AND valid_to IS NULL
-                    ORDER BY valid_from DESC
+                    ORDER BY
+                        CASE WHEN roi_id = :roi_id THEN 0 ELSE 1 END,
+                        valid_from DESC
                     LIMIT 1
                 """),
                 {
@@ -1079,7 +1105,7 @@ def create_measurement(data: MeasurementCreate):
             warning_temp = baseline + warning_delta
             critical_temp = baseline + critical_delta
 
-            # 2. 상태 및 캡처 모드는 thermal_monitoring에서 전달한 값 사용
+            # 3. 상태 및 캡처 모드는 thermal_monitoring에서 전달한 값 사용
             status = data.status
 
             capture_mode = (
@@ -1087,7 +1113,7 @@ def create_measurement(data: MeasurementCreate):
             )
             visual_status = "success" if status == "normal" else "skipped"
 
-            # 3. 촬영 기록 생성
+            # 4. 촬영 기록 생성
             capture_result = connection.execute(
                 text("""
                     INSERT INTO captures (
@@ -1120,7 +1146,7 @@ def create_measurement(data: MeasurementCreate):
 
             capture_id = capture_result.lastrowid
 
-            # 4. 분석 실행 기록 생성 (thermal_monitoring의 algorithm_version 사용)
+            # 5. 분석 실행 기록 생성 (thermal_monitoring의 algorithm_version 사용)
             analysis_result = connection.execute(
                 text("""
                     INSERT INTO analysis_runs (
@@ -1146,7 +1172,7 @@ def create_measurement(data: MeasurementCreate):
 
             analysis_id = analysis_result.lastrowid
 
-            # 5. 측정 데이터 저장 (thermal_monitoring의 status 사용)
+            # 6. 측정 데이터 저장 (thermal_monitoring의 status 사용)
             measurement_result = connection.execute(
                 text("""
                     INSERT INTO roi_measurements (
@@ -1200,7 +1226,7 @@ def create_measurement(data: MeasurementCreate):
 
             alert_id = None
 
-            # 6. do_alarm이 True인 경우만 alert_events 생성
+            # 7. do_alarm이 True인 경우만 alert_events 생성
             #    (thermal_monitoring의 상태 머신 + 쿨다운을 통과한 알람만 기록)
             if data.do_alarm:
 

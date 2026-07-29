@@ -28,6 +28,7 @@ RoiConfig = AppRoiConfig
 @dataclass
 class RoiResult:
     roi_name: str = ""
+    db_roi_id: int | None = None
     roi_thermal: np.ndarray = field(default_factory=lambda: np.zeros((1, 1)))
     max_temp: float = 0.0
     mean_temp: float = 0.0
@@ -52,6 +53,9 @@ def load_roi_config() -> RoiConfig:
                 "y1": entry.y1 if hasattr(entry, 'y1') else 0,
                 "x2": entry.x2 if hasattr(entry, 'x2') else 640,
                 "y2": entry.y2 if hasattr(entry, 'y2') else 480,
+                "db_roi_id": (
+                    entry.db_roi_id if hasattr(entry, "db_roi_id") else None
+                ),
             })
     return RoiConfig(
         x1=cfg.roi.x1,
@@ -214,6 +218,7 @@ def extract_all_rois_from_npy(npy_path: str, config: Optional[RoiConfig] = None)
                 y1=int(entry_data.get("y1", 0)),
                 x2=int(entry_data.get("x2", 640)),
                 y2=int(entry_data.get("y2", 480)),
+                db_roi_id=entry_data.get("db_roi_id"),
             )
         else:
             entry = entry_data
@@ -226,6 +231,7 @@ def extract_all_rois_from_npy(npy_path: str, config: Optional[RoiConfig] = None)
         )
         result = extract_roi_from_npy(npy_path, single_config)
         result.roi_name = entry.name
+        result.db_roi_id = entry.db_roi_id
         results.append(result)
 
     return results

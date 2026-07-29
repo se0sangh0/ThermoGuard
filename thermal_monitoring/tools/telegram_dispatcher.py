@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import tempfile
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -20,12 +21,21 @@ _log = get_logger("tools.telegram_dispatcher")
 class TelegramDispatcher:
     """ProductDashboard의 텔레그램 알람 전송 및 백엔드 DB 기록을 위임받는다."""
 
+    RETRY_BACKOFF_SECONDS = 60.0
+
     def __init__(
         self,
         dashboard,  # ProductDashboard (weak ref)
     ):
         self._dash = dashboard
         self._last_telegram_capture: Optional[datetime] = None
+        self._pending_result: Optional[dict] = None
+        self._pending_captured_at = None
+        self._pending_quality_ok = False
+        self._pending_attempt_count = 0
+        self._last_attempt_monotonic = 0.0
+        self._dispatch_inflight = False
+        self._state_lock = threading.Lock()
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -53,7 +63,46 @@ class TelegramDispatcher:
         warning_transition: bool = False,
     ) -> None:
         """경고 진입/위험 알람을 전송하고 보내지 않는 경우도 로그로 남긴다."""
-        if not result.get("alarm") and not warning_transition:
+        triggered = bool(result.get("alarm")) or warning_transition
+        current_status = result.get("alarm_status", result.get("status"))
+
+        with self._state_lock:
+            if current_status == Status.NORMAL:
+                self._pending_result = None
+                self._pending_captured_at = None
+                self._pending_quality_ok = False
+                self._pending_attempt_count = 0
+                self._last_attempt_monotonic = 0.0
+
+            if (
+                triggered
+                and captured_at != self._last_telegram_capture
+                and captured_at != self._pending_captured_at
+            ):
+                self._pending_result = result
+                self._pending_captured_at = captured_at
+                self._pending_quality_ok = quality_ok
+                self._pending_attempt_count = 0
+                self._last_attempt_monotonic = 0.0
+            elif (
+                self._pending_result is not None
+                and self._pending_attempt_count == 0
+                and not self._pending_quality_ok
+                and quality_ok
+                and current_status != Status.NORMAL
+            ):
+                # A trigger detected from a bad frame must never send that frame
+                # later. Replace it with the first valid frame while the same
+                # abnormal condition is still active.
+                self._pending_result = result
+                self._pending_captured_at = captured_at
+                self._pending_quality_ok = True
+
+            pending_result = self._pending_result
+            pending_captured_at = self._pending_captured_at
+            pending_quality_ok = self._pending_quality_ok
+
+        if pending_result is None:
             self._trace(
                 "SKIP — no trigger (alarm=%s warning_transition=%s)",
                 result.get("alarm", False), warning_transition,
@@ -71,35 +120,85 @@ class TelegramDispatcher:
             self._trace("SKIP — disabled")
             self._op_log("보류", "알림 전송 비활성화")
             return
-        if not quality_ok:
+        if not pending_quality_ok:
             self._trace(
                 "SKIP — quality not ok: %s",
-                result.get("image_quality_reason", "?"),
+                pending_result.get("image_quality_reason", "?"),
             )
-            self._op_log("보류", result.get("image_quality_reason", "영상 품질 미달로 미발송"))
+            self._op_log(
+                "보류",
+                pending_result.get("image_quality_reason", "영상 품질 미달로 미발송"),
+            )
             return
 
-        if captured_at == self._last_telegram_capture:
-            self._trace("SKIP — same capture")
-            self._op_log("보류", "동일 캡처 재분석 — 중복 발송 방지")
-            return
+        now = time.monotonic()
+        with self._state_lock:
+            if self._dispatch_inflight:
+                self._trace("SKIP — dispatch already in flight")
+                return
+            if self._pending_result is None:
+                return
+            if (
+                self._pending_attempt_count > 0
+                and now - self._last_attempt_monotonic < self.RETRY_BACKOFF_SECONDS
+            ):
+                self._trace(
+                    "SKIP — retry backoff %.1fs remaining",
+                    self.RETRY_BACKOFF_SECONDS - (now - self._last_attempt_monotonic),
+                )
+                return
+            pending_result = self._pending_result
+            pending_captured_at = self._pending_captured_at
+            is_retry = self._pending_attempt_count > 0
+            self._pending_attempt_count += 1
+            self._last_attempt_monotonic = now
+            self._dispatch_inflight = True
 
-        self._trace("DISPATCH — base=%s temp=%.1f", result.get("base", "?"), result["max_temp"])
-        self._last_telegram_capture = captured_at
-        self._op_log(
-            "전송 시도",
-            f"{result.get('overall_max_roi_name', 'ROI')} · {result['max_temp']:.1f}°C",
+        self._trace(
+            "DISPATCH — base=%s temp=%.1f retry=%s",
+            pending_result.get("base", "?"),
+            pending_result["max_temp"],
+            is_retry,
         )
-        self._dispatch(result)
+        self._op_log(
+            "재전송 시도" if is_retry else "전송 시도",
+            f"{pending_result.get('roi_name', 'ROI')} · "
+            f"{pending_result['max_temp']:.1f}°C",
+        )
+        try:
+            self._dispatch(pending_result, pending_captured_at)
+        except Exception as exc:
+            # Thread creation and test doubles can fail synchronously. Release
+            # the in-flight guard so the pending alarm remains retryable.
+            self._complete_dispatch(False, pending_captured_at)
+            _log.error("Telegram dispatch start error: %s", exc, exc_info=True)
+            self._op_log("오류", f"전송 시작 실패: {exc}")
 
     # ── 전송 실행 ────────────────────────────────────────────
 
-    def _dispatch(self, result: dict):
+    def _complete_dispatch(self, success: bool, captured_at) -> None:
+        """Complete an asynchronous attempt and retain failures for retry."""
+        with self._state_lock:
+            self._dispatch_inflight = False
+            if not success:
+                return
+            self._last_telegram_capture = captured_at
+            if self._pending_captured_at == captured_at:
+                self._pending_result = None
+                self._pending_captured_at = None
+                self._pending_quality_ok = False
+                self._pending_attempt_count = 0
+                self._last_attempt_monotonic = 0.0
+
+    def _dispatch(self, result: dict, captured_at):
         temp = float(result.get("hot_temp_95", result.get("max_temp", 0.0)))
         overlay = result.get("overlay")
         base = str(result.get("base", "")) or "latest"
         robot_id = self._dash.cfg.identity.robot_id
-        status = result.get("status", Status.CRITICAL)
+        status = result.get(
+            "measurement_status",
+            result.get("alarm_status", result.get("status", Status.CRITICAL)),
+        )
         status_value = status.value if isinstance(status, Status) else str(status)
 
         def work():
@@ -123,6 +222,7 @@ class TelegramDispatcher:
 
             tmp_path = None
             image_path = ""
+            ok = False
             if overlay is not None:
                 tmp_path = os.path.join(
                     tempfile.gettempdir(), f"thermoguard_alarm_{base}.jpg"
@@ -160,6 +260,7 @@ class TelegramDispatcher:
                         os.remove(tmp_path)
                     except OSError:
                         pass
+                self._complete_dispatch(ok, captured_at)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -167,24 +268,42 @@ class TelegramDispatcher:
 
     def post_measurement(self, result: dict) -> None:
         """측정값을 POST /api/measurements 로 전송 (백그라운드 스레드)."""
-        if not self._dash.cfg.backend.enabled:
-            return
-
-        camera_id = self._dash.cfg.identity.db_camera_id or 1
-        roi = result.get("overall_max_roi")
-        roi_id = getattr(roi, "db_roi_id", None) if roi is not None else 1
-        if roi_id is None:
-            roi_id = 1
-
         backend_event = result.get("_backend_posted_event")
-        do_alarm = bool(result.get("alarm", False))
-
-        self._trace(
-            "post_measurement: do_alarm=%s base=%s status=%s",
-            do_alarm, result.get("base", "?"), result["status"].value.lower(),
-        )
 
         try:
+            if not self._dash.cfg.backend.enabled:
+                return
+
+            camera_id = self._dash.cfg.identity.db_camera_id
+            roi = result.get("measurement_roi")
+            roi_id = getattr(roi, "db_roi_id", None) if roi is not None else None
+            if camera_id is None or roi_id is None:
+                self._dash.metrics.api_other_errors += 1
+                _log.error(
+                    "measurement POST skipped: missing DB identity "
+                    "(camera_id=%s roi_id=%s roi=%s)",
+                    camera_id,
+                    roi_id,
+                    result.get("roi_name", ""),
+                )
+                return
+
+            measurement_status = result.get(
+                "measurement_status",
+                result.get("alarm_status", result["status"]),
+            )
+            status_value = (
+                measurement_status.value.lower()
+                if isinstance(measurement_status, Status)
+                else str(measurement_status).lower()
+            )
+            do_alarm = bool(result.get("alarm", False))
+
+            self._trace(
+                "post_measurement: do_alarm=%s base=%s status=%s",
+                do_alarm, result.get("base", "?"), status_value,
+            )
+
             payload = {
                 "camera_id": camera_id,
                 "roi_id": roi_id,
@@ -194,13 +313,13 @@ class TelegramDispatcher:
                 "percentile_95_temp": result["hot_temp_95"],
                 "over_temp_pixels": result.get("over_temp_pixels", 0),
                 "max_hotspot_size": result.get("max_hotspot_size", 0),
-                "status": result["status"].value.lower(),
+                "status": status_value,
                 "algorithm_version": "v2.0",
                 "do_alarm": do_alarm,
                 "alarm_message": (
                     f"{self._dash.cfg.identity.robot_id} · "
                     f"{result['max_temp']:.1f}°C · "
-                    f"{result['status'].value}"
+                    f"{status_value}"
                 ),
             }
             resp = requests.post(
@@ -221,6 +340,7 @@ class TelegramDispatcher:
                     self._trace("saved alert_id=%s to result dict", data.get("alert_id"))
                 else:
                     _log.warning("backend POST rejected: %s", data)
+                    self._dash.metrics.api_other_errors += 1
             else:
                 self._dash._record_api_result(False, status_code=resp.status_code, error_kind="http")
         except requests.exceptions.Timeout:
@@ -234,5 +354,16 @@ class TelegramDispatcher:
                 try:
                     self._trace("backend_event.set() — alert_id=%s", result.get("alert_id"))
                     backend_event.set()
+                except Exception:
+                    pass
+            local_event_id = result.get("_local_event_id")
+            if local_event_id and self._running():
+                try:
+                    self._dash.root.after(
+                        0,
+                        lambda event_id=local_event_id, linked_id=result.get("alert_id"): (
+                            self._dash._link_backend_alert(event_id, linked_id)
+                        ),
+                    )
                 except Exception:
                     pass

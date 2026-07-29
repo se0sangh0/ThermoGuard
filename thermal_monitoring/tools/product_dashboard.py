@@ -464,20 +464,56 @@ class ProductDashboard:
                      font=("맑은 고딕", 12, "bold")).pack(anchor="w", padx=12)
             tk.Label(card, text=f"최고 온도 {event['temp']:.1f}°C", bg=COLORS["card"], fg=color,
                      font=("맑은 고딕", 13, "bold")).pack(anchor="w", padx=12, pady=(3, 8))
-            tk.Button(card, text="확인", command=lambda event_id=event["id"]: self._acknowledge_event(event_id),
-                      bg=color, fg="white", activebackground=color, activeforeground="white",
-                      relief="flat", font=("맑은 고딕", 10, "bold"), cursor="hand2").pack(
-                          fill="x", padx=12, pady=(0, 10))
+            acknowledging = bool(event.get("ack_pending"))
+            linking = bool(event.get("backend_pending"))
+            button_busy = acknowledging or linking
+            tk.Button(
+                card,
+                text=(
+                    "백엔드 연동 중..."
+                    if linking
+                    else "확인 처리 중..."
+                    if acknowledging
+                    else "확인"
+                ),
+                command=lambda event_id=event["id"]: self._acknowledge_event(event_id),
+                bg=color,
+                fg="white",
+                activebackground=color,
+                activeforeground="white",
+                relief="flat",
+                font=("맑은 고딕", 10, "bold"),
+                cursor="arrow" if button_busy else "hand2",
+                state="disabled" if button_busy else "normal",
+            ).pack(fill="x", padx=12, pady=(0, 10))
 
     def _acknowledge_event(self, event_id: str):
         event = next((e for e in self.events if e["id"] == event_id), None)
         if event is None:
             return
-        event["action"] = "확인 완료"
-        event["acknowledged_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._acknowledge_event_backend(event)
+        if event.get("ack_pending") or event.get("backend_pending"):
+            return
+        if event.get("backend_id") and self.cfg.backend.enabled:
+            event["ack_pending"] = True
+            self._add_operating_log(
+                "알림",
+                "확인 처리 중",
+                f"{event['asset']} · {event['temp']:.1f}°C",
+            )
+            self._render_alert_cards()
+            self._acknowledge_event_backend(event)
+            return
+        self._mark_event_acknowledged(event)
         self._add_operating_log("알림", "확인 완료", f"{event['asset']} · {event['temp']:.1f}°C")
         self._render_alert_cards()
+
+    @staticmethod
+    def _mark_event_acknowledged(event: dict, acknowledged_at=None):
+        event["action"] = "확인 완료"
+        event["ack_pending"] = False
+        event["acknowledged_at"] = (
+            acknowledged_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
 
     def _draw_robot_map(self):
         canvas = self.map_canvas
@@ -983,10 +1019,26 @@ class ProductDashboard:
 
     def _latest_pair(self):
         """Return the newest thermal, visual and NPY paths for analysis."""
+        capture = self.capture
+        thermal_only_warning = bool(
+            capture is not None and capture.warning_mode
+        )
         return latest_analysis_pair(
             self.cfg.paths.dataset_dir,
-            visual_mode=(self.cfg.tools.mode == "both"),
+            visual_mode=(
+                self.cfg.tools.mode == "both"
+                and not thermal_only_warning
+            ),
         )
+
+    def _visual_required_for_quality(self, visual_img) -> bool:
+        """Require visual frames except during the intentional thermal-only warning mode."""
+        if self.cfg.tools.mode != "both":
+            return False
+        if visual_img is not None:
+            return True
+        capture = self.capture
+        return not (capture is not None and capture.warning_mode)
 
     def _process_pair_to_dict(self, pair: dict) -> dict:
         base = pair["base"]
@@ -998,9 +1050,10 @@ class ProductDashboard:
         visual_img = None
         if visual and visual.exists():
             visual_img = cv2.imread(str(visual))
+        visual_required = self._visual_required_for_quality(visual_img)
         image_quality_ok, image_quality_reason = assess_image_quality(
             thermal_img, visual_img,
-            visual_mode=(self.cfg.tools.mode == "both"),
+            visual_mode=visual_required,
         )
 
         roi_cfg = load_roi_config()
@@ -1035,7 +1088,7 @@ class ProductDashboard:
         # 전역 최악 상태 갱신
         self.state.status = status
 
-        roi_result.hotspot_centroids = merge_roi_hotspot_centroids(roi_results)
+        merged_hotspots = merge_roi_hotspot_centroids(roi_results)
 
         overlay = create_overlay(
             # This panel is explicitly the Thermal view. Passing the visual
@@ -1043,7 +1096,7 @@ class ProductDashboard:
             # Homography exists, duplicating the visible-image panel.
             str(thermal), "", roi_result.roi_bounds,
             roi_result.max_temp, roi_result.mean_temp, roi_result.hot_temp_95,
-            status.value, hotspot_centroids=roi_result.hotspot_centroids,
+            status.value, hotspot_centroids=merged_hotspots,
             roi_bounds_list=_get_roi_bounds_list(roi_cfg),
             roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
         )
@@ -1055,8 +1108,10 @@ class ProductDashboard:
             "hot_temp_95": roi_result.hot_temp_95,
             "over_temp_pixels": getattr(roi_result, 'over_temp_pixels', 0),
             "max_hotspot_size": getattr(roi_result, 'max_hotspot_size', 0),
-            "hotspot_count": len(roi_result.hotspot_centroids),
+            "hotspot_count": len(merged_hotspots),
             "status": status, "alarm_status": alarm_status, "alarm": alarm,
+            "measurement_status": alarm_status,
+            "measurement_roi": roi_result,
             "overall_max_temp": overall_max_temp,
             "overall_max_roi_name": overall_max_roi.roi_name or "ROI-01",
             "overall_max_roi": overall_max_roi,
@@ -1066,6 +1121,11 @@ class ProductDashboard:
             "captured_at": captured_at,
             "image_quality_ok": image_quality_ok,
             "image_quality_reason": image_quality_reason,
+            "thermal_only_mode": (
+                self.cfg.tools.mode == "both"
+                and visual_img is None
+                and not visual_required
+            ),
         }
 
     def _apply_analysis_result(self, result: dict, generation: int):
@@ -1099,13 +1159,14 @@ class ProductDashboard:
             and captured_at != self._last_alert_capture
         ):
             self.metrics.anomaly_today += 1
-            self._append_event(
+            local_event = self._append_event(
                 status.value,
                 result.get("overall_max_temp", result["max_temp"]),
                 "확인 필요",
                 result.get("overall_max_roi_name", "ROI-01"),
                 event_time=captured_at,
             )
+            result["_local_event_id"] = local_event["id"]
             self._last_alert_capture = captured_at
         elif status == Status.NORMAL and previous != Status.NORMAL:
             if self.capture:
@@ -1125,8 +1186,21 @@ class ProductDashboard:
         self._last_alarm_status = alarm_status
 
         # 새로 촬영된 이미지일 때만 백엔드 DB에 측정값을 기록한다.
-        if is_new_capture and self._latest_pair_fresh:
+        if (
+            is_new_capture
+            and self._latest_pair_fresh
+            and self.cfg.backend.enabled
+        ):
             result["_backend_posted_event"] = threading.Event()
+            local_event_id = result.get("_local_event_id")
+            if local_event_id:
+                local_event = next(
+                    (e for e in self.events if e.get("id") == local_event_id),
+                    None,
+                )
+                if local_event is not None:
+                    local_event["backend_pending"] = True
+                    self._render_alert_cards()
             threading.Thread(
                 target=self.telegram.post_measurement, args=(result,), daemon=True
             ).start()
@@ -1143,7 +1217,8 @@ class ProductDashboard:
         # 뒤바뀌어 보일 수 있으므로, 이상 프레임은 표시하지 않고 직전의
         # 정상 화면을 유지한다.
         if quality_ok:
-            self._show_image(self.visual_label, result["visual_img"], "visual")
+            if result["visual_img"] is not None:
+                self._show_image(self.visual_label, result["visual_img"], "visual")
             self._show_image(self.thermal_label, result["overlay"], "thermal")
         else:
             if self.visual_photo is None:
@@ -1197,8 +1272,11 @@ class ProductDashboard:
         self._draw_robot_map()
         if result.get("image_quality_ok", False):
             stamp = captured_at.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
-            self.visual_stamp.configure(text=stamp)
             self.thermal_stamp.configure(text=stamp)
+            if result.get("thermal_only_mode", False):
+                self.visual_stamp.configure(text="과열 모드 · 가시광 촬영 생략")
+            else:
+                self.visual_stamp.configure(text=stamp)
         else:
             issue = result.get("image_quality_reason", "영상 종류 확인 필요")
             hold_text = f"갱신 보류 · {issue}"
@@ -1283,6 +1361,36 @@ class ProductDashboard:
             "acknowledged_at": None,
         }
         self.events.insert(0, event)
+        self._render_alert_cards()
+        return event
+
+    def _link_backend_alert(self, local_event_id: str, alert_id) -> None:
+        """Finish backend linking and attach an alert ID when one was created."""
+        if not local_event_id:
+            return
+        event = next((e for e in self.events if e.get("id") == local_event_id), None)
+        if event is None:
+            return
+        event["backend_pending"] = False
+        if alert_id is None:
+            self._render_alert_cards()
+            return
+        backend_id = str(alert_id)
+        event["backend_id"] = backend_id
+        duplicates = [
+            candidate
+            for candidate in self.events
+            if candidate is not event and candidate.get("backend_id") == backend_id
+        ]
+        for duplicate in duplicates:
+            if duplicate.get("action") == "확인 완료":
+                self._mark_event_acknowledged(
+                    event,
+                    duplicate.get("acknowledged_at"),
+                )
+            elif duplicate.get("ack_pending"):
+                event["ack_pending"] = True
+            self.events.remove(duplicate)
         self._render_alert_cards()
 
     def acknowledge_selected(self):
@@ -1389,34 +1497,68 @@ class ProductDashboard:
             if resp.status_code != 200:
                 return
             data = resp.json()
-            for alert in data.get("alerts", []):
-                alert_id = str(alert.get("alert_id", ""))
-                if any(e.get("backend_id") == alert_id for e in self.events):
-                    continue
-                event_status = alert.get("event_status", "open")
-                action = "확인 완료" if event_status in ("acknowledged", "resolved") else "확인 필요"
-                self.events.insert(0, {
-                    "id": f"be_{alert_id}",
-                    "backend_id": alert_id,
-                    "time": alert.get("occurred_at", "")[:19].replace("T", " "),
-                    "asset": f"{alert.get('robot_code', 'Robot-01')} · {alert.get('roi_name', 'ROI')}",
-                    "state": alert.get("severity", "normal").capitalize(),
-                    "temp": float(alert.get("max_temp", 0)),
-                    "action": action,
-                    "acknowledged_at": alert.get("acknowledged_at"),
-                })
-            self.events.sort(key=lambda e: e["id"], reverse=True)
-            del self.events[200:]
-            self.root.after(0, self._render_alert_cards)
-        except Exception:
-            pass
+            alerts = data.get("alerts", [])
+            if not isinstance(alerts, list):
+                return
+            if threading.current_thread() is threading.main_thread():
+                self._merge_backend_alerts(alerts)
+            elif self.lifecycle == "running":
+                self.root.after(0, lambda rows=alerts: self._merge_backend_alerts(rows))
+        except Exception as exc:
+            _file_log.warning("backend alert sync failed: %s", exc)
+
+    def _merge_backend_alerts(self, alerts: list[dict]) -> None:
+        for alert in alerts:
+            alert_id = str(alert.get("alert_id", ""))
+            if not alert_id:
+                continue
+            event_status = alert.get("event_status", "open")
+            action = (
+                "확인 완료"
+                if event_status in ("acknowledged", "resolved")
+                else "확인 필요"
+            )
+            event = next(
+                (e for e in self.events if e.get("backend_id") == alert_id),
+                None,
+            )
+            ack_pending = bool(
+                event is not None
+                and event.get("ack_pending")
+                and event_status == "open"
+            )
+            fields = {
+                "backend_id": alert_id,
+                "time": alert.get("occurred_at", "")[:19].replace("T", " "),
+                "asset": (
+                    f"{alert.get('robot_code', 'Robot-01')} · "
+                    f"{alert.get('roi_name', 'ROI')}"
+                ),
+                "state": alert.get("severity", "normal").capitalize(),
+                "temp": float(alert.get("max_temp", 0)),
+                "action": action,
+                "ack_pending": ack_pending,
+                "acknowledged_at": alert.get("acknowledged_at"),
+            }
+            if event is None:
+                self.events.insert(0, {"id": f"be_{alert_id}", **fields})
+            else:
+                event.update(fields)
+        self.events.sort(key=lambda event: event.get("time", ""), reverse=True)
+        del self.events[200:]
+        self._render_alert_cards()
 
     def _acknowledge_event_backend(self, event: dict):
         """이벤트 확인 처리 → PATCH /api/alerts/{id} 호출."""
         backend_id = event.get("backend_id")
         if not backend_id or not self.cfg.backend.enabled:
             return
+        event_id = event["id"]
+
         def work():
+            success = False
+            detail = ""
+            acknowledged_at = None
             try:
                 resp = requests.patch(
                     f"{self.cfg.backend.url}/api/alerts/{backend_id}",
@@ -1424,10 +1566,56 @@ class ProductDashboard:
                     timeout=self.cfg.backend.timeout_sec,
                 )
                 if resp.status_code == 200:
-                    _file_log.info("backend PATCH /api/alerts/%s → acknowledged", backend_id)
-            except Exception:
-                pass
+                    data = resp.json()
+                    success = (
+                        data.get("status") == "updated"
+                        and data.get("event_status") == "acknowledged"
+                    )
+                    if success:
+                        acknowledged_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        detail = str(data.get("error") or data)
+                else:
+                    detail = f"HTTP {resp.status_code}"
+            except Exception as exc:
+                detail = str(exc)
+            if self.lifecycle == "running":
+                self.root.after(
+                    0,
+                    lambda: self._finish_backend_ack(
+                        event_id,
+                        success,
+                        acknowledged_at,
+                        detail,
+                    ),
+                )
         threading.Thread(target=work, daemon=True).start()
+
+    def _finish_backend_ack(
+        self,
+        event_id: str,
+        success: bool,
+        acknowledged_at,
+        detail: str,
+    ) -> None:
+        event = next((e for e in self.events if e.get("id") == event_id), None)
+        if event is None:
+            return
+        event["ack_pending"] = False
+        if success:
+            self._mark_event_acknowledged(event, acknowledged_at)
+            self._add_operating_log(
+                "알림",
+                "확인 완료",
+                f"{event['asset']} · {event['temp']:.1f}°C",
+            )
+        else:
+            self._add_operating_log(
+                "알림",
+                "확인 실패",
+                detail or f"alert_id={event.get('backend_id')}",
+            )
+        self._render_alert_cards()
 
     # ── Shutdown ─────────────────────────────────────────────────
 
@@ -2084,13 +2272,23 @@ class SettingsDialog:
                     timeout=self.d.cfg.backend.timeout_sec,
                 )
                 if resp.status_code != 200:
-                    return
+                    raise RuntimeError(f"threshold 조회 실패: HTTP {resp.status_code}")
                 thresholds = resp.json().get("thresholds", [])
                 camera_id = self.d.cfg.identity.db_camera_id
-                matching = [t for t in thresholds if t.get("camera_id") == camera_id and t.get("valid_to") is None]
-                for t in matching:
-                    threshold_id = t["threshold_id"]
-                    requests.patch(
+                matching = [
+                    threshold
+                    for threshold in thresholds
+                    if threshold.get("camera_id") == camera_id
+                    and threshold.get("roi_id") is None
+                    and threshold.get("valid_to") is None
+                ]
+                if matching:
+                    latest = max(
+                        matching,
+                        key=lambda threshold: int(threshold["threshold_id"]),
+                    )
+                    threshold_id = latest["threshold_id"]
+                    update_response = requests.patch(
                         f"{self.d.cfg.backend.url}/api/thresholds/{threshold_id}",
                         json={
                             "baseline_temp": self.d.cfg.roi.baseline_temp,
@@ -2099,21 +2297,47 @@ class SettingsDialog:
                         },
                         timeout=self.d.cfg.backend.timeout_sec,
                     )
+                    update_payload = update_response.json()
+                    if (
+                        update_response.status_code != 200
+                        or update_payload.get("status") != "updated"
+                    ):
+                        raise RuntimeError(
+                            f"threshold 수정 실패: {update_payload}"
+                        )
                     _file_log.info("backend PATCH /api/thresholds/%s success", threshold_id)
                     return
-                requests.post(
+                create_response = requests.post(
                     f"{self.d.cfg.backend.url}/api/thresholds",
                     json={
                         "camera_id": camera_id,
+                        "roi_id": None,
                         "baseline_temp": self.d.cfg.roi.baseline_temp,
                         "warning_delta": self.d.cfg.roi.warning_delta,
                         "critical_delta": self.d.cfg.roi.critical_delta,
                     },
                     timeout=self.d.cfg.backend.timeout_sec,
                 )
+                create_payload = create_response.json()
+                if (
+                    create_response.status_code != 200
+                    or create_payload.get("status") != "created"
+                ):
+                    raise RuntimeError(
+                        f"threshold 생성 실패: {create_payload}"
+                    )
                 _file_log.info("backend POST /api/thresholds success")
-            except Exception:
-                pass
+            except Exception as exc:
+                _file_log.warning("backend threshold sync failed: %s", exc)
+                if self.d.lifecycle == "running":
+                    self.d.root.after(
+                        0,
+                        lambda message=str(exc): self.d._add_operating_log(
+                            "임계값 DB 연동",
+                            "저장 실패",
+                            message,
+                        ),
+                    )
         threading.Thread(target=work, daemon=True).start()
 
 

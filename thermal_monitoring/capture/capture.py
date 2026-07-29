@@ -114,6 +114,12 @@ class CaptureSession:
         return self._running
 
     @property
+    def warning_mode(self) -> bool:
+        """Return whether the capture loop is currently in thermal-only warning mode."""
+        with self._interval_lock:
+            return self.interval != self._normal_interval
+
+    @property
     def last_saved_pair(self) -> tuple[str | None, str | None]:
         """가장 최근 캡처 사이클에서 저장된 (thermal, visual) 경로.
 

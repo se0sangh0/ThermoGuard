@@ -1,6 +1,8 @@
+from types import SimpleNamespace
+
 from thermal_monitoring.analysis import notifier
 from thermal_monitoring.analysis.threshold import Status
-from thermal_monitoring.tools.product_dashboard import ProductDashboard
+from thermal_monitoring.tools.telegram_dispatcher import TelegramDispatcher
 
 
 class _Response:
@@ -10,6 +12,21 @@ class _Response:
 
     def json(self):
         return self._payload
+
+
+class _ImmediateRoot:
+    @staticmethod
+    def after(_delay, callback):
+        callback()
+
+
+def _dispatcher(logs):
+    dashboard = SimpleNamespace(
+        lifecycle="running",
+        root=_ImmediateRoot(),
+        _add_operating_log=lambda *args: logs.append(args),
+    )
+    return TelegramDispatcher(dashboard)
 
 
 def test_configure_toggle_and_logout_persist_local_env(tmp_path, monkeypatch):
@@ -65,11 +82,11 @@ def test_send_alarm_does_not_call_api_when_delivery_disabled(monkeypatch):
 
 
 def test_dashboard_dispatches_first_warning_transition(monkeypatch):
-    dashboard = ProductDashboard.__new__(ProductDashboard)
-    dashboard._last_telegram_capture = None
-    dashboard._add_operating_log = lambda *args: None
     dispatched = []
-    dashboard._dispatch_telegram = lambda result: dispatched.append(result)
+    dispatcher = _dispatcher([])
+    dispatcher._dispatch = (
+        lambda result, captured_at: dispatched.append((result, captured_at))
+    )
     monkeypatch.setattr(
         notifier,
         "get_settings",
@@ -82,22 +99,20 @@ def test_dashboard_dispatches_first_warning_transition(monkeypatch):
         "overall_max_roi_name": "ROI-01",
     }
 
-    dashboard._maybe_dispatch_telegram(
+    dispatcher.maybe_dispatch(
         result,
         quality_ok=True,
         captured_at="capture-1",
         warning_transition=True,
     )
 
-    assert dispatched == [result]
+    assert dispatched == [(result, "capture-1")]
 
 
 def test_dashboard_does_not_dispatch_when_delivery_is_disabled(monkeypatch):
-    dashboard = ProductDashboard.__new__(ProductDashboard)
-    dashboard._last_telegram_capture = None
     logs = []
-    dashboard._add_operating_log = lambda *args: logs.append(args)
-    dashboard._dispatch_telegram = lambda result: (_ for _ in ()).throw(
+    dispatcher = _dispatcher(logs)
+    dispatcher._dispatch = lambda *_args: (_ for _ in ()).throw(
         AssertionError("dispatch called")
     )
     monkeypatch.setattr(
@@ -106,7 +121,7 @@ def test_dashboard_does_not_dispatch_when_delivery_is_disabled(monkeypatch):
         lambda: {"configured": True, "enabled": False},
     )
 
-    dashboard._maybe_dispatch_telegram(
+    dispatcher.maybe_dispatch(
         {"alarm": True, "status": Status.CRITICAL, "max_temp": 70.0},
         quality_ok=True,
         captured_at="capture-2",

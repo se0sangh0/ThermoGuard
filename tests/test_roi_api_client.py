@@ -51,6 +51,7 @@ def test_sync_rois_does_not_post_unchanged_definition(monkeypatch):
         {"cameras": [{"camera_id": 7, "camera_code": "CAM-01",
                       "ip_address": "192.168.0.51"}]},
         {"rois": [{"camera_id": 7, "roi_name": "ROI-1",
+                   "roi_id": 12,
                    "x1": 10, "y1": 20, "x2": 110, "y2": 220,
                    "version": 2, "enabled": True}]},
     ])
@@ -71,3 +72,4 @@ def test_sync_rois_does_not_post_unchanged_definition(monkeypatch):
     )
     assert result.created == 0
     assert result.unchanged == 1
+    assert roi_id_map == {"ROI-1": 12}
