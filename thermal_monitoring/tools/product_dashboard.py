@@ -1674,16 +1674,18 @@ class SettingsDialog:
         self.critical = tk.StringVar(value=str(self.d.cfg.roi.critical_delta))
         self.factory_name = tk.StringVar(value=self.d.cfg.identity.factory_name)
         self.line_name = tk.StringVar(value=self.d.cfg.identity.line_name)
+        self.robot_code = tk.StringVar(value=self.d.cfg.identity.robot_id)
         self.robot_name = tk.StringVar(
             value=self.d.cfg.identity.robot_name or self.d.cfg.identity.robot_id
         )
         self._field(general, "공장 이름", self.factory_name, 0)
         self._field(general, "생산라인 이름", self.line_name, 1)
-        self._field(general, "로봇 이름", self.robot_name, 2)
-        self._field(general, "카메라 주소", self.ip, 3)
-        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 4)
+        self._field(general, "로봇 ID", self.robot_code, 2)
+        self._field(general, "로봇 이름", self.robot_name, 3)
+        self._field(general, "카메라 주소", self.ip, 4)
+        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 5)
         ttk.Label(general, text="촬영 이미지, 온도 배열과 오버레이가 선택한 폴더에 저장됩니다.").grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=12)
+            row=6, column=0, columnspan=3, sticky="w", pady=12)
         ttk.Label(roi, text="가시광 이미지에서 감시할 설비 영역을 지정합니다.", font=("맑은 고딕", 11, "bold")).pack(anchor="w", pady=8)
         self.roi_button = ttk.Button(roi, text="가시광 이미지에서 ROI 설정", command=self.open_roi_editor)
         self.roi_button.pack(anchor="w", pady=8)
@@ -2164,11 +2166,12 @@ class SettingsDialog:
             camera_ip = self.ip.get().strip()
             factory_name = self.factory_name.get().strip()
             line_name = self.line_name.get().strip()
+            robot_code = self.robot_code.get().strip()
             robot_name = self.robot_name.get().strip()
-            if not factory_name or not line_name or not robot_name:
+            if not factory_name or not line_name or not robot_code or not robot_name:
                 messagebox.showerror(
                     "설비 정보 입력 오류",
-                    "공장 이름, 생산라인 이름, 로봇 이름을 모두 입력하세요.",
+                    "공장 이름, 생산라인 이름, 로봇 ID, 로봇 이름을 모두 입력하세요.",
                     parent=self.win,
                 )
                 return
@@ -2200,14 +2203,18 @@ class SettingsDialog:
             identity = self.d.cfg.identity
             same_factory = factory_name == identity.factory_name
             same_line = same_factory and line_name == identity.line_name
-            same_robot = same_line and robot_name == identity.robot_name
+            same_robot = (
+                same_line
+                and robot_code == identity.robot_id
+                and robot_name == identity.robot_name
+            )
             same_camera = same_robot and camera_ip == self.d.cfg.camera.ip
             registration = register_asset_hierarchy(
                 base_url=self.d.cfg.backend.url,
                 timeout=self.d.cfg.backend.timeout_sec,
                 factory_name=factory_name,
                 line_name=line_name,
-                robot_code=identity.robot_id,
+                robot_code=robot_code,
                 robot_name=robot_name,
                 camera_code=identity.camera_id,
                 camera_ip=camera_ip,
@@ -2220,6 +2227,7 @@ class SettingsDialog:
             self.d.cfg.camera.ip = camera_ip
             identity.factory_name = factory_name
             identity.line_name = line_name
+            identity.robot_id = robot_code
             identity.robot_name = robot_name
             identity.factory_id = registration.factory_id
             identity.line_id = registration.line_id
@@ -2235,7 +2243,7 @@ class SettingsDialog:
             self.d._add_operating_log(
                 "설비 DB 연동",
                 "저장 완료",
-                f"{factory_name} · {line_name} · {robot_name} "
+                f"{factory_name} · {line_name} · {robot_code} · {robot_name} "
                 f"(camera_id={registration.camera_id})",
             )
             self.d._add_operating_log("환경설정", "저장 경로 변경", dataset_path)
