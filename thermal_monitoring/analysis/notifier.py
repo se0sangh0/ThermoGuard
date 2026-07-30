@@ -250,6 +250,7 @@ def save_delivery_result(
     http_status: int | None = None,
     error_message: str | None = None,
     retry_count: int = 0,
+    backend_url: str | None = None,
 ) -> bool:
     """Telegram 전송 결과를 FastAPI를 통해 DB에 저장한다."""
     _log.debug(
@@ -258,9 +259,14 @@ def save_delivery_result(
         alert_id, success, http_status, error_message,
     )
 
+    target_url = (
+        f"{(backend_url or FASTAPI_URL).rstrip('/')}"
+        "/api/notification-deliveries"
+    )
+
     try:
         response = requests.post(
-            f"{FASTAPI_URL}/api/notification-deliveries",
+            target_url,
             json={
                 "alert_id": alert_id,
                 "delivery_status": (
@@ -278,8 +284,9 @@ def save_delivery_result(
 
         if result.get("status") != "created":
             _log.error(
-                "notification_deliveries 저장 실패: %s",
+                "notification_deliveries 저장 실패: %s url=%s",
                 result,
+                target_url,
             )
             return False
 
@@ -294,8 +301,9 @@ def save_delivery_result(
     except Exception as exc:
         _log.error(
             "notification delivery API 호출 실패: "
-            "alert_id=%s error=%s",
+            "alert_id=%s url=%s error=%s",
             alert_id,
+            target_url,
             exc,
         )
         return False
@@ -309,6 +317,7 @@ def send_alarm(
     status: str,
     robot_id: str = "Robot-01",
     alert_id: int | None = None,
+    backend_url: str | None = None,
 ) -> bool:
     """
     과열 알림 전송 (이미지 + 캡션).
@@ -408,6 +417,7 @@ def send_alarm(
             http_status=last_http_status,
             error_message=(None if photo_sent else last_error_message),
             retry_count=0,
+            backend_url=backend_url,
         )
     else:
         _log.debug(

@@ -13,6 +13,10 @@ class _Response:
     def json(self):
         return self._payload
 
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise notifier.requests.HTTPError(f"HTTP {self.status_code}")
+
 
 class _ImmediateRoot:
     @staticmethod
@@ -127,3 +131,100 @@ def test_dashboard_does_not_dispatch_when_delivery_is_disabled(monkeypatch):
     )
 
     assert any("비활성화" in detail for _, _, detail in logs)
+
+
+def test_save_delivery_result_uses_explicit_backend_url(monkeypatch):
+    posted = []
+
+    def fake_post(url, json=None, timeout=None):
+        posted.append((url, json))
+        return _Response(200, {"status": "created", "delivery_id": 100})
+
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+
+    result = notifier.save_delivery_result(
+        alert_id=10,
+        success=True,
+        backend_url="http://custom-backend.local:8000///",
+    )
+
+    assert result is True
+    assert posted[0][0] == (
+        "http://custom-backend.local:8000/api/notification-deliveries"
+    )
+    assert posted[0][1]["alert_id"] == 10
+    assert posted[0][1]["delivery_status"] == "success"
+
+
+def test_save_delivery_result_falls_back_to_fastapi_url(monkeypatch):
+    posted = []
+
+    def fake_post(url, json=None, timeout=None):
+        posted.append(url)
+        return _Response(200, {"status": "created", "delivery_id": 101})
+
+    monkeypatch.setattr(
+        notifier,
+        "FASTAPI_URL",
+        "http://default-fastapi.local:5000/",
+    )
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+
+    result = notifier.save_delivery_result(
+        alert_id=11,
+        success=False,
+        error_message="Telegram timeout",
+        backend_url=None,
+    )
+
+    assert result is True
+    assert posted == [
+        "http://default-fastapi.local:5000/api/notification-deliveries"
+    ]
+
+
+def test_send_alarm_keeps_telegram_result_separate_from_delivery_save(
+    monkeypatch,
+):
+    monkeypatch.setattr(notifier, "BOT_TOKEN", "valid-token")
+    monkeypatch.setattr(notifier, "CHAT_ID", "12345")
+    monkeypatch.setattr(notifier, "TELEGRAM_ENABLED", True)
+
+    def fake_post(url, data=None, timeout=None, **kwargs):
+        assert "sendMessage" in url
+        return _Response(200, {"ok": True})
+
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+    save_calls = []
+
+    def fake_save_delivery_result(*args, **kwargs):
+        save_calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr(
+        notifier,
+        "save_delivery_result",
+        fake_save_delivery_result,
+    )
+
+    without_alert = notifier.send_alarm(
+        image_path="",
+        temp=50.0,
+        status="Critical",
+        alert_id=None,
+    )
+    with_alert = notifier.send_alarm(
+        image_path="",
+        temp=60.0,
+        status="Critical",
+        alert_id=99,
+        backend_url="http://explicit-backend.local:8000/",
+    )
+
+    assert without_alert is True
+    assert with_alert is True
+    assert len(save_calls) == 1
+    assert save_calls[0]["alert_id"] == 99
+    assert save_calls[0]["backend_url"] == (
+        "http://explicit-backend.local:8000/"
+    )

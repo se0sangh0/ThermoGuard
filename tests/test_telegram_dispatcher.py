@@ -229,3 +229,73 @@ def test_synchronous_dispatch_start_failure_remains_retryable(monkeypatch):
 
     assert attempts == ["attempt", "attempt"]
     assert dispatcher._dispatch_inflight is False
+
+
+class _ImmediateThread:
+    def __init__(self, target=None, daemon=None):
+        self.target = target
+
+    def start(self):
+        if self.target:
+            self.target()
+
+
+def test_dispatch_passes_backend_url_from_cfg(monkeypatch):
+    dispatcher = _make_dispatcher()
+    dispatcher._dash.cfg.backend = SimpleNamespace(
+        url="http://dashboard-backend.local:8000"
+    )
+    captured_calls = []
+
+    def fake_send_alarm(*args, **kwargs):
+        captured_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(notifier, "send_alarm", fake_send_alarm)
+    monkeypatch.setattr(
+        telegram_dispatcher.threading,
+        "Thread",
+        _ImmediateThread,
+    )
+
+    dispatcher._dispatch(
+        {
+            "max_temp": 80.0,
+            "status": Status.CRITICAL,
+            "base": "cap-1",
+        },
+        "capture-1",
+    )
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["backend_url"] == (
+        "http://dashboard-backend.local:8000"
+    )
+
+
+def test_dispatch_passes_none_when_backend_attr_absent(monkeypatch):
+    dispatcher = _make_dispatcher()
+    captured_calls = []
+
+    def fake_send_alarm(*args, **kwargs):
+        captured_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(notifier, "send_alarm", fake_send_alarm)
+    monkeypatch.setattr(
+        telegram_dispatcher.threading,
+        "Thread",
+        _ImmediateThread,
+    )
+
+    dispatcher._dispatch(
+        {
+            "max_temp": 80.0,
+            "status": Status.CRITICAL,
+            "base": "cap-2",
+        },
+        "capture-2",
+    )
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["backend_url"] is None

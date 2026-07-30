@@ -213,6 +213,9 @@ class TelegramDispatcher:
         overlay = result.get("overlay")
         base = str(result.get("base", "")) or "latest"
         robot_id = self._dash.cfg.identity.robot_id
+        cfg = getattr(self._dash, "cfg", None)
+        backend = getattr(cfg, "backend", None)
+        backend_url = getattr(backend, "url", None)
         status = result.get(
             "measurement_status",
             result.get("alarm_status", result.get("status", Status.CRITICAL)),
@@ -261,6 +264,7 @@ class TelegramDispatcher:
                     status=status_value,
                     robot_id=robot_id,
                     alert_id=alert_id,
+                    backend_url=backend_url,
                 )
                 self._trace("send_alarm returned ok=%s", ok)
                 self._op_log(
