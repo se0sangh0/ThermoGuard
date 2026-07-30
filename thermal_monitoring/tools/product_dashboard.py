@@ -2147,17 +2147,20 @@ class SettingsDialog:
                     timeout=self.d.cfg.backend.timeout_sec,
                     database_camera_id=self.d.cfg.identity.db_camera_id,
                 )
+                self.d.cfg.identity.db_camera_id = result.camera_id
                 # 저장된 ROI ID를 config에 반영
                 for entry in entries:
                     name = entry.name
                     if name in roi_id_map:
                         entry.db_roi_id = roi_id_map[name]
-                save_config(self.d.cfg)
+                threshold_result = self._sync_thresholds_to_backend(entries)
                 self.d._add_operating_log(
                     "ROI DB 연동",
                     "저장 완료",
                     f"camera_id={result.camera_id}, "
-                    f"신규 버전 {result.created}개, 변경 없음 {result.unchanged}개",
+                    f"신규 버전 {result.created}개, 변경 없음 {result.unchanged}개 · "
+                    f"threshold 생성 {threshold_result.created}개, "
+                    f"갱신 {threshold_result.updated}개",
                 )
 
             saved = show_roi_dialog(
@@ -2334,83 +2337,65 @@ class SettingsDialog:
                 parent=self.win,
             )
 
-    def _sync_thresholds_to_backend(self):
+    def _sync_thresholds_to_backend(self, roi_entries=None):
         if not self.d.cfg.backend.enabled or not self.d.cfg.identity.db_camera_id:
-            return
-        def work():
-            try:
-                resp = requests.get(
-                    f"{self.d.cfg.backend.url}/api/thresholds",
-                    timeout=self.d.cfg.backend.timeout_sec,
-                )
-                if resp.status_code != 200:
-                    raise RuntimeError(f"threshold 조회 실패: HTTP {resp.status_code}")
-                thresholds = resp.json().get("thresholds", [])
-                camera_id = self.d.cfg.identity.db_camera_id
-                matching = [
-                    threshold
-                    for threshold in thresholds
-                    if threshold.get("camera_id") == camera_id
-                    and threshold.get("roi_id") is None
-                    and threshold.get("valid_to") is None
-                ]
-                if matching:
-                    latest = max(
-                        matching,
-                        key=lambda threshold: int(threshold["threshold_id"]),
-                    )
-                    threshold_id = latest["threshold_id"]
-                    update_response = requests.patch(
-                        f"{self.d.cfg.backend.url}/api/thresholds/{threshold_id}",
-                        json={
-                            "baseline_temp": self.d.cfg.roi.baseline_temp,
-                            "warning_delta": self.d.cfg.roi.warning_delta,
-                            "critical_delta": self.d.cfg.roi.critical_delta,
-                        },
-                        timeout=self.d.cfg.backend.timeout_sec,
-                    )
-                    update_payload = update_response.json()
-                    if (
-                        update_response.status_code != 200
-                        or update_payload.get("status") != "updated"
-                    ):
-                        raise RuntimeError(
-                            f"threshold 수정 실패: {update_payload}"
-                        )
-                    _file_log.info("backend PATCH /api/thresholds/%s success", threshold_id)
-                    return
-                create_response = requests.post(
-                    f"{self.d.cfg.backend.url}/api/thresholds",
-                    json={
-                        "camera_id": camera_id,
-                        "roi_id": None,
-                        "baseline_temp": self.d.cfg.roi.baseline_temp,
-                        "warning_delta": self.d.cfg.roi.warning_delta,
-                        "critical_delta": self.d.cfg.roi.critical_delta,
-                    },
-                    timeout=self.d.cfg.backend.timeout_sec,
-                )
-                create_payload = create_response.json()
-                if (
-                    create_response.status_code != 200
-                    or create_payload.get("status") != "created"
-                ):
-                    raise RuntimeError(
-                        f"threshold 생성 실패: {create_payload}"
-                    )
-                _file_log.info("backend POST /api/thresholds success")
-            except Exception as exc:
-                _file_log.warning("backend threshold sync failed: %s", exc)
-                if self.d.lifecycle == "running":
-                    self.d.root.after(
-                        0,
-                        lambda message=str(exc): self.d._add_operating_log(
-                            "임계값 DB 연동",
-                            "저장 실패",
-                            message,
-                        ),
-                    )
-        threading.Thread(target=work, daemon=True).start()
+            raise RuntimeError(
+                "Backend 또는 카메라 DB ID가 없어 threshold를 저장할 수 없습니다."
+            )
+
+        from .threshold_api_client import sync_threshold_profiles
+
+        entries = self.d.cfg.roi.rois if roi_entries is None else roi_entries
+        roi_ids = [
+            (
+                entry.get("db_roi_id")
+                if isinstance(entry, dict)
+                else getattr(entry, "db_roi_id", None)
+            )
+            for entry in entries
+        ]
+        roi_ids = [roi_id for roi_id in roi_ids if roi_id is not None]
+        if not roi_ids:
+            self.d._add_operating_log(
+                "임계값 DB 연동",
+                "보류",
+                "저장된 DB ROI ID가 없어 ROI 저장 후 생성합니다.",
+            )
+            from .threshold_api_client import ThresholdSyncResult
+            return ThresholdSyncResult(
+                camera_id=int(self.d.cfg.identity.db_camera_id),
+                roi_ids=(),
+                created=0,
+                updated=0,
+            )
+
+        result = sync_threshold_profiles(
+            base_url=self.d.cfg.backend.url,
+            timeout=self.d.cfg.backend.timeout_sec,
+            camera_id=self.d.cfg.identity.db_camera_id,
+            roi_ids=roi_ids,
+            baseline_temp=self.d.cfg.roi.baseline_temp,
+            warning_delta=self.d.cfg.roi.warning_delta,
+            critical_delta=self.d.cfg.roi.critical_delta,
+            min_hotspot_size=self.d.cfg.hotspot.min_size,
+            min_hotspot_size_max=self.d.cfg.hotspot.min_size_max,
+            alarm_cooldown_sec=self.d.cfg.monitoring.alarm_cooldown_sec,
+        )
+        _file_log.info(
+            "backend ROI threshold sync success: camera_id=%s roi_ids=%s "
+            "created=%s updated=%s",
+            result.camera_id,
+            result.roi_ids,
+            result.created,
+            result.updated,
+        )
+        self.d._add_operating_log(
+            "임계값 DB 연동",
+            "저장 완료",
+            f"ROI {len(result.roi_ids)}개 · 생성 {result.created}개 · "
+            f"갱신 {result.updated}개",
+        )
+        return result
 
 
 def main():

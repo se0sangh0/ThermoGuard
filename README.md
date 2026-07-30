@@ -291,6 +291,11 @@ Product Dashboard는 DB에 직접 INSERT하지 않고 기존 FastAPI 경로를 �
 - 각 ROI의 `db_roi_id`
 - 해당 카메라 또는 ROI에 적용 가능한 활성 threshold profile
 
+ROI 저장이 완료되면 각 `db_roi_id`에 대응하는 활성 threshold profile을 즉시
+생성하거나 갱신합니다. 기존 설치에서 프로필이 누락된 채 측정이 시작됐더라도
+Backend가 해당 오류를 반환하면 프로필을 동기화한 뒤 같은 측정을 한 번만
+재시도합니다.
+
 `roi_measurements`까지 기록되는데 `alert_events`가 없을 수 있는 정상적인 경우도
 있습니다. Warning이거나, Critical 상태가 계속 유지 중이거나, 알람 쿨다운 중이면
 `do_alarm=false`이므로 이벤트를 만들지 않습니다. Telegram 전송 결과는 백엔드가
@@ -342,7 +347,7 @@ python -m pytest -q
 uv run --with-requirements requirements.txt --with pytest python -m pytest -q
 ```
 
-최종 확인 결과는 **48 passed, 1 skipped**입니다.
+최종 확인 결과는 **52 passed, 1 skipped**입니다.
 
 ## 관련 문서
 

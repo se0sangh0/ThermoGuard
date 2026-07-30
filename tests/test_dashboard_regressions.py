@@ -5,7 +5,7 @@ import numpy as np
 from thermal_monitoring import config
 from thermal_monitoring.analysis import roi
 from thermal_monitoring.analysis.threshold import Status
-from thermal_monitoring.tools import product_dashboard
+from thermal_monitoring.tools import product_dashboard, threshold_api_client
 from thermal_monitoring.tools.product_dashboard import ProductDashboard, SettingsDialog
 from thermal_monitoring.tools.telegram_dispatcher import TelegramDispatcher
 
@@ -17,16 +17,6 @@ class _Response:
 
     def json(self):
         return self._payload
-
-
-class _ImmediateThread:
-    def __init__(self, target, args=(), kwargs=None, daemon=None):
-        self.target = target
-        self.args = args
-        self.kwargs = kwargs or {}
-
-    def start(self):
-        self.target(*self.args, **self.kwargs)
 
 
 def test_dashboard_accepts_missing_visual_only_in_warning_mode():
@@ -245,8 +235,9 @@ def test_backend_alert_merge_preserves_inflight_ack_state():
     assert dashboard.events[0]["ack_pending"] is True
 
 
-def test_threshold_sync_updates_only_camera_wide_profile(monkeypatch):
+def test_threshold_sync_updates_saved_roi_profiles(monkeypatch):
     settings = SettingsDialog.__new__(SettingsDialog)
+    operating_logs = []
     settings.d = SimpleNamespace(
         cfg=SimpleNamespace(
             backend=SimpleNamespace(
@@ -256,58 +247,50 @@ def test_threshold_sync_updates_only_camera_wide_profile(monkeypatch):
             ),
             identity=SimpleNamespace(db_camera_id=7),
             roi=SimpleNamespace(
+                rois=[
+                    SimpleNamespace(db_roi_id=12),
+                    SimpleNamespace(db_roi_id=13),
+                ],
                 baseline_temp=35.0,
                 warning_delta=15.0,
                 critical_delta=25.0,
             ),
+            hotspot=SimpleNamespace(
+                min_size=3,
+                min_size_max=10,
+            ),
+            monitoring=SimpleNamespace(alarm_cooldown_sec=600.0),
         ),
         lifecycle="running",
+        _add_operating_log=lambda *args: operating_logs.append(args),
     )
-    patched = []
-    monkeypatch.setattr(product_dashboard.threading, "Thread", _ImmediateThread)
+    calls = []
     monkeypatch.setattr(
-        product_dashboard.requests,
-        "get",
-        lambda *_args, **_kwargs: _Response({
-            "thresholds": [
-                {
-                    "threshold_id": 21,
-                    "camera_id": 7,
-                    "roi_id": 12,
-                    "valid_to": None,
-                },
-                {
-                    "threshold_id": 22,
-                    "camera_id": 7,
-                    "roi_id": None,
-                    "valid_to": None,
-                },
-                {
-                    "threshold_id": 23,
-                    "camera_id": 7,
-                    "roi_id": None,
-                    "valid_to": None,
-                },
-            ]
-        }),
-    )
-    monkeypatch.setattr(
-        product_dashboard.requests,
-        "patch",
-        lambda url, **kwargs: (
-            patched.append((url, kwargs["json"]))
-            or _Response({"status": "updated"})
+        threshold_api_client,
+        "sync_threshold_profiles",
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or threshold_api_client.ThresholdSyncResult(
+                camera_id=7,
+                roi_ids=(12, 13),
+                created=1,
+                updated=1,
+            )
         ),
     )
 
-    settings._sync_thresholds_to_backend()
+    result = settings._sync_thresholds_to_backend()
 
-    assert patched[0][0].endswith("/api/thresholds/23")
-    assert patched[0][1]["baseline_temp"] == 35.0
+    assert result.roi_ids == (12, 13)
+    assert calls[0]["camera_id"] == 7
+    assert calls[0]["roi_ids"] == [12, 13]
+    assert calls[0]["baseline_temp"] == 35.0
+    assert operating_logs[-1][1] == "저장 완료"
 
 
-def test_threshold_sync_creates_explicit_camera_wide_profile(monkeypatch):
+def test_threshold_sync_waits_until_roi_has_database_id(monkeypatch):
     settings = SettingsDialog.__new__(SettingsDialog)
+    operating_logs = []
     settings.d = SimpleNamespace(
         cfg=SimpleNamespace(
             backend=SimpleNamespace(
@@ -317,33 +300,33 @@ def test_threshold_sync_creates_explicit_camera_wide_profile(monkeypatch):
             ),
             identity=SimpleNamespace(db_camera_id=7),
             roi=SimpleNamespace(
+                rois=[SimpleNamespace(db_roi_id=None)],
                 baseline_temp=35.0,
                 warning_delta=15.0,
                 critical_delta=25.0,
             ),
+            hotspot=SimpleNamespace(
+                min_size=3,
+                min_size_max=10,
+            ),
+            monitoring=SimpleNamespace(alarm_cooldown_sec=600.0),
         ),
         lifecycle="running",
-    )
-    posted = []
-    monkeypatch.setattr(product_dashboard.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(
-        product_dashboard.requests,
-        "get",
-        lambda *_args, **_kwargs: _Response({"thresholds": []}),
+        _add_operating_log=lambda *args: operating_logs.append(args),
     )
     monkeypatch.setattr(
-        product_dashboard.requests,
-        "post",
-        lambda url, **kwargs: (
-            posted.append((url, kwargs["json"]))
-            or _Response({"status": "created"})
+        threshold_api_client,
+        "sync_threshold_profiles",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ROI DB ID가 없으면 threshold API를 호출하면 안 됩니다.")
         ),
     )
 
-    settings._sync_thresholds_to_backend()
+    result = settings._sync_thresholds_to_backend()
 
-    assert posted[0][1]["camera_id"] == 7
-    assert posted[0][1]["roi_id"] is None
+    assert result.roi_ids == ()
+    assert result.created == 0
+    assert operating_logs[-1][1] == "보류"
 
 
 def test_measurement_uses_matching_roi_identity_and_status(monkeypatch):
@@ -400,6 +383,98 @@ def test_measurement_uses_matching_roi_identity_and_status(monkeypatch):
     assert payload["roi_id"] == 12
     assert payload["max_temp"] == 61.0
     assert payload["status"] == "warning"
+
+
+def test_measurement_repairs_missing_threshold_and_retries_once(monkeypatch):
+    responses = iter([
+        _Response({
+            "status": "error",
+            "error": "적용 가능한 threshold profile이 없습니다.",
+        }),
+        _Response({
+            "status": "created",
+            "capture_id": 51,
+            "alert_id": None,
+        }),
+    ])
+    posts = []
+    operating_logs = []
+    dashboard = SimpleNamespace(
+        lifecycle="running",
+        root=SimpleNamespace(after=lambda _delay, callback: callback()),
+        cfg=SimpleNamespace(
+            backend=SimpleNamespace(
+                enabled=True,
+                url="http://backend",
+                timeout_sec=5,
+            ),
+            identity=SimpleNamespace(
+                db_camera_id=7,
+                robot_id="Robot-01",
+            ),
+            roi=SimpleNamespace(
+                baseline_temp=35.0,
+                warning_delta=15.0,
+                critical_delta=25.0,
+            ),
+            hotspot=SimpleNamespace(
+                min_size=3,
+                min_size_max=10,
+            ),
+            monitoring=SimpleNamespace(alarm_cooldown_sec=600.0),
+        ),
+        metrics=SimpleNamespace(
+            api_successes=0,
+            api_timeouts=0,
+            api_connection_errors=0,
+            api_other_errors=0,
+        ),
+        _record_api_result=lambda *_args, **_kwargs: None,
+        _add_operating_log=lambda *args: operating_logs.append(args),
+    )
+    dispatcher = TelegramDispatcher(dashboard)
+    repaired = []
+    monkeypatch.setattr(
+        "thermal_monitoring.tools.telegram_dispatcher.requests.post",
+        lambda url, **kwargs: (
+            posts.append((url, kwargs["json"]))
+            or next(responses)
+        ),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_ensure_threshold_profile",
+        lambda camera_id, roi_id: (
+            repaired.append((camera_id, roi_id))
+            or threshold_api_client.ThresholdSyncResult(
+                camera_id=camera_id,
+                roi_ids=(roi_id,),
+                created=1,
+                updated=0,
+            )
+        ),
+    )
+    result = {
+        "base": "capture",
+        "measurement_roi": SimpleNamespace(db_roi_id=12),
+        "roi_name": "ROI-1",
+        "max_temp": 40.0,
+        "min_temp": 30.0,
+        "mean_temp": 35.0,
+        "hot_temp_95": 38.0,
+        "over_temp_pixels": 0,
+        "max_hotspot_size": 0,
+        "status": Status.NORMAL,
+        "alarm": False,
+    }
+
+    dispatcher.post_measurement(result)
+
+    assert repaired == [(7, 12)]
+    assert len(posts) == 2
+    assert dashboard.metrics.api_successes == 1
+    assert dashboard.metrics.api_other_errors == 0
+    assert operating_logs[-1][1] == "자동 복구"
 
 
 def test_measurement_without_database_roi_id_is_not_posted(monkeypatch):

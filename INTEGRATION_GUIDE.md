@@ -282,6 +282,7 @@ ROI 저장은 현재 다음 순서를 따릅니다.
   → GET /api/rois로 기존 버전 확인
   → 좌표가 같으면 기존 roi_id 재사용
   → 좌표가 바뀌면 새 버전 POST
+  → 각 roi_id의 활성 threshold profile 생성 또는 갱신
   → db_roi_id를 config.json에 저장
 ```
 
@@ -335,6 +336,10 @@ captures
 Telegram 작업자는 측정 POST 완료를 기다려 `alert_id`를 받은 뒤 알림을
 전송합니다. `alert_id`가 있어야 전송 성공 또는 실패를
 `notification_deliveries`에 연결할 수 있습니다.
+
+측정 요청이 `적용 가능한 threshold profile이 없습니다`로 거부되면 Dashboard는
+해당 `camera_id + roi_id`의 프로필을 동기화하고 동일 측정을 한 번만
+재시도합니다. 반복 루프나 무제한 재시도는 하지 않습니다.
 
 ## Telegram 연동
 
@@ -427,13 +432,14 @@ python -m pytest -q
 |---|---|
 | `test_asset_api_client.py` | 단일 카메라 재사용과 장비 ID 저장 |
 | `test_roi_api_client.py` | 카메라 ID 해석과 ROI 버전 동기화 |
+| `test_threshold_api_client.py` | ROI별 threshold 생성·갱신과 오류 전달 |
 | `test_backend_measurement_contract.py` | 측정/이벤트 요청 계약 |
 | `test_telegram_dispatcher.py` | Critical 전송과 `alert_id` 연결 |
 | `test_threshold.py` | Warning 미전송, Critical 상태 전환과 쿨다운 |
 | `test_product_dashboard_calibration.py` | 기존 캘리브레이션 함수 호출 |
 | `test_dashboard_regressions.py` | Dashboard 회귀 조건 |
 
-최종 확인 결과는 **48 passed, 1 skipped**입니다.
+최종 확인 결과는 **52 passed, 1 skipped**입니다.
 
 ## 문제 해결
 
@@ -446,8 +452,9 @@ python -m pytest -q
 ### `적용 가능한 threshold profile이 없습니다`
 
 측정의 `camera_id`와 `roi_id`에 연결된 활성 profile이 없다는 뜻입니다.
-Product Dashboard 환경설정에서 장비와 ROI를 먼저 저장한 뒤 임계값을 다시
-저장합니다.
+현재 Dashboard는 이 오류를 받으면 ROI별 profile을 자동 동기화하고 측정을 한 번
+재시도합니다. 계속 발생하면 운영 로그의 `자동 복구` 또는 `저장 실패` 항목과
+`GET /api/thresholds` 결과를 확인합니다.
 
 ### `roi_measurements`는 있는데 `alert_events`가 없음
 

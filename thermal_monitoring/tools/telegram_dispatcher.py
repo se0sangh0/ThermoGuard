@@ -36,6 +36,7 @@ class TelegramDispatcher:
         self._last_attempt_monotonic = 0.0
         self._dispatch_inflight = False
         self._state_lock = threading.Lock()
+        self._threshold_sync_lock = threading.Lock()
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -51,6 +52,25 @@ class TelegramDispatcher:
 
     def _trace(self, msg: str, *args):
         _log.debug(f"[TELEGRAM] {msg}", *args)
+
+    def _ensure_threshold_profile(self, camera_id: int, roi_id: int):
+        """Create/update the exact ROI profile before retrying a rejected measurement."""
+        from .threshold_api_client import sync_threshold_profiles
+
+        with self._threshold_sync_lock:
+            cfg = self._dash.cfg
+            return sync_threshold_profiles(
+                base_url=cfg.backend.url,
+                timeout=cfg.backend.timeout_sec,
+                camera_id=camera_id,
+                roi_ids=[roi_id],
+                baseline_temp=cfg.roi.baseline_temp,
+                warning_delta=cfg.roi.warning_delta,
+                critical_delta=cfg.roi.critical_delta,
+                min_hotspot_size=cfg.hotspot.min_size,
+                min_hotspot_size_max=cfg.hotspot.min_size_max,
+                alarm_cooldown_sec=cfg.monitoring.alarm_cooldown_sec,
+            )
 
     # ── 전송 결정 ────────────────────────────────────────────
 
@@ -320,13 +340,41 @@ class TelegramDispatcher:
                     f"{status_value}"
                 ),
             }
+            measurement_url = (
+                f"{self._dash.cfg.backend.url}/api/measurements"
+            )
             resp = requests.post(
-                f"{self._dash.cfg.backend.url}/api/measurements",
+                measurement_url,
                 json=payload,
                 timeout=self._dash.cfg.backend.timeout_sec,
             )
+            data = resp.json() if resp.status_code == 200 else {}
+            threshold_missing = (
+                resp.status_code == 200
+                and data.get("status") == "error"
+                and "threshold profile" in str(data.get("error", "")).lower()
+            )
+            if threshold_missing:
+                _log.warning(
+                    "measurement rejected without threshold; synchronizing and "
+                    "retrying once: camera_id=%s roi_id=%s",
+                    camera_id,
+                    roi_id,
+                )
+                sync_result = self._ensure_threshold_profile(camera_id, roi_id)
+                self._op_log(
+                    "자동 복구",
+                    f"ROI {roi_id} threshold 생성 {sync_result.created}개 · "
+                    f"갱신 {sync_result.updated}개",
+                )
+                resp = requests.post(
+                    measurement_url,
+                    json=payload,
+                    timeout=self._dash.cfg.backend.timeout_sec,
+                )
+                data = resp.json() if resp.status_code == 200 else {}
+
             if resp.status_code == 200:
-                data = resp.json()
                 if data.get("status") == "created":
                     result["alert_id"] = data.get("alert_id")
                     self._dash.metrics.api_successes += 1
@@ -345,8 +393,10 @@ class TelegramDispatcher:
             self._dash.metrics.api_timeouts += 1
         except requests.exceptions.ConnectionError:
             self._dash.metrics.api_connection_errors += 1
-        except Exception:
+        except Exception as exc:
             self._dash.metrics.api_other_errors += 1
+            _log.error("measurement POST failed: %s", exc, exc_info=True)
+            self._op_log("저장 실패", str(exc))
         finally:
             if backend_event is not None:
                 try:
