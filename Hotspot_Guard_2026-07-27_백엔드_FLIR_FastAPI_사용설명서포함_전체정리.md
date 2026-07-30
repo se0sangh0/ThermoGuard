@@ -246,7 +246,7 @@ sudo systemctl stop hotspot-backend.service
 
 로 자동 Backend 서비스를 멈춘 뒤 실행하는 것이 좋다.
 
-테스트가 끝난 뒤에는:
+테스트가 끝난 뒤에는:   
 
 ```bash
 sudo systemctl start hotspot-backend.service

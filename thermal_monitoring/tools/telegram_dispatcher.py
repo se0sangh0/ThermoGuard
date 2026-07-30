@@ -380,14 +380,40 @@ class TelegramDispatcher:
 
             if resp.status_code == 200:
                 if data.get("status") == "created":
-                    result["alert_id"] = data.get("alert_id")
-                    self._dash.metrics.api_successes += 1
-                    _log.info(
-                        "backend POST ok: capture_id=%s alert_id=%s",
-                        data.get("capture_id"),
-                        data.get("alert_id"),
-                    )
-                    self._trace("saved alert_id=%s to result dict", data.get("alert_id"))
+                    alert_id = data.get("alert_id")
+                    result["alert_id"] = alert_id
+                    if do_alarm and alert_id is None:
+                        # Critical trigger가 승인됐는데 alert_events가 생성되지
+                        # 않았다면 Telegram 결과를 notification_deliveries에
+                        # 연결할 수 없으므로 정상 저장으로 오인하지 않게 한다.
+                        self._dash.metrics.api_other_errors += 1
+                        _log.error(
+                            "backend POST inconsistent: do_alarm=True but "
+                            "alert_id=None (capture_id=%s)",
+                            data.get("capture_id"),
+                        )
+                        self._op_log(
+                            "저장 오류",
+                            "Critical 알람의 alert_id가 생성되지 않았습니다",
+                        )
+                    elif alert_id is not None:
+                        self._dash.metrics.api_successes += 1
+                        _log.info(
+                            "backend alarm POST ok: capture_id=%s alert_id=%s",
+                            data.get("capture_id"),
+                            alert_id,
+                        )
+                        self._trace(
+                            "saved alert_id=%s to result dict",
+                            alert_id,
+                        )
+                    else:
+                        self._dash.metrics.api_successes += 1
+                        _log.info(
+                            "backend measurement POST ok: capture_id=%s "
+                            "(do_alarm=False, alert_id not expected)",
+                            data.get("capture_id"),
+                        )
                 else:
                     _log.warning("backend POST rejected: %s", data)
                     self._dash.metrics.api_other_errors += 1

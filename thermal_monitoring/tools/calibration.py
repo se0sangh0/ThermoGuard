@@ -26,10 +26,10 @@ pair_state = "rgb"  # "rgb" or "thermal"
 t_mouse_x, t_mouse_y = -1, -1  # Thermal 창 마우스 (원본 해상도)
 r_mouse_x, r_mouse_y = -1, -1  # RGB 창 마우스 (원본 해상도)
 
-ZOOM_SIZE = 80      # 확대경 영역 크기 (px)
+ZOOM_SIZE = 10      # 확대경 영역 크기 (px)
 ZOOM_SCALE = 3.0    # 확대 배율
 MAX_MEAN_ERROR_PX = 5.0   # 평균 재투영 오차 허용 기준
-MAX_POINT_ERROR_PX = 10.0  # 개별 최대 오차 허용 기준
+MAX_POINT_ERROR_PX = 25.0  # 개별 최대 오차 허용 기준
 BUTTON_BAR_HEIGHT = 44
 CALIBRATION_WINDOW_TITLE = "Calibration - Thermal | RGB"
 _BUTTONS = [

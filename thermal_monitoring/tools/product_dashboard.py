@@ -2032,7 +2032,7 @@ class SettingsDialog:
                 "작업 진행 중",
                 f"{self._tool_running} 작업이 이미 실행 중입니다.",
                 parent=self.win,
-            )
+            ) 
             return False
         self._tool_running = tool_name
         self._roi_editor_running = tool_name == "ROI 설정"
