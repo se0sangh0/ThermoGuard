@@ -212,7 +212,6 @@ class TelegramDispatcher:
         temp = float(result.get("hot_temp_95", result.get("max_temp", 0.0)))
         overlay = result.get("overlay")
         base = str(result.get("base", "")) or "latest"
-        robot_id = self._dash.cfg.identity.robot_id
         cfg = getattr(self._dash, "cfg", None)
         backend = getattr(cfg, "backend", None)
         backend_url = getattr(backend, "url", None)
@@ -262,14 +261,13 @@ class TelegramDispatcher:
                     image_path=image_path,
                     temp=temp,
                     status=status_value,
-                    robot_id=robot_id,
                     alert_id=alert_id,
                     backend_url=backend_url,
                 )
                 self._trace("send_alarm returned ok=%s", ok)
                 self._op_log(
                     "전송 성공" if ok else "전송 실패",
-                    f"{robot_id} · {temp:.1f}°C · {'사진' if image_path else '텍스트'}",
+                    f"{temp:.1f}°C · {'사진' if image_path else '텍스트'}",
                 )
             except RuntimeError:
                 self._op_log("미설정", ".env의 BOT_TOKEN / CHAT_ID를 확인하세요")
@@ -339,7 +337,6 @@ class TelegramDispatcher:
                 "algorithm_version": "v2.0",
                 "do_alarm": do_alarm,
                 "alarm_message": (
-                    f"{self._dash.cfg.identity.robot_id} · "
                     f"{result['max_temp']:.1f}°C · "
                     f"{status_value}"
                 ),

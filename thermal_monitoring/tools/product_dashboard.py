@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -93,6 +94,9 @@ class RuntimeMetrics:
 class ProductDashboard:
     REFRESH_SECONDS = 30
     REFRESH_FAST_SECONDS = 5    # Warning/Critical 상태일 때 분석 간격
+    TREND_HISTORY_DAYS = 7
+    TREND_API_LIMIT = 150000
+    TREND_DRAW_POINTS = 1000
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -119,6 +123,9 @@ class ProductDashboard:
         self._thermal_source = None
         self._image_render_ids = {"visual": None, "thermal": None}
         self.events: list[dict] = []
+        self.alert_window: Optional[tk.Toplevel] = None
+        self.alert_tree: Optional[ttk.Treeview] = None
+        self.alert_filter_var: Optional[tk.StringVar] = None
         self.operating_logs: list[tuple[str, str, str, str]] = []
         self.operating_log_window: Optional[tk.Toplevel] = None
         self._operating_log_opening = False
@@ -215,15 +222,11 @@ class ProductDashboard:
         carousel.grid_rowconfigure(0, weight=1)
         self.carousel_container = carousel
         self.carousel_pages = []
-        for _ in range(3):
-            page = tk.Frame(carousel, bg=COLORS["bg"])
-            page.grid(row=0, column=0, sticky="nsew")
-            self.carousel_pages.append(page)
-        self._build_alert_panel(self.carousel_pages[0])
-        self._build_robot_map(self.carousel_pages[1])
-        self._build_trend_panel(self.carousel_pages[2])
+        page = tk.Frame(carousel, bg=COLORS["bg"])
+        page.grid(row=0, column=0, sticky="nsew")
+        self.carousel_pages.append(page)
+        self._build_trend_panel(page)
         self._build_carousel_navigation(body)
-        self.carousel_index = 0
         self.carousel_expanded = False
         self._set_carousel_expanded(False)
         self._update_carousel_navigation()
@@ -233,10 +236,8 @@ class ProductDashboard:
                           highlightbackground=COLORS["line"], highlightthickness=1)
         header.pack(fill="x"); header.pack_propagate(False)
         left = tk.Frame(header, bg=COLORS["navy"]); left.pack(side="left", padx=24, pady=11)
-        tk.Label(left, text="1공장 로봇 열화상 모니터링", bg=COLORS["navy"], fg="white",
+        tk.Label(left, text="로봇 열화상 모니터링", bg=COLORS["navy"], fg="white",
                  font=("맑은 고딕", 20, "bold")).pack(anchor="w")
-        tk.Label(left, text=f"1공장  ·  조립라인 A  ·  {self.cfg.identity.robot_id}",
-                 bg=COLORS["navy"], fg="#c7d6e5", font=("맑은 고딕", 10)).pack(anchor="w")
 
         right = tk.Frame(header, bg=COLORS["navy"]); right.pack(side="right", padx=22, pady=16)
         self.header_state = tk.Label(right, text="● 확인 중", bg=COLORS["navy"], fg="#ffd166",
@@ -279,63 +280,36 @@ class ProductDashboard:
         )
         self.settings_button.pack(side="left", padx=3)
 
-    def _build_alert_panel(self, parent):
-        panel = tk.Frame(parent, bg=COLORS["panel"],
-                         highlightbackground=COLORS["line"], highlightthickness=1)
-        panel.pack(fill="both", expand=True)
-        head = tk.Frame(panel, bg=COLORS["panel"]); head.pack(fill="x", padx=16, pady=(12, 8))
-        tk.Label(head, text="미확인 알림", bg=COLORS["panel"], fg=COLORS["text"],
-                 font=("맑은 고딕", 17, "bold")).pack(side="left")
-        self.alert_count_label = tk.Label(head, text="0건", bg=COLORS["panel"], fg=COLORS["muted"],
-                                          font=("맑은 고딕", 11, "bold"))
-        self.alert_count_label.pack(side="right")
-
-        alert_wrap = tk.Frame(panel, bg=COLORS["panel"])
-        alert_wrap.pack(fill="both", expand=True, padx=10)
-        self.alert_canvas = tk.Canvas(alert_wrap, bg=COLORS["panel"], highlightthickness=0)
-        alert_scroll = ttk.Scrollbar(alert_wrap, orient="vertical", command=self.alert_canvas.yview)
-        self.alert_cards = tk.Frame(self.alert_canvas, bg=COLORS["panel"])
-        self._alert_window = self.alert_canvas.create_window((0, 0), window=self.alert_cards, anchor="nw")
-        self.alert_canvas.configure(yscrollcommand=alert_scroll.set)
-        self.alert_canvas.pack(side="left", fill="both", expand=True)
-        alert_scroll.pack(side="right", fill="y")
-        self.alert_cards.bind("<Configure>", lambda _e: self.alert_canvas.configure(
-            scrollregion=self.alert_canvas.bbox("all")))
-        self.alert_canvas.bind("<Configure>", lambda e: self.alert_canvas.itemconfigure(
-            self._alert_window, width=e.width))
-
-        self._render_alert_cards()
-
     def _build_carousel_navigation(self, parent):
         navigation = tk.Frame(parent, bg=COLORS["bg"])
         navigation.grid(row=2, column=0, sticky="ew", pady=(2, 6))
-        self.info_tab_buttons = []
-        tabs = ("미확인 알림  0건", "로봇 위치", "온도 추이")
-        for index, title in enumerate(tabs):
-            button = tk.Button(
-                navigation, text=title,
-                command=lambda selected=index: self._show_carousel_page(selected),
-                bg=COLORS["panel"], fg=COLORS["muted"],
-                activebackground=COLORS["blue"], activeforeground="white",
-                relief="flat", bd=0, padx=22, pady=9,
-                font=("맑은 고딕", 10, "bold"), cursor="hand2",
-            )
-            button.pack(side="left", padx=(0, 5))
-            self.info_tab_buttons.append(button)
+        self.alert_history_button = tk.Button(
+            navigation,
+            text="미확인 알림  0건",
+            command=self.open_alert_history,
+            bg=COLORS["panel"], fg=COLORS["muted"],
+            activebackground=COLORS["blue"], activeforeground="white",
+            relief="flat", bd=0, padx=22, pady=9,
+            font=("맑은 고딕", 10, "bold"), cursor="hand2",
+        )
+        self.alert_history_button.pack(side="left", padx=(0, 5))
+        self.trend_toggle_button = tk.Button(
+            navigation,
+            text="온도 추이",
+            command=self._toggle_temperature_trend,
+            bg=COLORS["panel"], fg=COLORS["muted"],
+            activebackground=COLORS["blue"], activeforeground="white",
+            relief="flat", bd=0, padx=22, pady=9,
+            font=("맑은 고딕", 10, "bold"), cursor="hand2",
+        )
+        self.trend_toggle_button.pack(side="left", padx=(0, 5))
 
-    def _show_carousel_page(self, index):
-        if self.carousel_expanded and self.carousel_index == index:
-            self._set_carousel_expanded(False)
-            self._update_carousel_navigation()
-            return
-
-        self.carousel_index = index
-        self.carousel_pages[index].tkraise()
-        self._set_carousel_expanded(True)
+    def _toggle_temperature_trend(self):
+        self._set_carousel_expanded(not self.carousel_expanded)
         self._update_carousel_navigation()
-        if index == 1:
-            self.root.after_idle(self._draw_robot_map)
-        elif index == 2:
+        if self.carousel_expanded:
+            if self.cfg.backend.enabled:
+                self._analysis_executor.submit(self._sync_temperature_history)
             self.root.after_idle(self._draw_temperature_trend)
 
     def _set_carousel_expanded(self, expanded):
@@ -351,23 +325,19 @@ class ProductDashboard:
         self.root.after_idle(self._redraw_dashboard_content)
 
     def _update_carousel_navigation(self):
-        for button_index, button in enumerate(self.info_tab_buttons):
-            selected = self.carousel_expanded and button_index == self.carousel_index
-            button.configure(
-                bg=COLORS["blue"] if selected else COLORS["panel"],
-                fg="white" if selected else COLORS["muted"],
-                relief="sunken" if selected else "flat",
-            )
+        self.trend_toggle_button.configure(
+            bg=COLORS["blue"] if self.carousel_expanded else COLORS["panel"],
+            fg="white" if self.carousel_expanded else COLORS["muted"],
+            relief="sunken" if self.carousel_expanded else "flat",
+        )
 
     def _redraw_dashboard_content(self):
         self._schedule_dashboard_image_render("visual")
         self._schedule_dashboard_image_render("thermal")
         if not self.carousel_expanded:
             return
-        if self.carousel_index == 1:
-            self.root.after_idle(self._draw_robot_map)
-        elif self.carousel_index == 2:
-            self.root.after_idle(self._draw_temperature_trend)
+        self.root.after_idle(self._draw_status_gauge)
+        self.root.after_idle(self._draw_temperature_trend)
 
     def _image_panel(self, parent, title):
         frame = tk.Frame(parent, bg=COLORS["card"], highlightbackground=COLORS["line"], highlightthickness=1)
@@ -402,23 +372,11 @@ class ProductDashboard:
         self.root.after_idle(lambda: self._schedule_dashboard_image_render("visual"))
         self.root.after_idle(lambda: self._schedule_dashboard_image_render("thermal"))
 
-    def _build_robot_map(self, parent):
-        panel = tk.Frame(parent, bg=COLORS["card"], highlightbackground=COLORS["line"], highlightthickness=1)
-        panel.pack(fill="both", expand=True)
-        head = tk.Frame(panel, bg=COLORS["card"]); head.pack(fill="x", padx=14, pady=10)
-        tk.Label(head, text="공장 지도 및 로봇 위치", bg=COLORS["card"], fg=COLORS["text"],
-                 font=("맑은 고딕", 12, "bold")).pack(side="left")
-        tk.Label(head, text="임시 데이터", bg=COLORS["card"], fg=COLORS["orange"],
-                 font=("맑은 고딕", 9, "bold")).pack(side="right")
-        self.map_canvas = tk.Canvas(panel, bg="#e9edf0", highlightthickness=0, height=270)
-        self.map_canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.map_canvas.bind("<Configure>", lambda _e: self._draw_robot_map())
-
     def _build_trend_panel(self, parent):
         panel = tk.Frame(parent, bg=COLORS["card"], highlightbackground=COLORS["line"], highlightthickness=1)
         panel.pack(fill="both", expand=True)
         head = tk.Frame(panel, bg=COLORS["card"]); head.pack(fill="x", padx=14, pady=(10, 4))
-        tk.Label(head, text="전체 ROI 최대 온도 추이", bg=COLORS["card"], fg=COLORS["text"],
+        tk.Label(head, text="최근 7일 전체 ROI 최대 온도 추이", bg=COLORS["card"], fg=COLORS["text"],
                  font=("맑은 고딕", 12, "bold")).pack(side="left")
         self.trend_status_label = tk.Label(head, text="현재 상태: 확인 중", bg=COLORS["card"],
                                            fg=COLORS["orange"], font=("맑은 고딕", 10, "bold"))
@@ -433,58 +391,193 @@ class ProductDashboard:
         self.trend_roi_label = tk.Label(values, text="최대 온도 ROI —", bg=COLORS["card"],
                                         fg=COLORS["muted"], font=("맑은 고딕", 10))
         self.trend_roi_label.pack(side="right")
-        self.trend_canvas = tk.Canvas(panel, bg=COLORS["dark"], highlightthickness=0, height=230)
-        self.trend_canvas.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+        charts = tk.Frame(panel, bg=COLORS["card"])
+        charts.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+        self.status_gauge_canvas = tk.Canvas(
+            charts,
+            bg=COLORS["dark"],
+            highlightthickness=0,
+            width=300,
+            height=230,
+        )
+        self.status_gauge_canvas.pack(side="left", fill="y", padx=(0, 8))
+        self.status_gauge_canvas.bind(
+            "<Configure>",
+            lambda _event: self._draw_status_gauge(),
+        )
+        self.trend_canvas = tk.Canvas(charts, bg=COLORS["dark"], highlightthickness=0, height=230)
+        self.trend_canvas.pack(side="left", fill="both", expand=True)
         self.trend_canvas.bind("<Configure>", lambda _e: self._draw_temperature_trend())
         self.trend_canvas.bind("<Motion>", self._show_trend_hover)
         self.trend_canvas.bind("<Leave>", lambda _e: self._clear_trend_hover())
 
     def _render_alert_cards(self):
-        for child in self.alert_cards.winfo_children():
-            child.destroy()
-        pending = [event for event in self.events if event["action"] == "확인 필요"]
-        self.alert_count_label.configure(text=f"{len(pending)}건")
-        if hasattr(self, "info_tab_buttons"):
-            self.info_tab_buttons[0].configure(text=f"미확인 알림  {len(pending)}건")
-        if not pending:
-            tk.Label(self.alert_cards, text="미확인 알림이 없습니다.", bg=COLORS["panel"],
-                     fg=COLORS["muted"], font=("맑은 고딕", 10)).pack(pady=28)
+        """Update the alert button and the optional seven-day history popup."""
+        cutoff = datetime.now() - timedelta(days=7)
+        recent = []
+        for event in self.events:
+            try:
+                occurred_at = datetime.fromisoformat(str(event.get("time", "")))
+            except ValueError:
+                occurred_at = datetime.now()
+            if occurred_at >= cutoff:
+                recent.append(event)
+
+        pending = [event for event in recent if event["action"] == "확인 필요"]
+        if hasattr(self, "alert_history_button"):
+            self.alert_history_button.configure(text=f"미확인 알림  {len(pending)}건")
+
+        tree = self.alert_tree
+        if tree is None:
             return
-        for event in pending:
-            state = event["state"]
-            color = COLORS["red"] if state in ("Critical", "위험") else COLORS["orange"]
+
+        for item in tree.get_children():
+            tree.delete(item)
+        selected_filter = (
+            self.alert_filter_var.get()
+            if self.alert_filter_var is not None
+            else "미확인"
+        )
+        if selected_filter == "미확인":
+            visible = pending
+        elif selected_filter == "확인 완료":
+            visible = [event for event in recent if event["action"] == "확인 완료"]
+        else:
+            visible = recent
+
+        for event in visible:
+            state = event.get("state", "")
             korean = "위험" if state in ("Critical", "위험") else "경고"
-            card = tk.Frame(self.alert_cards, bg=COLORS["card"],
-                            highlightbackground=color, highlightthickness=2)
-            card.pack(fill="x", pady=5, padx=2)
-            tk.Label(card, text=event["time"], bg=COLORS["card"], fg=COLORS["muted"],
-                     font=("맑은 고딕", 9)).pack(anchor="w", padx=12, pady=(10, 2))
-            tk.Label(card, text=f"{korean} · {event['asset']}", bg=COLORS["card"], fg=color,
-                     font=("맑은 고딕", 12, "bold")).pack(anchor="w", padx=12)
-            tk.Label(card, text=f"최고 온도 {event['temp']:.1f}°C", bg=COLORS["card"], fg=color,
-                     font=("맑은 고딕", 13, "bold")).pack(anchor="w", padx=12, pady=(3, 8))
-            acknowledging = bool(event.get("ack_pending"))
-            linking = bool(event.get("backend_pending"))
-            button_busy = acknowledging or linking
-            tk.Button(
-                card,
-                text=(
-                    "백엔드 연동 중..."
-                    if linking
-                    else "확인 처리 중..."
-                    if acknowledging
-                    else "확인"
+            processing = event.get("ack_pending") or event.get("backend_pending")
+            action = "처리 중" if processing else event.get("action", "")
+            tree.insert(
+                "",
+                "end",
+                iid=str(event["id"]),
+                values=(
+                    event.get("time", ""),
+                    event.get("asset", "ROI"),
+                    f"{float(event.get('temp', 0)):.1f}°C",
+                    korean,
+                    action,
                 ),
-                command=lambda event_id=event["id"]: self._acknowledge_event(event_id),
-                bg=color,
-                fg="white",
-                activebackground=color,
-                activeforeground="white",
-                relief="flat",
-                font=("맑은 고딕", 10, "bold"),
-                cursor="arrow" if button_busy else "hand2",
-                state="disabled" if button_busy else "normal",
-            ).pack(fill="x", padx=12, pady=(0, 10))
+                tags=("critical" if korean == "위험" else "warning",),
+            )
+
+    def open_alert_history(self):
+        """Open a non-modal popup containing at most the latest seven days."""
+        if self.alert_window:
+            try:
+                if self.alert_window.winfo_exists():
+                    self.alert_window.deiconify()
+                    self.alert_window.lift()
+                    self.alert_window.focus_force()
+                    self._refresh_alert_history()
+                    return
+            except tk.TclError:
+                pass
+            self.alert_window = None
+            self.alert_tree = None
+
+        win = tk.Toplevel(self.root, name="alert_history")
+        win.title("최근 7일 알림 이력")
+        win.geometry("900x560")
+        win.minsize(760, 420)
+        win.transient(self.root)
+        self.alert_window = win
+        self.alert_history_button.configure(
+            bg=COLORS["blue"], fg="white", relief="sunken",
+        )
+
+        def close_window():
+            self.alert_window = None
+            self.alert_tree = None
+            self.alert_filter_var = None
+            self.alert_history_button.configure(
+                bg=COLORS["panel"], fg=COLORS["muted"], relief="flat",
+            )
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close_window)
+
+        toolbar = ttk.Frame(win, padding=(12, 12, 12, 6))
+        toolbar.pack(fill="x")
+        ttk.Label(
+            toolbar,
+            text="최근 7일 알림",
+            font=("맑은 고딕", 14, "bold"),
+        ).pack(side="left")
+        ttk.Label(toolbar, text="상태").pack(side="left", padx=(24, 6))
+        self.alert_filter_var = tk.StringVar(value="미확인")
+        filter_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.alert_filter_var,
+            values=("미확인", "확인 완료", "전체"),
+            state="readonly",
+            width=12,
+        )
+        filter_box.pack(side="left")
+        filter_box.bind("<<ComboboxSelected>>", lambda _event: self._render_alert_cards())
+        ttk.Button(
+            toolbar,
+            text="새로고침",
+            command=self._refresh_alert_history,
+        ).pack(side="right")
+
+        table_frame = ttk.Frame(win, padding=(12, 6))
+        table_frame.pack(fill="both", expand=True)
+        columns = ("time", "roi", "temp", "severity", "action")
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        for key, label, width in (
+            ("time", "발생 시각", 180),
+            ("roi", "ROI", 150),
+            ("temp", "최대 온도", 110),
+            ("severity", "상태", 90),
+            ("action", "확인 상태", 120),
+        ):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor="center")
+        tree.tag_configure("critical", foreground=COLORS["red"])
+        tree.tag_configure("warning", foreground=COLORS["orange"])
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.alert_tree = tree
+
+        footer = ttk.Frame(win, padding=(12, 6, 12, 12))
+        footer.pack(fill="x")
+        ttk.Label(
+            footer,
+            text="조회 범위: 현재 시각 기준 최근 7일",
+            foreground=COLORS["muted"],
+        ).pack(side="left")
+        ttk.Button(
+            footer,
+            text="선택 알림 확인 처리",
+            style="Action.TButton",
+            command=self._acknowledge_selected_alert,
+        ).pack(side="right")
+
+        self._render_alert_cards()
+        self._refresh_alert_history()
+
+    def _refresh_alert_history(self):
+        if self.cfg.backend.enabled:
+            self._analysis_executor.submit(self._sync_events_from_backend)
+        else:
+            self._render_alert_cards()
+
+    def _acknowledge_selected_alert(self):
+        tree = self.alert_tree
+        if tree is None or not tree.selection():
+            messagebox.showinfo(
+                "알림 확인",
+                "확인 처리할 알림을 선택하세요.",
+                parent=self.alert_window or self.root,
+            )
+            return
+        self._acknowledge_event(tree.selection()[0])
 
     def _acknowledge_event(self, event_id: str):
         event = next((e for e in self.events if e["id"] == event_id), None)
@@ -514,49 +607,21 @@ class ProductDashboard:
             acknowledged_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
 
-    def _draw_robot_map(self):
-        canvas = self.map_canvas
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 420)
-        height = max(canvas.winfo_height(), 240)
-        margin = 18
-        canvas.create_rectangle(margin, margin, width - margin, height - margin,
-                                fill="#f7f8f9", outline="#99a4ad", width=2)
-        left = margin + 80
-        right = width - margin - 80
-        middle = (left + right) // 2
-        canvas.create_rectangle(left, margin, middle, height - margin, fill="#dceaf8", outline="#8796a3")
-        canvas.create_rectangle(middle, margin, right, height - margin, fill="#e5f1e6", outline="#8796a3")
-        canvas.create_text((left + middle)//2, margin + 24, text="라인 1", fill="#24333f",
-                           font=("맑은 고딕", 11, "bold"))
-        canvas.create_text((middle + right)//2, margin + 24, text="라인 2", fill="#24333f",
-                           font=("맑은 고딕", 11, "bold"))
-        canvas.create_text(margin + 38, height//2, text="입고\n구역", fill="#24333f",
-                           font=("맑은 고딕", 9, "bold"), justify="center")
-        canvas.create_text(width - margin - 38, height//2, text="검사\n구역", fill="#24333f",
-                           font=("맑은 고딕", 9, "bold"), justify="center")
-        marker_color = {Status.NORMAL: COLORS["green"], Status.WARNING: COLORS["orange"],
-                        Status.CRITICAL: COLORS["red"]}.get(self.latest_status, COLORS["green"])
-        rx, ry = (left + middle)//2, height//2 + 20
-        canvas.create_oval(rx - 13, ry - 13, rx + 13, ry + 13, fill=marker_color, outline="white", width=2)
-        canvas.create_rectangle(rx + 18, ry - 30, rx + 155, ry + 36, fill="white",
-                                outline=marker_color, width=2)
-        canvas.create_text(rx + 30, ry - 12, anchor="w", text=self.cfg.identity.robot_id,
-                           fill="#1e2a33", font=("맑은 고딕", 11, "bold"))
-        canvas.create_text(rx + 30, ry + 14, anchor="w", text="라인 1 · 조립 설비",
-                           fill="#53636f", font=("맑은 고딕", 9))
-
     def _draw_temperature_trend(self):
         canvas = self.trend_canvas
         canvas.delete("all")
         self._trend_hover_points = []
+        display_history = self._downsample_temperature_history(
+            self.temperature_history,
+            self.TREND_DRAW_POINTS,
+        )
         width = max(canvas.winfo_width(), 480)
         height = max(canvas.winfo_height(), 220)
         left, top, right, bottom = 54, 18, width - 18, height - 36
         baseline = self.cfg.roi.baseline_temp
         warning = baseline + self.cfg.roi.warning_delta
         critical = baseline + self.cfg.roi.critical_delta
-        values = [value for _, value in self.temperature_history]
+        values = [value for _, value in display_history]
         y_min = min([baseline, *values], default=baseline) - 5
         y_max = max([critical, *values], default=critical) + 5
         if y_max <= y_min:
@@ -575,9 +640,9 @@ class ProductDashboard:
                                fill=color, font=("맑은 고딕", 8, "bold"))
         canvas.create_text(8, top, anchor="nw", text=f"{y_max:.0f}", fill=COLORS["muted"], font=("맑은 고딕", 8))
         canvas.create_text(8, bottom - 10, anchor="nw", text=f"{y_min:.0f}", fill=COLORS["muted"], font=("맑은 고딕", 8))
-        if len(self.temperature_history) < 2:
-            if self.temperature_history:
-                captured_at, value = self.temperature_history[0]
+        if len(display_history) < 2:
+            if display_history:
+                captured_at, value = display_history[0]
                 canvas.create_text(left, bottom + 18, anchor="w",
                                    text=captured_at.strftime("%H:%M:%S"),
                                    fill=COLORS["muted"], font=("맑은 고딕", 8))
@@ -589,8 +654,8 @@ class ProductDashboard:
                                fill=COLORS["muted"], font=("맑은 고딕", 10))
             return
         points = []
-        count = len(self.temperature_history)
-        for index, (captured_at, value) in enumerate(self.temperature_history):
+        count = len(display_history)
+        for index, (captured_at, value) in enumerate(display_history):
             x = left + index / max(1, count - 1) * (right - left)
             y = y_for(value)
             points.extend((x, y))
@@ -604,14 +669,144 @@ class ProductDashboard:
             round(position * (count - 1) / max(1, tick_count - 1))
             for position in range(tick_count)
         })
+        span = display_history[-1][0] - display_history[0][0]
+        tick_format = "%m-%d %H:%M" if span >= timedelta(days=1) else "%H:%M:%S"
         for tick_index in tick_indexes:
-            captured_at, _ = self.temperature_history[tick_index]
+            captured_at, _ = display_history[tick_index]
             x = left + tick_index / max(1, count - 1) * (right - left)
             canvas.create_line(x, bottom, x, bottom + 5, fill="#6f7b84")
             anchor = "w" if tick_index == 0 else "e" if tick_index == count - 1 else "center"
             canvas.create_text(x, bottom + 18, anchor=anchor,
-                               text=captured_at.strftime("%H:%M:%S"),
+                               text=captured_at.strftime(tick_format),
                                fill=COLORS["muted"], font=("맑은 고딕", 8))
+
+    @staticmethod
+    def _downsample_temperature_history(history, max_points):
+        """Keep graph drawing light while preserving the hottest point per bucket."""
+        if len(history) <= max_points:
+            return list(history)
+        bucket_size = math.ceil(len(history) / max_points)
+        reduced = []
+        for start in range(0, len(history), bucket_size):
+            bucket = history[start:start + bucket_size]
+            reduced.append(max(bucket, key=lambda point: point[1]))
+        reduced.sort(key=lambda point: point[0])
+        return reduced
+
+    def _draw_status_gauge(self):
+        """Draw the latest NORMAL/WARNING/CRITICAL state as a semicircle gauge."""
+        canvas = self.status_gauge_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 260)
+        height = max(canvas.winfo_height(), 210)
+        center_x = width / 2
+        center_y = min(height - 48, 155)
+        radius = min(width * 0.39, center_y - 28)
+        bbox = (
+            center_x - radius,
+            center_y - radius,
+            center_x + radius,
+            center_y + radius,
+        )
+
+        canvas.create_text(
+            center_x,
+            16,
+            text="현재 온도 상태",
+            fill=COLORS["text"],
+            font=("맑은 고딕", 11, "bold"),
+        )
+        # Tk의 0도는 오른쪽이므로 위험→경고→정상 순서로 반원을 그린다.
+        for start, extent, color in (
+            (4, 54, COLORS["red"]),
+            (63, 54, COLORS["orange"]),
+            (122, 54, COLORS["green"]),
+        ):
+            canvas.create_arc(
+                *bbox,
+                start=start,
+                extent=extent,
+                style="arc",
+                outline=color,
+                width=22,
+            )
+
+        state_angles = {
+            Status.NORMAL: 149,
+            Status.WARNING: 90,
+            Status.CRITICAL: 31,
+        }
+        state_labels = {
+            Status.NORMAL: ("정상", COLORS["green"]),
+            Status.WARNING: ("경고", COLORS["orange"]),
+            Status.CRITICAL: ("위험", COLORS["red"]),
+        }
+        angle = math.radians(state_angles.get(self.latest_status, 149))
+        needle_length = radius * 0.68
+        needle_x = center_x + math.cos(angle) * needle_length
+        needle_y = center_y - math.sin(angle) * needle_length
+        canvas.create_line(
+            center_x,
+            center_y,
+            needle_x,
+            needle_y,
+            fill="white",
+            width=6,
+            capstyle="round",
+        )
+        canvas.create_oval(
+            center_x - 10,
+            center_y - 10,
+            center_x + 10,
+            center_y + 10,
+            fill="white",
+            outline=COLORS["muted"],
+            width=2,
+        )
+
+        label, state_color = state_labels.get(
+            self.latest_status,
+            ("확인 중", COLORS["muted"]),
+        )
+        latest_temp = (
+            self.temperature_history[-1][1]
+            if self.temperature_history
+            else None
+        )
+        temperature_text = (
+            f"{latest_temp:.1f} °C"
+            if latest_temp is not None
+            else "측정 대기"
+        )
+        label_y = center_y + 26
+        canvas.create_text(
+            center_x,
+            label_y,
+            text=f"{label}  {temperature_text}",
+            fill=state_color,
+            font=("맑은 고딕", 14, "bold"),
+        )
+        canvas.create_text(
+            center_x - radius * 0.76,
+            center_y + 3,
+            text="정상",
+            fill=COLORS["green"],
+            font=("맑은 고딕", 9, "bold"),
+        )
+        canvas.create_text(
+            center_x,
+            center_y - radius - 15,
+            text="경고",
+            fill=COLORS["orange"],
+            font=("맑은 고딕", 9, "bold"),
+        )
+        canvas.create_text(
+            center_x + radius * 0.76,
+            center_y + 3,
+            text="위험",
+            fill=COLORS["red"],
+            font=("맑은 고딕", 9, "bold"),
+        )
 
     def _show_trend_hover(self, event):
         self._clear_trend_hover()
@@ -878,6 +1073,7 @@ class ProductDashboard:
         if now - self._last_backend_sync >= 30 and self.cfg.backend.enabled:
             self._last_backend_sync = now
             self._analysis_executor.submit(self._sync_events_from_backend)
+            self._analysis_executor.submit(self._sync_temperature_history)
 
     @staticmethod
     def _run_integrity(save_dir: str):
@@ -1254,10 +1450,14 @@ class ProductDashboard:
         captured_at = result.get("captured_at") or self.last_update
         if captured_at != self._last_history_capture:
             self.temperature_history.append((captured_at, float(overall_max)))
-            del self.temperature_history[:-120]
+            cutoff = datetime.now() - timedelta(days=self.TREND_HISTORY_DAYS)
+            self.temperature_history = [
+                point for point in self.temperature_history
+                if point[0] >= cutoff
+            ]
             self._last_history_capture = captured_at
+        self._draw_status_gauge()
         self._draw_temperature_trend()
-        self._draw_robot_map()
         if result.get("image_quality_ok", False):
             stamp = captured_at.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
             self.thermal_stamp.configure(text=stamp)
@@ -1342,7 +1542,7 @@ class ProductDashboard:
         event = {
             "id": now.strftime("%Y%m%d%H%M%S_%f"),
             "time": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "asset": f"{self.cfg.identity.robot_id} · {roi_name}",
+            "asset": roi_name,
             "state": state,
             "temp": float(temp) if temp is not None else 0.0,
             "action": action,
@@ -1382,17 +1582,10 @@ class ProductDashboard:
         self._render_alert_cards()
 
     def acknowledge_selected(self):
-        messagebox.showinfo("확인 처리", "왼쪽 미확인 알림 카드의 확인 버튼을 사용하세요.", parent=self.root)
+        self.open_alert_history()
 
     def show_all_events(self):
-        if self.cfg.backend.enabled:
-            self._sync_events_from_backend()
-        messagebox.showinfo("이상 이력",
-                            "백엔드 DB 연동 상태:\n"
-                            f"· 운영 로그 {len(self.operating_logs)}건\n"
-                            f"· 이벤트 {len(self.events)}건\n\n"
-                            "전체 기간 조회는 웹 대시보드에서 제공됩니다.",
-                            parent=self.root)
+        self.open_alert_history()
 
     def _update_metric_text_async(self):
         if self.lifecycle == "running": self.root.after(0, self._update_metric_text)
@@ -1472,6 +1665,61 @@ class ProductDashboard:
         del self.operating_logs[1000:]
         _file_log.info("[%s] %s | %s", category, result, detail)
 
+    def _sync_temperature_history(self):
+        """Load up to seven days from DB and join it to live in-memory readings."""
+        if not self.cfg.backend.enabled:
+            return
+        try:
+            resp = requests.get(
+                f"{self.cfg.backend.url}/api/temperature-trend",
+                params={
+                    "days": self.TREND_HISTORY_DAYS,
+                    "limit": self.TREND_API_LIMIT,
+                },
+                timeout=self.cfg.backend.timeout_sec,
+            )
+            if resp.status_code != 200:
+                return
+            points = resp.json().get("points", [])
+            if not isinstance(points, list):
+                return
+            if threading.current_thread() is threading.main_thread():
+                self._merge_temperature_history(points)
+            elif self.lifecycle == "running":
+                self.root.after(
+                    0,
+                    lambda rows=points: self._merge_temperature_history(rows),
+                )
+        except Exception as exc:
+            _file_log.warning("backend temperature trend sync failed: %s", exc)
+
+    def _merge_temperature_history(self, points: list[dict]) -> None:
+        cutoff = datetime.now() - timedelta(days=self.TREND_HISTORY_DAYS)
+        merged = {
+            captured_at: float(temperature)
+            for captured_at, temperature in self.temperature_history
+            if captured_at >= cutoff
+        }
+        for point in points:
+            try:
+                measured_at = datetime.fromisoformat(
+                    str(point.get("measured_at", "")).replace("Z", "+00:00")
+                )
+                if measured_at.tzinfo is not None:
+                    measured_at = measured_at.astimezone().replace(tzinfo=None)
+                if measured_at < cutoff:
+                    continue
+                temperature = float(point["max_temp"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            merged[measured_at] = temperature
+
+        self.temperature_history = sorted(merged.items())
+        if self.temperature_history:
+            self._last_history_capture = self.temperature_history[-1][0]
+        self._draw_status_gauge()
+        self._draw_temperature_trend()
+
     def _sync_events_from_backend(self):
         """GET /api/alerts 로 영구 알람 이벤트 목록을 가져와 self.events와 병합."""
         if not self.cfg.backend.enabled:
@@ -1479,7 +1727,7 @@ class ProductDashboard:
         try:
             resp = requests.get(
                 f"{self.cfg.backend.url}/api/alerts",
-                params={"limit": 50},
+                params={"limit": 5000, "days": 7},
                 timeout=self.cfg.backend.timeout_sec,
             )
             if resp.status_code != 200:
@@ -1518,10 +1766,7 @@ class ProductDashboard:
             fields = {
                 "backend_id": alert_id,
                 "time": alert.get("occurred_at", "")[:19].replace("T", " "),
-                "asset": (
-                    f"{alert.get('robot_code', 'Robot-01')} · "
-                    f"{alert.get('roi_name', 'ROI')}"
-                ),
+                "asset": alert.get("roi_name", "ROI"),
                 "state": alert.get("severity", "normal").capitalize(),
                 "temp": float(alert.get("max_temp", 0)),
                 "action": action,
@@ -1533,7 +1778,7 @@ class ProductDashboard:
             else:
                 event.update(fields)
         self.events.sort(key=lambda event: event.get("time", ""), reverse=True)
-        del self.events[200:]
+        del self.events[5000:]
         self._render_alert_cards()
 
     def _acknowledge_event_backend(self, event: dict):
@@ -1662,18 +1907,10 @@ class SettingsDialog:
         self.baseline = tk.StringVar(value=str(self.d.cfg.roi.baseline_temp))
         self.warning = tk.StringVar(value=str(self.d.cfg.roi.warning_delta))
         self.critical = tk.StringVar(value=str(self.d.cfg.roi.critical_delta))
-        self.factory_name = tk.StringVar(value=self.d.cfg.identity.factory_name)
-        self.line_name = tk.StringVar(value=self.d.cfg.identity.line_name)
-        self.robot_name = tk.StringVar(
-            value=self.d.cfg.identity.robot_name or self.d.cfg.identity.robot_id
-        )
-        self._field(general, "공장 이름", self.factory_name, 0)
-        self._field(general, "생산라인 이름", self.line_name, 1)
-        self._field(general, "로봇 이름", self.robot_name, 2)
-        self._field(general, "카메라 주소", self.ip, 3)
-        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 4)
+        self._field(general, "카메라 주소", self.ip, 0)
+        self._path_field(general, "데이터 저장 폴더", self.dataset_dir, 1)
         ttk.Label(general, text="촬영 이미지, 온도 배열과 오버레이가 선택한 폴더에 저장됩니다.").grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=12)
+            row=2, column=0, columnspan=3, sticky="w", pady=12)
         ttk.Label(roi, text="가시광 이미지에서 감시할 설비 영역을 지정합니다.", font=("맑은 고딕", 11, "bold")).pack(anchor="w", pady=8)
         self.roi_button = ttk.Button(roi, text="가시광 이미지에서 ROI 설정", command=self.open_roi_editor)
         self.roi_button.pack(anchor="w", pady=8)
@@ -2241,16 +2478,6 @@ class SettingsDialog:
     def save(self):
         try:
             camera_ip = self.ip.get().strip()
-            factory_name = self.factory_name.get().strip()
-            line_name = self.line_name.get().strip()
-            robot_name = self.robot_name.get().strip()
-            if not factory_name or not line_name or not robot_name:
-                messagebox.showerror(
-                    "설비 정보 입력 오류",
-                    "공장 이름, 생산라인 이름, 로봇 이름을 모두 입력하세요.",
-                    parent=self.win,
-                )
-                return
             dataset_value = self.dataset_dir.get().strip()
             if not dataset_value:
                 messagebox.showerror("입력 오류", "데이터 저장 폴더를 선택하세요.", parent=self.win)
@@ -2277,6 +2504,12 @@ class SettingsDialog:
             from .asset_api_client import register_asset_hierarchy
 
             identity = self.d.cfg.identity
+            # DB 스키마의 factory → line → robot → camera 외래키 연결은
+            # 측정·알림 저장에 필요하다. 사용자가 입력하거나 화면에서 보는
+            # 항목은 제거하고, 기존 값 또는 내부 기본값으로만 유지한다.
+            factory_name = identity.factory_name.strip() or "ThermoGuard"
+            line_name = identity.line_name.strip() or "기본 라인"
+            robot_name = identity.robot_name.strip() or identity.robot_id
             registration = register_asset_hierarchy(
                 base_url=self.d.cfg.backend.url,
                 timeout=self.d.cfg.backend.timeout_sec,
@@ -2293,9 +2526,6 @@ class SettingsDialog:
             )
 
             self.d.cfg.camera.ip = camera_ip
-            identity.factory_name = factory_name
-            identity.line_name = line_name
-            identity.robot_name = robot_name
             identity.factory_id = registration.factory_id
             identity.line_id = registration.line_id
             identity.db_robot_id = registration.robot_id
@@ -2310,8 +2540,7 @@ class SettingsDialog:
             self.d._add_operating_log(
                 "설비 DB 연동",
                 "저장 완료",
-                f"{factory_name} · {line_name} · {robot_name} "
-                f"(camera_id={registration.camera_id})",
+                f"카메라 연결 정보 저장 (camera_id={registration.camera_id})",
             )
             self.d._add_operating_log("환경설정", "저장 경로 변경", dataset_path)
             # 화면 갱신 주기는 운영 화면 정책에 따라 30초로 고정한다.
@@ -2332,8 +2561,8 @@ class SettingsDialog:
         except Exception as exc:
             self.d._add_operating_log("설비 DB 연동", "저장 실패", str(exc))
             messagebox.showerror(
-                "설비 정보 DB 저장 실패",
-                f"공장·생산라인·로봇 정보를 저장하지 못했습니다.\n\n{exc}",
+                "카메라 정보 DB 저장 실패",
+                f"카메라 연결 정보를 저장하지 못했습니다.\n\n{exc}",
                 parent=self.win,
             )
 

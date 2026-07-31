@@ -221,7 +221,6 @@ def build_caption(
     """Telegram 이미지 캡션용 메시지"""
     return (
         f"\u26a0\ufe0f Overheat Alarm\n\n"
-        f"Robot   : {robot_id}\n"
         f"Temp    : {temp:.1f}\u2103\n"
         f"Status  : {status}"
     )
@@ -237,7 +236,6 @@ def build_text_message(
     """이미지 없이 텍스트만 전송할 때 사용 (fallback)"""
     return (
         f"\u26a0\ufe0f Overheat Alarm\n\n"
-        f"Robot     : {robot_id}\n"
         f"Max Temp  : {max_temp:.1f}\u2103\n"
         f"Mean Temp : {mean_temp:.1f}\u2103\n"
         f"Hot (95th): {temp:.1f}\u2103\n"
@@ -327,8 +325,8 @@ def send_alarm(
     """
     caption = build_caption(temp, status, robot_id)
     _log.debug(
-        "[DBG-NOTIFIER] send_alarm ENTER: alert_id=%s robot=%s status=%s temp=%.1f image=%s",
-        alert_id, robot_id, status, temp, bool(image_path and os.path.isfile(image_path)),
+        "[DBG-NOTIFIER] send_alarm ENTER: alert_id=%s status=%s temp=%.1f image=%s",
+        alert_id, status, temp, bool(image_path and os.path.isfile(image_path)),
     )
 
     # --- dry-run (개발 중 테스트용) ---
@@ -348,8 +346,10 @@ def send_alarm(
         _log.info("send_alarm skipped: Telegram delivery disabled")
         return False
 
-    _log.info("send_alarm: robot=%s status=%s temp=%.1fC image=%s",
-              robot_id, status, temp, image_path)
+    _log.info(
+        "send_alarm: status=%s temp=%.1fC image=%s",
+        status, temp, image_path,
+    )
 
     # 1. 이미지 + 캡션 전송 시도
     photo_sent = False
@@ -368,7 +368,7 @@ def send_alarm(
             last_http_status = resp.status_code
             if resp.status_code == 200:
                 photo_sent = True
-                _log.info("sendPhoto success: robot=%s temp=%.1f°C", robot_id, temp)
+                _log.info("sendPhoto success: temp=%.1f°C", temp)
             else:
                 last_error_message = (
                     f"Telegram sendPhoto 실패: HTTP {resp.status_code} {resp.text}"

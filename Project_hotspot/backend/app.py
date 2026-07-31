@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from datetime import datetime, timedelta
 
 from database import engine
 from pydantic import BaseModel
@@ -328,9 +329,69 @@ def get_measurements(limit: int = 100):
             "error": str(e)
         }
 
-@app.get("/api/alerts")
-def get_alerts(limit: int = 100):
+
+@app.get("/api/temperature-trend")
+def get_temperature_trend(days: int = 7, limit: int = 150000):
+    """Return one maximum temperature per capture for the recent trend graph."""
     try:
+        if days < 1 or days > 7:
+            return {
+                "status": "error",
+                "error": "days는 1일부터 7일까지 지정할 수 있습니다."
+            }
+        safe_limit = max(1, min(limit, 150000))
+        cutoff = datetime.now() - timedelta(days=days)
+
+        with engine.connect() as connection:
+            result = connection.execute(
+                text("""
+                    SELECT
+                        rm.capture_id,
+                        rm.measured_at,
+                        MAX(rm.max_temp) AS max_temp
+                    FROM roi_measurements rm
+                    WHERE rm.measured_at >= :cutoff
+                    GROUP BY rm.capture_id, rm.measured_at
+                    ORDER BY rm.measured_at DESC
+                    LIMIT :limit
+                """),
+                {
+                    "cutoff": cutoff,
+                    "limit": safe_limit
+                }
+            )
+            points = [
+                {
+                    "capture_id": row["capture_id"],
+                    "measured_at": str(row["measured_at"]),
+                    "max_temp": float(row["max_temp"])
+                }
+                for row in result.mappings()
+            ]
+
+        return {
+            "count": len(points),
+            "days": days,
+            "points": points
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+@app.get("/api/alerts")
+def get_alerts(limit: int = 100, days: int = 7):
+    try:
+        if days < 1 or days > 7:
+            return {
+                "status": "error",
+                "error": "days는 1일부터 7일까지 지정할 수 있습니다."
+            }
+        safe_limit = max(1, min(limit, 5000))
+        cutoff = datetime.now() - timedelta(days=days)
+
         with engine.connect() as connection:
 
             result = connection.execute(
@@ -358,12 +419,15 @@ def get_alerts(limit: int = 100):
                     LEFT JOIN roi_definitions rd
                         ON ae.roi_id = rd.roi_id
 
+                    WHERE ae.occurred_at >= :cutoff
+
                     ORDER BY ae.occurred_at DESC
 
                     LIMIT :limit
                 """),
                 {
-                    "limit": limit
+                    "limit": safe_limit,
+                    "cutoff": cutoff
                 }
             )
 
@@ -403,6 +467,7 @@ def get_alerts(limit: int = 100):
 
         return {
             "count": len(alerts),
+            "days": days,
             "alerts": alerts
         }
 
