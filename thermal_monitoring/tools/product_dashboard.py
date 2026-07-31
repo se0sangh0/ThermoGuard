@@ -1867,6 +1867,14 @@ class ProductDashboard:
         self.settings_dialog = SettingsDialog(self)
         self.settings_button.configure(style="Active.Action.TButton")
 
+    def apply_saved_settings_immediately(self):
+        """Apply saved thresholds and runtime settings without waiting for the timer."""
+        self._draw_status_gauge()
+        self._draw_temperature_trend()
+        self._schedule_refresh(self.REFRESH_SECONDS * 1000)
+        self._schedule_analysis()
+        self._check_connection_async()
+
     def on_close(self):
         if self.lifecycle != "running": return
         self.lifecycle = "closing"
@@ -2543,8 +2551,15 @@ class SettingsDialog:
                 f"카메라 연결 정보 저장 (camera_id={registration.camera_id})",
             )
             self.d._add_operating_log("환경설정", "저장 경로 변경", dataset_path)
-            # 화면 갱신 주기는 운영 화면 정책에 따라 30초로 고정한다.
-            self.d._schedule_refresh(self.d.REFRESH_SECONDS * 1000)
+            self.d._add_operating_log(
+                "환경설정",
+                "즉시 적용",
+                (
+                    f"정상 {self.d.cfg.roi.baseline_temp:.1f}°C · "
+                    f"경고 +{self.d.cfg.roi.warning_delta:.1f}°C · "
+                    f"위험 +{self.d.cfg.roi.critical_delta:.1f}°C"
+                ),
+            )
 
             if capture_settings_changed and self.d.capture:
                 self.d.capture.request_stop()
@@ -2552,7 +2567,7 @@ class SettingsDialog:
                 self.d.monitoring = False
                 self.d.root.after(300, self.d.start_monitoring)
 
-            self.d._check_connection_async()
+            self.d.apply_saved_settings_immediately()
             self.close()
         except OSError as exc:
             messagebox.showerror("저장 경로 오류", f"폴더를 만들거나 사용할 수 없습니다.\n{exc}", parent=self.win)
