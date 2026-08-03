@@ -32,9 +32,12 @@ from ..config import (
     METADATA_INTERVAL_SEC,
     NORMAL_CAPTURE_INTERVAL_SEC,
     PROCESS_INTERVAL_SEC,
+    TEMP_MONITOR_INTERVAL_SEC,
     load_config,
 )
 from ..capture.capture import CaptureSession
+from ..capture.gige_backend import GigeTemperatureReader
+from ..monitoring.temperature import TemperatureMonitor
 from ..data.checking import run_check
 from ..data.metadata import run_metadata
 from ..data.cleanup import run_cleanup_if_due
@@ -97,6 +100,10 @@ class MonitorSequencer:
         self.processed_bases: set = set()
         self._alarm_count = 0
         self._status_counts = {s.value: 0 for s in Status}
+
+        # GigE 온도 감시 (REST와 병행)
+        self._gige_reader: Optional[GigeTemperatureReader] = None
+        self._temp_monitor: Optional[TemperatureMonitor] = None
 
     # ── 로깅 ────────────────────────────────────────────────
     def _log(self, msg: str):
@@ -535,8 +542,7 @@ class MonitorSequencer:
 
         self._running = True
 
-        # REST 이미지 캡처 시작. 온도 감시는 향후 별도 GigE/Mono16 adapter가
-        # TemperatureMonitor에 값을 공급하며 이 세션에는 probe를 연결하지 않습니다.
+        # REST 이미지 캡처 시작.
         self.capture = CaptureSession(
             cam_ip=self.cam_ip,
             mode="both",
@@ -546,6 +552,9 @@ class MonitorSequencer:
         )
         self.capture.start()
 
+        # GigE 온도 감시 시작 (REST와 병행)
+        self._start_gige_monitor()
+
         # 메인 스레드에서 감시 루프 실행
         try:
             self._monitoring_loop()
@@ -554,10 +563,59 @@ class MonitorSequencer:
         finally:
             self.stop()
 
+    def _start_gige_monitor(self):
+        """GigE Vision 온도 감시를 시작한다."""
+        cfg = load_config()
+        if not cfg.camera.gige_enabled:
+            return
+        try:
+            reader = GigeTemperatureReader(
+                device_index=cfg.camera.gige_device_index,
+                roi_bounds=None,
+            )
+        except Exception as exc:
+            _log_monitor.warning("GigE reader init failed: %s", exc)
+            return
+        if not reader.start():
+            _log_monitor.warning("GigE reader start failed - REST-only mode")
+            return
+        self._gige_reader = reader
+        threshold = (
+            (self.roi_config.baseline_temp + self.roi_config.warning_delta)
+            if self.roi_config else 50.0
+        )
+        self._temp_monitor = TemperatureMonitor(
+            read_temperature=reader.read_temperature,
+            threshold=threshold,
+            interval_sec=TEMP_MONITOR_INTERVAL_SEC,
+            on_elevated=self._on_gige_elevated,
+            on_recovered=self._on_gige_recovered,
+            on_error=lambda e: _log_monitor.warning("GigE error: %s", e),
+        )
+        self._temp_monitor.start()
+        self._log("GigE temperature monitor started")
+
+    def _stop_gige_monitor(self):
+        if self._temp_monitor is not None:
+            self._temp_monitor.stop()
+            self._temp_monitor = None
+        if self._gige_reader is not None:
+            self._gige_reader.stop()
+            self._gige_reader = None
+
+    def _on_gige_elevated(self, temp: float):
+        _log_monitor.info("GigE temperature elevated: %.1f°C", temp)
+        self._log(f"[GigE] Temperature elevated: {temp:.1f}°C")
+
+    def _on_gige_recovered(self, temp: float):
+        _log_monitor.info("GigE temperature recovered: %.1f°C", temp)
+        self._log(f"[GigE] Temperature recovered: {temp:.1f}°C")
+
     def stop(self):
         """캡처 + 감시 루프 종료"""
         _log_monitor.info("Sequencer stop requested (alarms=%d)", self._alarm_count)
         self._running = False
+        self._stop_gige_monitor()
         if self.capture:
             self.capture.stop()
 

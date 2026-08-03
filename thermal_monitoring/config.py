@@ -67,6 +67,8 @@ class CameraConfig:
     capture_interval_sec: float = NORMAL_CAPTURE_INTERVAL_SEC
     # 호환 필드입니다. GigE 감시/REST 캡처 분리 전까지 기존 호출자가 사용합니다.
     warning_interval_sec: float = TEMP_MONITOR_INTERVAL_SEC
+    gige_enabled: bool = True
+    gige_device_index: int = 0
 
 
 @dataclass

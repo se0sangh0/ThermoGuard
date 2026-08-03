@@ -34,13 +34,15 @@ from ..analysis.threshold import (
     apply_roi_state_updates,
 )
 from ..capture.capture import CaptureSession, camera_image_url
+from ..capture.gige_backend import GigeTemperatureReader
+from ..monitoring.temperature import TemperatureMonitor
 from ..data import pairs
 from ..data.checking import run_check
 from ..data.cleanup import run_cleanup_if_due
 from ..data.metadata import run_metadata
 from ..data.pairs import capture_time_from_file, latest_analysis_pair
 from ..data.quality import assess_image_quality
-from ..config import NORMAL_CAPTURE_INTERVAL_SEC, load_config, save_config
+from ..config import NORMAL_CAPTURE_INTERVAL_SEC, TEMP_MONITOR_INTERVAL_SEC, load_config, save_config
 from ..logger import get_logger
 from .telegram_dispatcher import TelegramDispatcher
 
@@ -144,6 +146,13 @@ class ProductDashboard:
         self._latest_pair_quality_ok = False
         self._latest_pair_fresh = False
         self._last_successful_capture_at: Optional[datetime] = None
+
+        # GigE 온도 감시 (REST 이미지 캡처와 병행)
+        self._gige_reader: Optional[GigeTemperatureReader] = None
+        self._temp_monitor: Optional[TemperatureMonitor] = None
+        self._gige_temperature: Optional[float] = None
+        self._gige_alarm_in_flight = False
+        self._gige_last_alarm_temp: float = 0.0
 
         self._analysis_executor = ThreadPoolExecutor(max_workers=1)
         self._analysis_running = False
@@ -768,12 +777,17 @@ class ProductDashboard:
             ("확인 중", COLORS["muted"]),
         )
         latest_temp = (
-            self.temperature_history[-1][1]
-            if self.temperature_history
-            else None
+            self._gige_temperature
+            if self._gige_temperature is not None
+            else (
+                self.temperature_history[-1][1]
+                if self.temperature_history
+                else None
+            )
         )
+        gige_label = " · GigE" if self._gige_temperature is not None else ""
         temperature_text = (
-            f"{latest_temp:.1f} °C"
+            f"{latest_temp:.1f} °C{gige_label}"
             if latest_temp is not None
             else "측정 대기"
         )
@@ -928,6 +942,122 @@ class ProductDashboard:
         )
         self.capture.start()
 
+        # GigE 온도 감시 시작 (REST와 병행)
+        self._start_gige_monitor()
+
+    def _start_gige_monitor(self):
+        """GigE Vision 온도 감시를 시작한다. 실패 시 REST-only로 동작한다."""
+        if not self.cfg.camera.gige_enabled:
+            return
+        try:
+            reader = GigeTemperatureReader(
+                device_index=self.cfg.camera.gige_device_index,
+                roi_bounds=None,
+            )
+        except Exception as exc:
+            self._add_operating_log("GigE", "초기화 실패", str(exc))
+            return
+        if not reader.start():
+            self._add_operating_log("GigE", "연결 실패", "Aravis 미설치 또는 카메라 없음 - REST-only 모드")
+            return
+        self._gige_reader = reader
+        threshold = self.cfg.roi.baseline_temp + self.cfg.roi.warning_delta
+        self._temp_monitor = TemperatureMonitor(
+            read_temperature=reader.read_temperature,
+            threshold=threshold,
+            interval_sec=TEMP_MONITOR_INTERVAL_SEC,
+            on_sample=self._on_gige_sample,
+            on_elevated=self._on_gige_elevated,
+            on_recovered=self._on_gige_recovered,
+            on_error=self._on_gige_error,
+        )
+        self._temp_monitor.start()
+        self._add_operating_log("GigE", "연결", "GigE 실시간 온도 감시 시작")
+
+    def _stop_gige_monitor(self):
+        if self._temp_monitor is not None:
+            self._temp_monitor.stop()
+            self._temp_monitor = None
+        if self._gige_reader is not None:
+            self._gige_reader.stop()
+            self._gige_reader = None
+        self._gige_temperature = None
+        self._gige_alarm_in_flight = False
+        self._gige_last_alarm_temp = 0.0
+
+    # ── GigE 온도 콜백 ────────────────────────────────────────
+
+    def _on_gige_sample(self, temp: float):
+        self._gige_temperature = temp
+        self.root.after(0, self._draw_status_gauge)
+
+    def _on_gige_elevated(self, temp: float):
+        """GigE 온도 임계 초과 시 REST 캡처 → 분석 → 오버레이 → 알람 파이프라인을 구동한다."""
+        self.state.status = Status.WARNING
+        self.latest_status = Status.WARNING
+        self._add_operating_log("GigE", "온도 상승", f"{temp:.1f}°C · 경고 임계 초과")
+        self.root.after(0, self._draw_status_gauge)
+        self.root.after(0, self._update_connection_stability_display)
+
+        # 이미 동일 온도에서 알람 진행 중이면 중복 캡처를 막는다.
+        if self._gige_alarm_in_flight:
+            return
+        if abs(temp - self._gige_last_alarm_temp) < 1.0 and self.cfg.monitoring.alarm_cooldown_sec > 0:
+            return
+        capture = self.capture
+        if capture is None or not capture.running:
+            return
+        self._gige_alarm_in_flight = True
+        self._gige_last_alarm_temp = temp
+        self._add_operating_log("GigE", "알람 캡처", f"GigE 감지 즉시 REST 촬영 요청 · {temp:.1f}°C")
+        self._analysis_executor.submit(self._run_gige_alarm_worker, capture, temp)
+
+    def _run_gige_alarm_worker(self, capture: CaptureSession, trigger_temp: float):
+        """GigE 알람 워커: REST 캡처 → 분석 → 오버레이 → 알람 전송."""
+        try:
+            thermal_path, visual_path = capture.capture_both_once()
+            if not thermal_path:
+                raise RuntimeError("GigE 알람: 열화상 이미지 촬영 실패")
+            thermal = Path(thermal_path)
+            visual = Path(visual_path) if visual_path else None
+            npy = pairs.ensure_npy(thermal)
+            pair = {"base": thermal.stem, "thermal": thermal, "visual": visual, "npy": npy}
+            result = self._process_pair_to_dict(pair)
+            result["_gige_trigger_temp"] = trigger_temp
+            self.root.after(0, lambda: self._apply_gige_alarm_result(result, trigger_temp))
+        except Exception as exc:
+            self._gige_alarm_in_flight = False
+            self.root.after(0, lambda msg=str(exc): self._add_operating_log(
+                "GigE 알람", "실패", msg,
+            ))
+
+    def _apply_gige_alarm_result(self, result: dict, trigger_temp: float):
+        """GigE 알람 분석 결과를 적용한다. 알람 발송은 _apply_analysis_result에 위임."""
+        try:
+            alarm_status = result.get("alarm_status", result.get("status"))
+            quality_ok = result.get("image_quality_ok", False)
+            self._apply_analysis_result(result, self._analysis_generation)
+            self._add_operating_log(
+                "GigE 알람",
+                "분석 완료",
+                f"{trigger_temp:.1f}°C · {alarm_status.value if hasattr(alarm_status, 'value') else alarm_status}"
+                f"{' (이미지 품질 불량)' if not quality_ok else ''}",
+            )
+        finally:
+            self._gige_alarm_in_flight = False
+
+    def _on_gige_recovered(self, temp: float):
+        self.state.status = Status.NORMAL
+        self.latest_status = Status.NORMAL
+        self._gige_alarm_in_flight = False
+        self._gige_last_alarm_temp = 0.0
+        self._add_operating_log("GigE", "온도 복귀", f"{temp:.1f}°C · 정상")
+        self.root.after(0, self._draw_status_gauge)
+        self.root.after(0, self._update_connection_stability_display)
+
+    def _on_gige_error(self, error: Exception):
+        self._add_operating_log("GigE", "오류", str(error))
+
     def toggle_capture(self):
         """현장 사용자가 촬영만 정지하거나 다시 시작할 수 있게 한다."""
         if self.monitoring:
@@ -947,6 +1077,7 @@ class ProductDashboard:
         self.capture = None
         if capture:
             capture.request_stop()
+        self._stop_gige_monitor()
         self.capture_toggle_button.configure(text="▶  촬영 시작")
         self._set_system_state("촬영 정지", COLORS["orange"])
         self._add_operating_log("촬영", "정지", "사용자가 촬영을 정지함")
@@ -1849,6 +1980,7 @@ class ProductDashboard:
             self.root.after_cancel(self.timer_id); self.timer_id = None
         if self.capture:
             self.capture.request_stop()
+        self._stop_gige_monitor()
         self.monitoring = False
         self.lifecycle = "closed"
         self._add_operating_log("프로그램", "종료 완료", "closing → closed")
