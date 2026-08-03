@@ -97,6 +97,12 @@ class ProductDashboard:
     TREND_HISTORY_DAYS = 7
     TREND_API_LIMIT = 150000
     TREND_DRAW_POINTS = 1000
+    HISTORY_PERIODS = {
+        "1시간": 1,
+        "1일": 24,
+        "3일": 72,
+        "7일": 168,
+    }
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -126,11 +132,16 @@ class ProductDashboard:
         self.alert_window: Optional[tk.Toplevel] = None
         self.alert_tree: Optional[ttk.Treeview] = None
         self.alert_filter_var: Optional[tk.StringVar] = None
+        self.alert_period_var: Optional[tk.StringVar] = None
+        self.alert_history_hours = 168
+        self.alert_range_label: Optional[ttk.Label] = None
         self.operating_logs: list[tuple[str, str, str, str]] = []
         self.operating_log_window: Optional[tk.Toplevel] = None
         self._operating_log_opening = False
         self.settings_dialog: Optional[SettingsDialog] = None
         self.temperature_history: list[tuple[datetime, float]] = []
+        self.trend_period_var = tk.StringVar(value="7일")
+        self.trend_history_hours = 168
         self._last_history_capture: Optional[datetime] = None
         self._last_alert_capture: Optional[datetime] = None
         self.telegram = TelegramDispatcher(self)
@@ -312,6 +323,16 @@ class ProductDashboard:
                 self._analysis_executor.submit(self._sync_temperature_history)
             self.root.after_idle(self._draw_temperature_trend)
 
+    def _on_trend_period_changed(self, _event=None):
+        label = self.trend_period_var.get()
+        self.trend_history_hours = self.HISTORY_PERIODS.get(label, 168)
+        self.trend_title_label.configure(
+            text=f"최근 {label} 전체 ROI 최대 온도 추이"
+        )
+        self._draw_temperature_trend()
+        if self.cfg.backend.enabled:
+            self._analysis_executor.submit(self._sync_temperature_history)
+
     def _set_carousel_expanded(self, expanded):
         self.carousel_expanded = expanded
         if expanded:
@@ -376,8 +397,23 @@ class ProductDashboard:
         panel = tk.Frame(parent, bg=COLORS["card"], highlightbackground=COLORS["line"], highlightthickness=1)
         panel.pack(fill="both", expand=True)
         head = tk.Frame(panel, bg=COLORS["card"]); head.pack(fill="x", padx=14, pady=(10, 4))
-        tk.Label(head, text="최근 7일 전체 ROI 최대 온도 추이", bg=COLORS["card"], fg=COLORS["text"],
-                 font=("맑은 고딕", 12, "bold")).pack(side="left")
+        self.trend_title_label = tk.Label(
+            head,
+            text="최근 7일 전체 ROI 최대 온도 추이",
+            bg=COLORS["card"],
+            fg=COLORS["text"],
+            font=("맑은 고딕", 12, "bold"),
+        )
+        self.trend_title_label.pack(side="left")
+        trend_period_box = ttk.Combobox(
+            head,
+            textvariable=self.trend_period_var,
+            values=tuple(self.HISTORY_PERIODS),
+            state="readonly",
+            width=8,
+        )
+        trend_period_box.pack(side="left", padx=(14, 0))
+        trend_period_box.bind("<<ComboboxSelected>>", self._on_trend_period_changed)
         self.trend_status_label = tk.Label(head, text="현재 상태: 확인 중", bg=COLORS["card"],
                                            fg=COLORS["orange"], font=("맑은 고딕", 10, "bold"))
         self.trend_status_label.pack(side="right")
@@ -413,7 +449,7 @@ class ProductDashboard:
 
     def _render_alert_cards(self):
         """Update the alert button and the optional seven-day history popup."""
-        cutoff = datetime.now() - timedelta(days=7)
+        cutoff = datetime.now() - timedelta(hours=self.alert_history_hours)
         recent = []
         for event in self.events:
             try:
@@ -465,7 +501,7 @@ class ProductDashboard:
             )
 
     def open_alert_history(self):
-        """Open a non-modal popup containing at most the latest seven days."""
+        """Open a non-modal popup with a selectable one-hour to seven-day range."""
         if self.alert_window:
             try:
                 if self.alert_window.winfo_exists():
@@ -480,7 +516,7 @@ class ProductDashboard:
             self.alert_tree = None
 
         win = tk.Toplevel(self.root, name="alert_history")
-        win.title("최근 7일 알림 이력")
+        win.title("알림 이력")
         win.geometry("900x560")
         win.minsize(760, 420)
         win.transient(self.root)
@@ -493,6 +529,8 @@ class ProductDashboard:
             self.alert_window = None
             self.alert_tree = None
             self.alert_filter_var = None
+            self.alert_period_var = None
+            self.alert_range_label = None
             self.alert_history_button.configure(
                 bg=COLORS["panel"], fg=COLORS["muted"], relief="flat",
             )
@@ -504,9 +542,27 @@ class ProductDashboard:
         toolbar.pack(fill="x")
         ttk.Label(
             toolbar,
-            text="최근 7일 알림",
+            text="알림 이력",
             font=("맑은 고딕", 14, "bold"),
         ).pack(side="left")
+        ttk.Label(toolbar, text="기간").pack(side="left", padx=(24, 6))
+        current_period = next(
+            (
+                label for label, hours in self.HISTORY_PERIODS.items()
+                if hours == self.alert_history_hours
+            ),
+            "7일",
+        )
+        self.alert_period_var = tk.StringVar(value=current_period)
+        period_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.alert_period_var,
+            values=tuple(self.HISTORY_PERIODS),
+            state="readonly",
+            width=8,
+        )
+        period_box.pack(side="left")
+        period_box.bind("<<ComboboxSelected>>", self._on_alert_period_changed)
         ttk.Label(toolbar, text="상태").pack(side="left", padx=(24, 6))
         self.alert_filter_var = tk.StringVar(value="미확인")
         filter_box = ttk.Combobox(
@@ -547,11 +603,12 @@ class ProductDashboard:
 
         footer = ttk.Frame(win, padding=(12, 6, 12, 12))
         footer.pack(fill="x")
-        ttk.Label(
+        self.alert_range_label = ttk.Label(
             footer,
-            text="조회 범위: 현재 시각 기준 최근 7일",
+            text=f"조회 범위: 현재 시각 기준 최근 {current_period}",
             foreground=COLORS["muted"],
-        ).pack(side="left")
+        )
+        self.alert_range_label.pack(side="left")
         ttk.Button(
             footer,
             text="선택 알림 확인 처리",
@@ -559,6 +616,18 @@ class ProductDashboard:
             command=self._acknowledge_selected_alert,
         ).pack(side="right")
 
+        self._render_alert_cards()
+        self._refresh_alert_history()
+
+    def _on_alert_period_changed(self, _event=None):
+        if self.alert_period_var is None:
+            return
+        label = self.alert_period_var.get()
+        self.alert_history_hours = self.HISTORY_PERIODS.get(label, 168)
+        if self.alert_range_label is not None:
+            self.alert_range_label.configure(
+                text=f"조회 범위: 현재 시각 기준 최근 {label}"
+            )
         self._render_alert_cards()
         self._refresh_alert_history()
 
@@ -611,8 +680,13 @@ class ProductDashboard:
         canvas = self.trend_canvas
         canvas.delete("all")
         self._trend_hover_points = []
+        cutoff = datetime.now() - timedelta(hours=self.trend_history_hours)
+        selected_history = [
+            point for point in self.temperature_history
+            if point[0] >= cutoff
+        ]
         display_history = self._downsample_temperature_history(
-            self.temperature_history,
+            selected_history,
             self.TREND_DRAW_POINTS,
         )
         width = max(canvas.winfo_width(), 480)
@@ -1666,14 +1740,14 @@ class ProductDashboard:
         _file_log.info("[%s] %s | %s", category, result, detail)
 
     def _sync_temperature_history(self):
-        """Load up to seven days from DB and join it to live in-memory readings."""
+        """Load the selected period and join it to live in-memory readings."""
         if not self.cfg.backend.enabled:
             return
         try:
             resp = requests.get(
                 f"{self.cfg.backend.url}/api/temperature-trend",
                 params={
-                    "days": self.TREND_HISTORY_DAYS,
+                    "hours": self.trend_history_hours,
                     "limit": self.TREND_API_LIMIT,
                 },
                 timeout=self.cfg.backend.timeout_sec,
@@ -1727,7 +1801,10 @@ class ProductDashboard:
         try:
             resp = requests.get(
                 f"{self.cfg.backend.url}/api/alerts",
-                params={"limit": 5000, "days": 7},
+                params={
+                    "limit": 5000,
+                    "hours": self.alert_history_hours,
+                },
                 timeout=self.cfg.backend.timeout_sec,
             )
             if resp.status_code != 200:

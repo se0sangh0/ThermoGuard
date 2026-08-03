@@ -331,16 +331,29 @@ def get_measurements(limit: int = 100):
 
 
 @app.get("/api/temperature-trend")
-def get_temperature_trend(days: int = 7, limit: int = 150000):
+def get_temperature_trend(
+    hours: int | None = None,
+    days: int = 7,
+    limit: int = 150000
+):
     """Return one maximum temperature per capture for the recent trend graph."""
     try:
-        if days < 1 or days > 7:
-            return {
-                "status": "error",
-                "error": "days는 1일부터 7일까지 지정할 수 있습니다."
-            }
+        if hours is None:
+            if days < 1 or days > 7:
+                return {
+                    "status": "error",
+                    "error": "days는 1일부터 7일까지 지정할 수 있습니다."
+                }
+            selected_hours = days * 24
+        else:
+            selected_hours = hours
+            if selected_hours not in {1, 24, 72, 168}:
+                return {
+                    "status": "error",
+                    "error": "hours는 1, 24, 72, 168 중 하나여야 합니다."
+                }
         safe_limit = max(1, min(limit, 150000))
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = datetime.now() - timedelta(hours=selected_hours)
 
         with engine.connect() as connection:
             result = connection.execute(
@@ -371,7 +384,7 @@ def get_temperature_trend(days: int = 7, limit: int = 150000):
 
         return {
             "count": len(points),
-            "days": days,
+            "hours": selected_hours,
             "points": points
         }
     except Exception as e:
@@ -382,15 +395,28 @@ def get_temperature_trend(days: int = 7, limit: int = 150000):
 
 
 @app.get("/api/alerts")
-def get_alerts(limit: int = 100, days: int = 7):
+def get_alerts(
+    limit: int = 100,
+    hours: int | None = None,
+    days: int = 7
+):
     try:
-        if days < 1 or days > 7:
-            return {
-                "status": "error",
-                "error": "days는 1일부터 7일까지 지정할 수 있습니다."
-            }
+        if hours is None:
+            if days < 1 or days > 7:
+                return {
+                    "status": "error",
+                    "error": "days는 1일부터 7일까지 지정할 수 있습니다."
+                }
+            selected_hours = days * 24
+        else:
+            selected_hours = hours
+            if selected_hours not in {1, 24, 72, 168}:
+                return {
+                    "status": "error",
+                    "error": "hours는 1, 24, 72, 168 중 하나여야 합니다."
+                }
         safe_limit = max(1, min(limit, 5000))
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = datetime.now() - timedelta(hours=selected_hours)
 
         with engine.connect() as connection:
 
@@ -467,7 +493,7 @@ def get_alerts(limit: int = 100, days: int = 7):
 
         return {
             "count": len(alerts),
-            "days": days,
+            "hours": selected_hours,
             "alerts": alerts
         }
 
