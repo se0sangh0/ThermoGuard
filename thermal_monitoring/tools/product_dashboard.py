@@ -153,6 +153,7 @@ class ProductDashboard:
         self._gige_temperature: Optional[float] = None
         self._gige_alarm_in_flight = False
         self._gige_last_alarm_temp: float = 0.0
+        self._gige_warning_active = False         # TemperatureMonitor 기동 중인지
 
         self._analysis_executor = ThreadPoolExecutor(max_workers=1)
         self._analysis_running = False
@@ -946,7 +947,7 @@ class ProductDashboard:
         self._start_gige_monitor()
 
     def _start_gige_monitor(self):
-        """GigE Vision 온도 감시를 시작한다. 실패 시 REST-only로 동작한다."""
+        """GigE Vision 리더를 연결만 해둔다. 5초 TemperatureMonitor는 경고 시에만 기동."""
         if not self.cfg.camera.gige_enabled:
             return
         try:
@@ -958,12 +959,18 @@ class ProductDashboard:
             self._add_operating_log("GigE", "초기화 실패", str(exc))
             return
         if not reader.start():
-            self._add_operating_log("GigE", "연결 실패", "Aravis 미설치 또는 카메라 없음 - REST-only 모드")
+            self._add_operating_log("GigE", "연결 실패", "PySpin 미설치 또는 카메라 없음 - REST-only 모드")
             return
         self._gige_reader = reader
+        self._add_operating_log("GigE", "연결", "GigE 리더 연결 완료 (경고 시 5초 감시 대기)")
+
+    def _activate_gige_monitor(self):
+        """경고 상태 진입 시 5초 주기 TemperatureMonitor를 기동한다."""
+        if self._gige_warning_active or self._gige_reader is None:
+            return
         threshold = self.cfg.roi.baseline_temp + self.cfg.roi.warning_delta
         self._temp_monitor = TemperatureMonitor(
-            read_temperature=reader.read_temperature,
+            read_temperature=self._gige_reader.read_temperature,
             threshold=threshold,
             interval_sec=TEMP_MONITOR_INTERVAL_SEC,
             on_sample=self._on_gige_sample,
@@ -972,12 +979,20 @@ class ProductDashboard:
             on_error=self._on_gige_error,
         )
         self._temp_monitor.start()
-        self._add_operating_log("GigE", "연결", "GigE 실시간 온도 감시 시작")
+        self._gige_warning_active = True
+        self._add_operating_log("GigE", "경고 감시 시작", f"5초 주기 온도 감시 활성화 (threshold={threshold:.1f}°C)")
 
-    def _stop_gige_monitor(self):
+    def _deactivate_gige_monitor(self):
+        """정상 복귀 시 TemperatureMonitor를 중지한다. GigE 리더는 유지."""
         if self._temp_monitor is not None:
             self._temp_monitor.stop()
             self._temp_monitor = None
+        self._gige_warning_active = False
+        self._gige_temperature = None
+        self._add_operating_log("GigE", "경고 감시 종료", "5초 주기 감시 비활성화 · 정상 상태 복귀")
+
+    def _stop_gige_monitor(self):
+        self._deactivate_gige_monitor()
         if self._gige_reader is not None:
             self._gige_reader.stop()
             self._gige_reader = None
@@ -1449,6 +1464,8 @@ class ProductDashboard:
             and status != Status.NORMAL
             and captured_at != self._last_alert_capture
         ):
+            # 경고/위험 진입: GigE 5초 온도 감시 활성화
+            self._activate_gige_monitor()
             self.metrics.anomaly_today += 1
             local_event = self._append_event(
                 status.value,
@@ -1460,6 +1477,8 @@ class ProductDashboard:
             result["_local_event_id"] = local_event["id"]
             self._last_alert_capture = captured_at
         elif status == Status.NORMAL and previous != Status.NORMAL:
+            # 정상 복귀: GigE 5초 온도 감시 비활성화
+            self._deactivate_gige_monitor()
             self._add_operating_log(
                 "과열 해제",
                 "정상 복귀",
@@ -2697,17 +2716,43 @@ class SettingsDialog:
         ]
         roi_ids = [roi_id for roi_id in roi_ids if roi_id is not None]
         if not roi_ids:
+            # ROI가 DB에 등록되지 않은 경우 기본 ROI를 자동 등록하고 threshold를 생성한다.
             self.d._add_operating_log(
                 "임계값 DB 연동",
-                "보류",
-                "저장된 DB ROI ID가 없어 ROI 저장 후 생성합니다.",
+                "자동 등록",
+                "DB ROI 정보가 없어 기본 ROI-01을 자동 등록하고 임계값을 생성합니다.",
             )
-            from .threshold_api_client import ThresholdSyncResult
-            return ThresholdSyncResult(
-                camera_id=int(self.d.cfg.identity.db_camera_id),
-                roi_ids=(),
-                created=0,
-                updated=0,
+            from .roi_api_client import sync_rois
+            from dataclasses import dataclass
+
+            @dataclass
+            class _DefaultRoi:
+                name: str = "ROI-01"
+                x1: int = 0
+                y1: int = 0
+                x2: int = 640
+                y2: int = 480
+                db_roi_id: int | None = None
+
+            default_rois = [_DefaultRoi()]
+            result, roi_id_map = sync_rois(
+                self.d.cfg.backend.url,
+                self.d.cfg.identity.camera_id,
+                self.d.cfg.camera.ip,
+                default_rois,
+                timeout=self.d.cfg.backend.timeout_sec,
+                database_camera_id=self.d.cfg.identity.db_camera_id,
+            )
+            roi_ids = [roi_id_map.get("ROI-01")]
+            if not roi_ids or roi_ids[0] is None:
+                raise RuntimeError("기본 ROI 자동 등록에 실패했습니다.")
+            # 반영된 ROI ID를 config에도 저장
+            if self.d.cfg.roi.rois:
+                self.d.cfg.roi.rois[0].db_roi_id = roi_ids[0]
+            self.d._add_operating_log(
+                "임계값 DB 연동",
+                "ROI 등록 완료",
+                f"ROI-01 자동 등록됨 (roi_id={roi_ids[0]})",
             )
 
         result = sync_threshold_profiles(
