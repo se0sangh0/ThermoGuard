@@ -27,7 +27,6 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
-_log_dir = "logs"
 _lock = threading.Lock()
 _loggers: dict[str, logging.Logger] = {}
 _initialized = False

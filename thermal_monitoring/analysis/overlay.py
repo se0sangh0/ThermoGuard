@@ -67,21 +67,6 @@ def _load_homography() -> np.ndarray | None:
             return data
     return None
 
-
-def _load_calibration() -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """(H, thermal_pts, visual_pts) 반환. 대응점 없으면 (H, None, None)."""
-    if not os.path.isfile(HOMOGRAPHY_PATH):
-        return None, None, None
-    data = np.load(HOMOGRAPHY_PATH, allow_pickle=True)
-    if isinstance(data, np.ndarray) and data.ndim == 0:
-        data = data.item()
-    if isinstance(data, dict):
-        return data.get("H"), data.get("thermal_pts"), data.get("visual_pts")
-    if isinstance(data, np.ndarray) and data.shape == (3, 3):
-        return data, None, None
-    return None, None, None
-
-
 # ------------------------------------------------------------
 # 표시 이미지 선택 및 ROI 좌표 변환
 # ------------------------------------------------------------

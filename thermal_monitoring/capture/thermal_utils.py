@@ -29,7 +29,6 @@ def _get_default_exiftool() -> str:
         return bundled
     return "exiftool"
 
-EXIFTOOL = _get_default_exiftool()
 
 ABSOLUTE_ZERO = 273.15
 

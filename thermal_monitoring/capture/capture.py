@@ -20,7 +20,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Optional
 
 import requests
 
@@ -365,8 +364,6 @@ class CaptureSession:
         return img_type, None, last_err or f"[{img_type}] transient failure"
 
     def _run(self):
-        os.makedirs(self.save_dir, exist_ok=True)
-
         while self._running:
             # warning_mode와 무관하게 세션 mode의 REST 캡처 구성을 유지한다.
             img_types = ["thermal", "visual"] if self.mode == "both" else ["thermal"]
@@ -395,12 +392,6 @@ class CaptureSession:
                     elif self._consecutive_failures == 30:
                         _log.error("Camera unreachable for 30 consecutive attempts: %s", self.cam_ip)
 
-            except requests.exceptions.Timeout:
-                _log.error("Timeout in capture loop")
-                self._log("[capture] Timeout")
-            except requests.exceptions.ConnectionError:
-                _log.error("Connection error in capture loop: %s", self.cam_ip)
-                self._log("[capture] Connection error - check camera IP")
             except Exception as e:
                 _log.error("Capture loop error: %s", e, exc_info=True)
                 self._log(f"[capture] Error: {e}")

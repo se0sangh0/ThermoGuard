@@ -61,7 +61,6 @@ from ..logger import get_logger
 
 _cfg = load_config()
 DATASET_DIR = _cfg.paths.dataset_dir
-OVERLAY_DIR = _cfg.paths.overlay_dir
 MAX_PARALLEL_PAIRS = max(2, (os.cpu_count() or 4) // 2)
 _log_monitor = get_logger("pipeline.monitor")
 
@@ -92,7 +91,6 @@ class MonitorSequencer:
         self.capture_interval = capture_interval
         self.process_interval = process_interval
         self._running = False
-        self._lock = threading.Lock()
 
         self.capture: Optional[CaptureSession] = None
         self.state = MonitorState()
