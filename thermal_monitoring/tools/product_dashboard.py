@@ -326,9 +326,7 @@ class ProductDashboard:
     def _on_trend_period_changed(self, _event=None):
         label = self.trend_period_var.get()
         self.trend_history_hours = self.HISTORY_PERIODS.get(label, 168)
-        self.trend_title_label.configure(
-            text=f"최근 {label} 전체 ROI 최대 온도 추이"
-        )
+        self.trend_title_label.configure(text="최근 전체온도추이")
         self._draw_temperature_trend()
         if self.cfg.backend.enabled:
             self._analysis_executor.submit(self._sync_temperature_history)
@@ -399,7 +397,7 @@ class ProductDashboard:
         head = tk.Frame(panel, bg=COLORS["card"]); head.pack(fill="x", padx=14, pady=(10, 4))
         self.trend_title_label = tk.Label(
             head,
-            text="최근 7일 전체 ROI 최대 온도 추이",
+            text="최근 전체온도추이",
             bg=COLORS["card"],
             fg=COLORS["text"],
             font=("맑은 고딕", 12, "bold"),
