@@ -1005,7 +1005,7 @@ class ProductDashboard:
                 capture.set_warning_mode(True)
                 self._schedule_refresh(100)  # 즉시 분석 가속
                 w_interval = getattr(capture, '_warning_interval', 5.0)
-                self._add_operating_log("프로브", "과열 감지", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
+                self._add_operating_log("분석", "과열 감지", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
                 return True
             else:
                 capture.set_warning_mode(False)
@@ -1026,7 +1026,7 @@ class ProductDashboard:
         else:
             self._set_system_state("연결 확인 중", COLORS["orange"])
             self.capture_toggle_button.configure(text="연결 확인 중...", state="disabled")
-            self._add_operating_log("촬영", "연결 확인", "촬영 시작 전 카메라 응답 확인")
+            self._add_operating_log("캡처", "연결 확인", "촬영 시작 전 카메라 응답 확인")
             self._check_connection_async(resume_on_success=True)
 
     def stop_monitoring(self):
@@ -1040,7 +1040,7 @@ class ProductDashboard:
             capture.request_stop()
         self.capture_toggle_button.configure(text="▶  촬영 시작")
         self._set_system_state("촬영 정지", COLORS["orange"])
-        self._add_operating_log("촬영", "정지", "사용자가 촬영을 정지함")
+        self._add_operating_log("캡처", "정지", "사용자가 촬영을 정지함")
 
     def _capture_log(self, message: str):
         if "saved" in message:
@@ -1203,7 +1203,7 @@ class ProductDashboard:
             self.timer_id = None
         self._manual_capture_running = True
         self.refresh_button.configure(text="촬영 중...", state="disabled")
-        self._add_operating_log("수동 촬영", "시작", "새로고침 버튼으로 즉시 촬영 요청")
+        self._add_operating_log("캡처", "시작", "새로고침 버튼으로 즉시 촬영 요청")
         self._analysis_executor.submit(self._run_capture_refresh_worker, capture)
 
     def _run_capture_refresh_worker(self, capture: CaptureSession):
@@ -1227,7 +1227,7 @@ class ProductDashboard:
     def _apply_capture_refresh_result(self, result: dict):
         try:
             self._add_operating_log(
-                "수동 촬영", "완료", f"{result['base']} 촬영 및 화면 갱신 완료"
+                "캡처", "완료", f"{result['base']} 촬영 및 화면 갱신 완료"
             )
             self._apply_analysis_result(result, self._analysis_generation)
         finally:
@@ -1235,7 +1235,7 @@ class ProductDashboard:
 
     def _handle_capture_refresh_error(self, message: str):
         try:
-            self._add_operating_log("수동 촬영", "실패", message)
+            self._add_operating_log("캡처", "실패", message)
             self._handle_analysis_error(message, self._analysis_generation)
             messagebox.showerror("새로고침 실패", message, parent=self.root)
         finally:
@@ -1438,7 +1438,7 @@ class ProductDashboard:
         elif status == Status.NORMAL and previous != Status.NORMAL:
             if self.capture:
                 self.capture.set_warning_mode(False)
-            self._add_operating_log("과열 해제", "정상 복귀",
+            self._add_operating_log("분석", "정상 복귀",
                                     f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
                                     else "정상 복귀")
 
@@ -1490,13 +1490,13 @@ class ProductDashboard:
                 self.metrics.image_quality_successes += 1
             else:
                 self._add_operating_log(
-                    "영상 품질", "비정상", result.get("image_quality_reason", "영상 확인 필요")
+                    "분석", "영상 품질 이상", result.get("image_quality_reason", "영상 확인 필요")
                 )
             self._image_quality_window.append(quality_ok)
             del self._image_quality_window[:-20]
         elif is_new_capture:
             self._add_operating_log(
-                "영상 품질", "갱신 없음",
+                "분석", "캡처 오래됨",
                 f"{capture_id} · 촬영 후 {capture_age:.0f}초 경과",
             )
         self.latest_status = status
@@ -2346,7 +2346,7 @@ class SettingsDialog:
         """ROI/캘리브레이션 도구는 프로세스에서 한 번에 하나만 실행한다."""
         if self._tool_running:
             self.d._add_operating_log(
-                tool_name, "중복 실행 차단", f"{self._tool_running} 작업이 이미 실행 중"
+                "설정", "중복 실행 차단", f"{self._tool_running} 작업이 이미 실행 중"
             )
             messagebox.showinfo(
                 "작업 진행 중",
@@ -2448,7 +2448,7 @@ class SettingsDialog:
             return
         if not self._begin_tool("ROI 설정"):
             return
-        self.d._add_operating_log("ROI 설정", "시작", str(visual))
+        self.d._add_operating_log("설정", "시작", str(visual))
         try:
             from .tk_image_dialogs import show_roi_dialog
             from .roi_api_client import sync_rois
@@ -2475,7 +2475,7 @@ class SettingsDialog:
                         entry.db_roi_id = roi_id_map[name]
                 threshold_result = self._sync_thresholds_to_backend(entries)
                 self.d._add_operating_log(
-                    "ROI DB 연동",
+                    "DB",
                     "저장 완료",
                     f"camera_id={result.camera_id}, "
                     f"신규 버전 {result.created}개, 변경 없음 {result.unchanged}개 · "
@@ -2492,11 +2492,11 @@ class SettingsDialog:
             self.d.cfg = load_config(force_reload=True)
             result_text = "완료" if saved else "종료"
             self.d._add_operating_log(
-                "ROI 설정", result_text,
+                "설정", result_text,
                 f"{len(self.d.cfg.roi.rois)}개 영역 저장됨" if saved else "저장 없이 종료",
             )
         except Exception as exc:
-            self.d._add_operating_log("ROI 설정", "예외 처리", str(exc))
+            self.d._add_operating_log("설정", "예외 처리", str(exc))
             messagebox.showerror("ROI 설정", str(exc), parent=self.win)
         finally:
             self._end_tool()
@@ -2515,7 +2515,7 @@ class SettingsDialog:
         thermal, visual = pair
         if not self._begin_tool("캘리브레이션"):
             return
-        self.d._add_operating_log("캘리브레이션", "시작", thermal.name)
+        self.d._add_operating_log("설정", "시작", thermal.name)
         saved = False
         calibration_window_title = None
         try:
@@ -2530,12 +2530,12 @@ class SettingsDialog:
                 display_bounds=self._tool_display_bounds(),
             ))
             if saved:
-                self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
+                self.d._add_operating_log("설정", "완료", self.d.cfg.paths.homography_path)
             else:
-                self.d._add_operating_log("캘리브레이션", "종료", "저장 없이 종료")
+                self.d._add_operating_log("설정", "종료", "저장 없이 종료")
         except Exception as exc:
             self.d.metrics.exception_count += 1
-            self.d._add_operating_log("캘리브레이션", "예외 처리", str(exc))
+            self.d._add_operating_log("설정", "예외 처리", str(exc))
             messagebox.showerror("캘리브레이션", str(exc), parent=self.win)
             saved = False
         finally:
@@ -2621,13 +2621,13 @@ class SettingsDialog:
             save_config(self.d.cfg)
             self._sync_thresholds_to_backend()
             self.d._add_operating_log(
-                "설비 DB 연동",
+                "DB",
                 "저장 완료",
                 f"카메라 연결 정보 저장 (camera_id={registration.camera_id})",
             )
-            self.d._add_operating_log("환경설정", "저장 경로 변경", dataset_path)
+            self.d._add_operating_log("설정", "저장 경로 변경", dataset_path)
             self.d._add_operating_log(
-                "환경설정",
+                "설정",
                 "즉시 적용",
                 (
                     f"정상 {self.d.cfg.roi.baseline_temp:.1f}°C · "
@@ -2649,7 +2649,7 @@ class SettingsDialog:
         except ValueError:
             messagebox.showerror("입력 오류", "숫자 설정값을 확인하세요.", parent=self.win)
         except Exception as exc:
-            self.d._add_operating_log("설비 DB 연동", "저장 실패", str(exc))
+            self.d._add_operating_log("DB", "저장 실패", str(exc))
             messagebox.showerror(
                 "카메라 정보 DB 저장 실패",
                 f"카메라 연결 정보를 저장하지 못했습니다.\n\n{exc}",
@@ -2676,7 +2676,7 @@ class SettingsDialog:
         roi_ids = [roi_id for roi_id in roi_ids if roi_id is not None]
         if not roi_ids:
             self.d._add_operating_log(
-                "임계값 DB 연동",
+                "DB",
                 "보류",
                 "저장된 DB ROI ID가 없어 ROI 저장 후 생성합니다.",
             )
@@ -2709,7 +2709,7 @@ class SettingsDialog:
             result.updated,
         )
         self.d._add_operating_log(
-            "임계값 DB 연동",
+            "DB",
             "저장 완료",
             f"ROI {len(result.roi_ids)}개 · 생성 {result.created}개 · "
             f"갱신 {result.updated}개",
