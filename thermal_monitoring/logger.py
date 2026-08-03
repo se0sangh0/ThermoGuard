@@ -16,8 +16,7 @@ logger.py - 중앙 로깅 모듈 (Daily Rotating File Logger)
       Traceback (most recent call last):
         ...
 
-설정:
-    config.json에 monitoring.log_dir로 로그 디렉토리 지정 가능 (기본: logs/)
+로그 디렉터리는 코드 전역 기본값을 사용합니다.
 """
 
 import logging
@@ -35,12 +34,9 @@ _initialized = False
 
 
 def _get_log_dir() -> str:
-    try:
-        from .config import load_config
-        cfg_dir = load_config().monitoring.log_dir if hasattr(load_config().monitoring, 'log_dir') else ""
-        return cfg_dir or "logs"
-    except Exception:
-        return "logs"
+    from .config import DEFAULT_LOG_DIR
+
+    return DEFAULT_LOG_DIR
 
 
 def _init_root_logger():

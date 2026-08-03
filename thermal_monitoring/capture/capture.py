@@ -15,6 +15,7 @@ import해서 사용하거나 tools.py GUI에서 호출할 수 있도록 리팩�
 """
 
 import os
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,9 +24,13 @@ from typing import Optional
 
 import requests
 
-from ..config import load_config
+from ..config import (
+    DEFAULT_TOOLS_MODE,
+    NORMAL_CAPTURE_INTERVAL_SEC,
+    TEMP_MONITOR_INTERVAL_SEC,
+    load_config,
+)
 from ..logger import get_logger
-from .thermal_utils import probe_thermal_from_url
 
 _log = get_logger("capture")
 
@@ -54,18 +59,27 @@ class CaptureSession:
     ):
         cfg = load_config()
         self.cam_ip = cam_ip or cfg.camera.ip
-        self.mode = mode or cfg.tools.mode      # "thermal" or "both"
-        self.interval = interval or cfg.camera.capture_interval_sec
+        self.mode = mode or DEFAULT_TOOLS_MODE  # "thermal" or "both"
+        self.interval = (
+            interval if interval is not None else NORMAL_CAPTURE_INTERVAL_SEC
+        )
         self.save_dir = save_dir or cfg.paths.dataset_dir
         self.log_callback = log_callback  # callable(str) for GUI output
-        self.probe_callback = probe_callback  # callable(float) — max_temp을 받아 Warning 이상이면 True 반환
+        # 호환성을 위해 받지만 REST 캡처 루프에서는 호출하지 않는다.
+        # 온도 감시는 카메라 연결 작업에서 별도 GigE 루프로 제공한다.
+        self.probe_callback = probe_callback
         self._running = False
         self._thread = None
+        self._stop_event = threading.Event()
+        # 주기 캡처와 UI/알람의 명시적 캡처가 카메라 REST를 동시에 치지 않게 한다.
+        self._capture_lock = threading.Lock()
         self._consecutive_failures = 0
         self._was_connected = False
+        # 기존 UI 호환 필드. warning 상태는 interval과 독립적이다.
         self._normal_interval = self.interval
-        self._warning_interval = cfg.camera.warning_interval_sec
+        self._warning_interval = TEMP_MONITOR_INTERVAL_SEC
         self._interval_lock = threading.Lock()
+        self._warning_mode = False
         # 가장 최근 캡처 사이클에서 저장된 (thermal, visual) 경로. 알람 오버레이가
         # 카메라를 다시 치지 않고 최신 프레임을 재사용할 수 있게 노출한다.
         self._last_pair: tuple[str | None, str | None] = (None, None)
@@ -89,6 +103,7 @@ class CaptureSession:
             _log.warning("Capture session already running — ignored start()")
             self._log("[capture] Already running.")
             return
+        self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -98,8 +113,9 @@ class CaptureSession:
     def stop(self):
         _log.info("Capture stop requested")
         self._running = False
+        self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=self.interval + 5)
+            self._thread.join(timeout=15.0)
         _log.info("Capture stopped (consecutive_failures=%d)", self._consecutive_failures)
         self._log("[capture] Stopped.")
 
@@ -107,6 +123,7 @@ class CaptureSession:
         """캡처 중단 요청만 하고 join은 하지 않는다 (UI 블로킹 방지)."""
         _log.info("Capture stop requested (non-blocking)")
         self._running = False
+        self._stop_event.set()
         self._log("[capture] Stop requested (non-blocking).")
 
     @property
@@ -115,22 +132,23 @@ class CaptureSession:
 
     @property
     def warning_mode(self) -> bool:
-        """Return whether the capture loop is currently in thermal-only warning mode."""
+        """Return the compatibility warning flag without changing REST capture behavior."""
         with self._interval_lock:
-            return self.interval != self._normal_interval
+            return self._warning_mode
 
     @property
     def last_saved_pair(self) -> tuple[str | None, str | None]:
         """가장 최근 캡처 사이클에서 저장된 (thermal, visual) 경로.
 
-        경고 모드(thermal-only 캡처)면 visual은 None, 아직 캡처 전이면 (None, None).
+        ``mode='thermal'``이면 visual은 None, 아직 캡처 전이면
+        (None, None). warning_mode는 저장 파일 구성에 영향을 주지 않는다.
         오버레이 생성 시 카메라 추가 접근 없이 최신 프레임을 쓰기 위한 용도.
         """
         with self._last_pair_lock:
             return self._last_pair
 
     def capture_both_once(self) -> tuple[str | None, str | None]:
-        """알람용 일회성 캡처: thermal + visual 동시 요청 → 디스크 저장 → 경로 반환.
+        """명시적 일회 캡처 요청을 수행하고 저장 경로를 반환한다.
 
         Returns:
             (thermal_jpg_path, visual_jpg_path) — 실패 시 (None, None)
@@ -140,52 +158,156 @@ class CaptureSession:
             _log.warning("capture_both_once: session not running")
             return (None, None)
 
-        do_visual = self.mode == "both"
-        filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
+        img_types = ["thermal", "visual"] if self.mode == "both" else ["thermal"]
+        with self._capture_lock:
+            if not self._running:
+                return (None, None)
+            pair, all_ok = self._capture_images(img_types, log_label="requested")
+            if all_ok and pair[0] is not None:
+                # 캡처와 게시를 같은 직렬화 구간에서 완료해 더 최신인 정기
+                # 캡처 결과를 이전 명시 캡처 결과가 덮어쓰지 않게 한다.
+                with self._last_pair_lock:
+                    self._last_pair = pair
 
+        if not all_ok or pair[0] is None:
+            return (None, None)
+        return pair
+
+    def _capture_images(
+        self,
+        img_types: list[str],
+        *,
+        log_label: str | None = None,
+    ) -> tuple[tuple[str | None, str | None], bool]:
+        """하나의 REST 캡처 사이클을 수행한다.
+
+        호출자가 ``_capture_lock``을 보유해야 하며, thermal/visual 결과와
+        전체 성공 여부를 반환한다.
+        """
+        filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
         results: dict[str, str | None] = {"thermal": None, "visual": None}
-        img_types = ["thermal", "visual"] if do_visual else ["thermal"]
+        contents: dict[str, bytes] = {}
+        all_ok = True
+
+        def save_images_atomically() -> bool:
+            """요청된 이미지 전체를 저장하거나 실패 시 모두 정리한다."""
+            pending: list[tuple[str, str, str]] = []
+            committed: list[str] = []
+            try:
+                os.makedirs(self.save_dir, exist_ok=True)
+                for img_type in img_types:
+                    suffix = "_visual" if img_type == "visual" else ""
+                    final_path = os.path.join(
+                        self.save_dir, f"{filenametime}{suffix}.jpg"
+                    )
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        dir=self.save_dir,
+                        prefix=f".{filenametime}{suffix}.",
+                        suffix=".tmp",
+                        delete=False,
+                    ) as stream:
+                        temporary_path = stream.name
+                        pending.append((img_type, temporary_path, final_path))
+                        stream.write(contents[img_type])
+                        stream.flush()
+                        os.fsync(stream.fileno())
+
+                # 데이터 스캐너는 thermal JPG를 기준으로 새 캡처를 찾는다.
+                # mode=both에서는 visual을 먼저 커밋하고 thermal을 마지막에
+                # 공개해 thermal 파일 자체가 완성된 쌍의 커밋 마커가 되게 한다.
+                commit_order = sorted(
+                    pending,
+                    key=lambda item: item[0] == "thermal",
+                )
+                for _img_type, temporary_path, final_path in commit_order:
+                    os.replace(temporary_path, final_path)
+                    committed.append(final_path)
+
+                label = f" [{log_label}]" if log_label else ""
+                for img_type, _temporary_path, final_path in pending:
+                    results[img_type] = final_path
+                    self._log(
+                        f"[{datetime.now().strftime('%H:%M:%S')}]{label} "
+                        f"[{img_type}] saved ({len(contents[img_type])} bytes)"
+                    )
+                return True
+            except OSError as exc:
+                self._log(f"[capture] File save failed: {exc}")
+                return False
+            finally:
+                if len(committed) != len(img_types):
+                    for _img_type, temporary_path, _final_path in pending:
+                        try:
+                            os.unlink(temporary_path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError as exc:
+                            _log.warning(
+                                "Failed to remove capture temp file %s: %s",
+                                temporary_path,
+                                exc,
+                            )
+                    for final_path in committed:
+                        try:
+                            os.unlink(final_path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError as exc:
+                            _log.warning(
+                                "Failed to roll back capture file %s: %s",
+                                final_path,
+                                exc,
+                            )
 
         if len(img_types) > 1:
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = {executor.submit(self._fetch_image, t): t for t in img_types}
                 for future in as_completed(futures):
+                    if not self._running:
+                        all_ok = False
+                        continue
                     img_type, content, error = future.result()
                     if error or content is None:
-                        _log.warning("capture_both_once: %s failed, aborting", img_type)
-                        return (None, None)
-                    suffix = "_visual" if img_type == "visual" else ""
-                    jpg_path = os.path.join(self.save_dir, f"{filenametime}{suffix}.jpg")
-                    with open(jpg_path, "wb") as f:
-                        f.write(content)
-                    results[img_type] = jpg_path
-                    self._log(f"[{datetime.now().strftime('%H:%M:%S')}] [alarm] [{img_type}] saved ({len(content)} bytes)")
+                        if error:
+                            self._log(error)
+                        all_ok = False
+                        continue
+                    contents[img_type] = content
         else:
-            _, content, error = self._fetch_image("thermal")
+            img_type = img_types[0]
+            _, content, error = self._fetch_image(img_type)
             if error or content is None:
-                return (None, None)
-            jpg_path = os.path.join(self.save_dir, f"{filenametime}.jpg")
-            with open(jpg_path, "wb") as f:
-                f.write(content)
-            results["thermal"] = jpg_path
+                if error:
+                    self._log(error)
+                all_ok = False
+            else:
+                contents[img_type] = content
 
-        if results["thermal"]:
-            with self._last_pair_lock:
-                self._last_pair = (results["thermal"], results.get("visual"))
+        # mode=both인 캡처는 요청된 두 이미지가 모두 준비된 뒤에만 저장한다.
+        # 한쪽 REST 요청이 실패했을 때 불완전한 thermal-only 파일을 남기지 않는다.
+        if all_ok and self._running and len(contents) == len(img_types):
+            all_ok = save_images_atomically()
+        else:
+            all_ok = False
 
-        return (results["thermal"], results.get("visual"))
+        return (results["thermal"], results["visual"]), all_ok
 
     def set_warning_mode(self, active: bool) -> None:
-        """과열 감지 시 캡처 주기를 warning_interval로 전환. 평상시 복귀."""
+        """호환용 warning 상태를 기록한다.
+
+        온도 감시와 이미지 캡처가 분리되었으므로 이 상태는 REST 주기,
+        요청 유형, 파일 생성에 영향을 주지 않는다.
+        """
         with self._interval_lock:
-            new_interval = self._warning_interval if active else self._normal_interval
-            if self.interval != new_interval:
-                old = self.interval
-                self.interval = new_interval
-                _log.info("Capture interval changed: %.1fs → %.1fs (%s)",
-                          old, new_interval, "warning" if active else "normal")
-                self._log(f"[capture] Interval changed: {old:.1f}s → {new_interval:.1f}s " +
-                          f"({'warning' if active else 'normal'} mode)")
+            changed = self._warning_mode != bool(active)
+            self._warning_mode = bool(active)
+        if changed:
+            _log.info(
+                "Capture warning flag changed: %s (REST interval remains %.1fs)",
+                "warning" if active else "normal",
+                self.interval,
+            )
 
     def _retry_delay(self, resp, attempt: int) -> float:
         """재시도 대기 시간. Retry-After(초) 헤더가 있으면 반영하되 상한으로 캡."""
@@ -233,7 +355,8 @@ class CaptureSession:
                              img_type, r.status_code, self.cam_ip,
                              attempt + 1, _MAX_TRANSIENT_RETRIES, delay)
                 last_err = f"[{img_type}] HTTP {r.status_code}"
-                time.sleep(delay)
+                if self._stop_event.wait(delay):
+                    return img_type, None, f"[{img_type}] Capture stopped"
                 continue
 
             _log.warning("[%s] HTTP %d from %s", img_type, r.status_code, self.cam_ip)
@@ -245,64 +368,18 @@ class CaptureSession:
         os.makedirs(self.save_dir, exist_ok=True)
 
         while self._running:
-            # 경고 모드에서는 thermal만 캡처 (visual은 알람 시점에만 필요)
-            with self._interval_lock:
-                is_normal_cycle = self.interval == self._normal_interval
-            img_types = ["thermal", "visual"] if (self.mode == "both" and is_normal_cycle) else ["thermal"]
+            # warning_mode와 무관하게 세션 mode의 REST 캡처 구성을 유지한다.
+            img_types = ["thermal", "visual"] if self.mode == "both" else ["thermal"]
             try:
-                filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
-                saved_thermal: str | None = None
-                saved_visual: str | None = None
-
-                # Thermal + Visual 동시 요청으로 정렬 오차 최소화 (503 등은 _fetch_image가 재시도)
-                all_ok = True
-                if len(img_types) > 1:
-                    with ThreadPoolExecutor(max_workers=2) as executor:
-                        futures = {executor.submit(self._fetch_image, t): t for t in img_types}
-                        for future in as_completed(futures):
-                            if not self._running:
-                                break
-                            img_type, content, error = future.result()
-                            if error:
-                                self._log(error)
-                                all_ok = False
-                                continue
-                            if content is None:
-                                all_ok = False
-                                continue
-                            suffix = "_visual" if img_type == "visual" else ""
-                            jpg_path = os.path.join(self.save_dir, f"{filenametime}{suffix}.jpg")
-                            with open(jpg_path, "wb") as f:
-                                f.write(content)
-                            if img_type == "visual":
-                                saved_visual = jpg_path
-                            else:
-                                saved_thermal = jpg_path
-                            self._log(f"[{datetime.now().strftime('%H:%M:%S')}] [{img_type}] saved "
-                                      f"({len(content)} bytes)")
-                else:
-                    for img_type in img_types:
-                        if not self._running:
-                            break
-                        _, content, error = self._fetch_image(img_type)
-                        if error:
-                            self._log(error)
-                            all_ok = False
-                            continue
-                        if content is None:
-                            all_ok = False
-                            continue
-                        jpg_path = os.path.join(self.save_dir, f"{filenametime}.jpg")
-                        with open(jpg_path, "wb") as f:
-                            f.write(content)
-                        saved_thermal = jpg_path
-                        self._log(f"[{datetime.now().strftime('%H:%M:%S')}] [{img_type}] saved "
-                                  f"({len(content)} bytes)")
-
-                # 알람 오버레이가 카메라를 다시 치지 않도록 최신 저장 쌍을 공개
-                if saved_thermal:
-                    with self._last_pair_lock:
-                        self._last_pair = (saved_thermal, saved_visual)
+                with self._capture_lock:
+                    if not self._running:
+                        break
+                    pair, all_ok = self._capture_images(img_types)
+                    # 알람 오버레이가 카메라를 다시 치지 않도록 최신 저장 쌍을
+                    # 캡처 직렬화 구간 안에서 공개한다.
+                    if pair[0]:
+                        with self._last_pair_lock:
+                            self._last_pair = pair
 
                 # 연결 상태 추적
                 if all_ok:
@@ -328,37 +405,10 @@ class CaptureSession:
                 _log.error("Capture loop error: %s", e, exc_info=True)
                 self._log(f"[capture] Error: {e}")
 
-            # 대기 시간 동안 1초 간격으로 경량 프로브 수행
-            deadline = time.monotonic() + self.interval
-            probe_backoff = 0  # 프로브 실패 시 대기 시간 (초)
-            probe_tick = 0
-            while self._running:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-
-                # 정상 모드일 때만 경량 프로브로 과열 감시
-                with self._interval_lock:
-                    is_normal = self.interval == self._normal_interval
-
-                if is_normal and self.probe_callback and self._was_connected and probe_backoff <= 0:
-                    probe_tick += 1
-                    _log.info("probe #%d: checking (interval=%.1fs, remaining=%.1fs)", probe_tick, self.interval, remaining)
-                    temp = probe_thermal_from_url(self._urls["thermal"], timeout=5.0)
-                    if temp is not None:
-                        _log.info("probe #%d: max_temp=%.1f°C", probe_tick, temp)
-                        if self.probe_callback(temp):
-                            _log.info("probe #%d: ELEVATED (%.1f°C) — triggering immediate capture", probe_tick, temp)
-                            self._log(f"[capture] Probe: {temp:.1f}°C — immediate capture triggered")
-                            break
-                    else:
-                        _log.warning("probe #%d: failed — backing off ~6s", probe_tick)
-                        probe_backoff = 2
-
-                if probe_backoff > 0:
-                    probe_backoff -= 1
-
-                time.sleep(min(3.0, remaining))
+            # 온도 프로브는 GigE 감시 루프가 담당한다. 이 루프는 정해진
+            # REST 캡처 주기만 대기하며 stop/request_stop에 즉시 반응한다.
+            if self._stop_event.wait(self.interval):
+                break
 
 
 # ------------------------------------------------------------

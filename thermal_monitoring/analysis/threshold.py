@@ -20,7 +20,12 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ..config import load_config
+from ..config import (
+    DEFAULT_BASELINE_TEMP,
+    DEFAULT_CRITICAL_DELTA,
+    DEFAULT_WARNING_DELTA,
+    load_config,
+)
 from ..logger import get_logger
 
 _log = get_logger("analysis.threshold")
@@ -53,7 +58,8 @@ class MonitorState:
     # ── 하위 호환: 단일 ROI 또는 최악-집계용 필드 ──
     status: Status = Status.NORMAL
     last_alarm_time: float = 0.0
-    alarm_cooldown: float = _cfg.monitoring.alarm_cooldown_sec  # from config.json
+    # DB hydration이 적용된 threshold profile의 런타임 쿨다운 값입니다.
+    alarm_cooldown: float = _cfg.monitoring.alarm_cooldown_sec
     alarm_pending: bool = False        # 전송 실패한 CRITICAL 알람이 재시도 대기 중인지
     last_alarm_attempt: float = 0.0    # 마지막 전송 시도 시각 (재시도 백오프용)
 
@@ -69,9 +75,9 @@ class MonitorState:
 def evaluate_threshold(
     hot_temp: float,
     max_temp: float,
-    baseline: float = 35.0,
-    warning_delta: float = 15.0,
-    critical_delta: float = 25.0,
+    baseline: float = DEFAULT_BASELINE_TEMP,
+    warning_delta: float = DEFAULT_WARNING_DELTA,
+    critical_delta: float = DEFAULT_CRITICAL_DELTA,
     max_hotspot_size: int = 0,
 ) -> Status:
     """

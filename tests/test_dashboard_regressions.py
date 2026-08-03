@@ -19,19 +19,19 @@ class _Response:
         return self._payload
 
 
-def test_dashboard_accepts_missing_visual_only_in_warning_mode():
+def test_dashboard_requires_visual_in_both_mode_even_if_warning_compat_is_set():
     dashboard = ProductDashboard.__new__(ProductDashboard)
     dashboard.cfg = SimpleNamespace(tools=SimpleNamespace(mode="both"))
     dashboard.capture = SimpleNamespace(warning_mode=True)
 
-    assert dashboard._visual_required_for_quality(None) is False
+    assert dashboard._visual_required_for_quality(None) is True
 
     dashboard.capture.warning_mode = False
     assert dashboard._visual_required_for_quality(None) is True
     assert dashboard._visual_required_for_quality(np.zeros((2, 2, 3))) is True
 
 
-def test_dashboard_selects_newest_thermal_during_warning_mode(monkeypatch):
+def test_dashboard_keeps_visual_pair_policy_during_warning_compat(monkeypatch):
     dashboard = ProductDashboard.__new__(ProductDashboard)
     dashboard.cfg = SimpleNamespace(
         tools=SimpleNamespace(mode="both"),
@@ -51,7 +51,7 @@ def test_dashboard_selects_newest_thermal_during_warning_mode(monkeypatch):
     pair = dashboard._latest_pair()
 
     assert pair == {"base": "latest"}
-    assert calls == [("/dataset", {"visual_mode": False})]
+    assert calls == [("/dataset", {"visual_mode": True})]
 
 
 def test_dashboard_keeps_visual_grace_in_normal_both_mode(monkeypatch):

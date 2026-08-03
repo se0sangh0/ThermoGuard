@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from ..config import RoiEntry, load_config, save_config
+from ..config import RoiEntry, load_config
 
 
 try:
@@ -394,6 +394,14 @@ class RoiTkDialog:
         if not self.rois:
             messagebox.showwarning("ROI 설정", "ROI를 하나 이상 지정하세요.", parent=self.win)
             return
+        if self.save_handler is None:
+            messagebox.showerror(
+                "ROI DB 저장 미구성",
+                "ROI는 DB 관리값이므로 저장 처리기가 필요합니다.\n"
+                "ProductDashboard의 환경설정 화면에서 다시 시도하세요.",
+                parent=self.win,
+            )
+            return False
         entries = []
         for roi in self.rois:
             # hull boundary check: 네 꼭짓점이 모두 hull 안에 있어야 통과
@@ -460,33 +468,24 @@ class RoiTkDialog:
             ))
         if not entries:
             return False
-        if self.save_handler is not None:
-            try:
-                self.save_handler(entries)
-            except Exception as exc:
-                messagebox.showerror(
-                    "ROI DB 저장 실패",
-                    "ROI를 데이터베이스에 저장하지 못했습니다.\n"
-                    "입력한 영역은 유지되므로 연결 상태를 확인한 뒤 다시 저장하세요.\n\n"
-                    f"{exc}",
-                    parent=self.win,
-                )
-                return
+        try:
+            self.save_handler(entries)
+        except Exception as exc:
+            messagebox.showerror(
+                "ROI DB 저장 실패",
+                "ROI를 데이터베이스에 저장하지 못했습니다.\n"
+                "입력한 영역은 유지되므로 연결 상태를 확인한 뒤 다시 저장하세요.\n\n"
+                f"{exc}",
+                parent=self.win,
+            )
+            return False
         self.cfg.roi.rois = entries
         first = entries[0]
         self.cfg.roi.x1, self.cfg.roi.y1 = first.x1, first.y1
         self.cfg.roi.x2, self.cfg.roi.y2 = first.x2, first.y2
-        try:
-            save_config(self.cfg)
-        except Exception as exc:
-            messagebox.showerror(
-                "ROI 저장 실패",
-                f"config.json 저장 중 오류가 발생했습니다.\n{exc}",
-                parent=self.win,
-            )
-            return
         self.result = True
         self.close()
+        return True
 
     def close(self):
         try:

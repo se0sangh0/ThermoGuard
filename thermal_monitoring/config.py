@@ -1,46 +1,81 @@
+"""ThermoGuard 로컬 경로 설정과 런타임 기본값.
+
+``config.json``은 장비마다 달라지는 로컬 경로만 영속화합니다. 카메라,
+설비 식별자, ROI, Threshold 같은 운영값은 DB에서 주입하는 런타임 값이며,
+인터벌과 기타 비경로 값은 이 모듈의 명명된 기본 상수에서 시작합니다.
+
+기존 호출자의 단계적 전환을 위해 ``AppConfig``의 공개 필드 형상은 유지합니다.
 """
-config.py - 통합 설정 모듈 (Unified Config Module)
 
-모든 설정을 config.json 하나로 관리합니다.
-최초 실행 시 roi_config.json, experiment_config.json에서 자동 이관(migration)합니다.
-
-사용법:
-    from config import load_config
-
-    cfg = load_config()
-    print(cfg.roi.baseline_temp)   # 23.0
-    print(cfg.camera.ip)             # 192.168.0.51
-"""
+from __future__ import annotations
 
 import json
 import os
-import shutil
-from dataclasses import dataclass, field, asdict
+import tempfile
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
+
 CONFIG_PATH = "config.json"
-OLD_ROI_CONFIG = "roi_config.json"
-OLD_EXP_CONFIG = "experiment_config.json"
 
+# 비경로 런타임 기본값. DB hydration 전의 안전한 시작값이며 JSON에서 읽지 않습니다.
+NORMAL_CAPTURE_INTERVAL_SEC: float = 30.0
+TEMP_MONITOR_INTERVAL_SEC: float = 5.0
+PROCESS_INTERVAL_SEC: float = 10.0
+INTEGRITY_INTERVAL_SEC: float = 60.0
+METADATA_INTERVAL_SEC: float = 120.0
+MAX_PROCESSED_CACHE: int = 10000
+ALARM_COOLDOWN_SEC: float = 600.0
+CLEANUP_RETENTION_DAYS: int = 2
 
-# ════════════════════════════════════════════════════════════
-# Dataclass definitions
-# ════════════════════════════════════════════════════════════
+DEFAULT_CAMERA_IP = "192.168.0.51"
+DEFAULT_CAMERA_ID = "CAM-01"
+DEFAULT_ROBOT_ID = "Robot-01"
+DEFAULT_FACTORY_NAME = ""
+DEFAULT_LINE_NAME = ""
+DEFAULT_ROBOT_NAME = ""
+
+DEFAULT_ROI_X1 = 0
+DEFAULT_ROI_Y1 = 0
+DEFAULT_ROI_X2 = 640
+DEFAULT_ROI_Y2 = 480
+DEFAULT_BASELINE_TEMP = 35.0
+DEFAULT_WARNING_DELTA = 15.0
+DEFAULT_CRITICAL_DELTA = 25.0
+
+DEFAULT_HOTSPOT_MIN_SIZE = 3
+DEFAULT_HOTSPOT_MIN_SIZE_MAX = 10
+DEFAULT_ROI_DISPLAY_WIDTH = 640
+DEFAULT_ROI_DISPLAY_HEIGHT = 480
+DEFAULT_DISPLAY_WIDTH = 800
+DEFAULT_TOOLS_MODE = "both"
+DEFAULT_LOG_DIR = "logs"
+
+DEFAULT_BACKEND_URL = "http://127.0.0.1:8000"
+DEFAULT_BACKEND_ENABLED = True
+DEFAULT_BACKEND_TIMEOUT_SEC = 5.0
+
+DEFAULT_DATASET_DIR = "thermal_dataset"
+DEFAULT_OVERLAY_DIR = "thermal_dataset/overlay"
+DEFAULT_HOMOGRAPHY_PATH = "thermal_to_rgb.npy"
+DEFAULT_EXIFTOOL_PATH = ""
+
 
 @dataclass
 class CameraConfig:
-    ip: str = "192.168.0.51"
-    capture_interval_sec: float = 30.0
-    warning_interval_sec: float = 5.0
+    ip: str = DEFAULT_CAMERA_IP
+    capture_interval_sec: float = NORMAL_CAPTURE_INTERVAL_SEC
+    # 호환 필드입니다. GigE 감시/REST 캡처 분리 전까지 기존 호출자가 사용합니다.
+    warning_interval_sec: float = TEMP_MONITOR_INTERVAL_SEC
 
 
 @dataclass
 class IdentityConfig:
-    camera_id: str = "CAM-01"
-    robot_id: str = "Robot-01"
-    factory_name: str = ""
-    line_name: str = ""
-    robot_name: str = ""
+    camera_id: str = DEFAULT_CAMERA_ID
+    robot_id: str = DEFAULT_ROBOT_ID
+    factory_name: str = DEFAULT_FACTORY_NAME
+    line_name: str = DEFAULT_LINE_NAME
+    robot_name: str = DEFAULT_ROBOT_NAME
     factory_id: int | None = None
     line_id: int | None = None
     db_robot_id: int | None = None
@@ -49,70 +84,73 @@ class IdentityConfig:
 
 @dataclass
 class RoiEntry:
-    """개별 ROI 영역 정의"""
+    """개별 ROI 영역 정의."""
+
     name: str = "ROI-1"
-    x1: int = 0
-    y1: int = 0
-    x2: int = 640
-    y2: int = 480
+    x1: int = DEFAULT_ROI_X1
+    y1: int = DEFAULT_ROI_Y1
+    x2: int = DEFAULT_ROI_X2
+    y2: int = DEFAULT_ROI_Y2
     db_roi_id: int | None = None
 
 
 @dataclass
 class RoiConfig:
-    """ROI 설정 — 다중 영역 지원 (rois 리스트). 비어있으면 x1/y1/x2/y2 폴백."""
-    x1: int = 0
-    y1: int = 0
-    x2: int = 640
-    y2: int = 480
-    baseline_temp: float = 35.0
-    warning_delta: float = 15.0
-    critical_delta: float = 25.0
-    rois: list = field(default_factory=list)  # list[RoiEntry]
+    """ROI 설정 — DB hydration 전에는 코드 기본값을 사용합니다."""
+
+    x1: int = DEFAULT_ROI_X1
+    y1: int = DEFAULT_ROI_Y1
+    x2: int = DEFAULT_ROI_X2
+    y2: int = DEFAULT_ROI_Y2
+    baseline_temp: float = DEFAULT_BASELINE_TEMP
+    warning_delta: float = DEFAULT_WARNING_DELTA
+    critical_delta: float = DEFAULT_CRITICAL_DELTA
+    rois: list[RoiEntry] = field(default_factory=list)
 
 
 @dataclass
 class MonitoringConfig:
-    process_interval_sec: float = 10.0
-    integrity_interval_sec: float = 60.0
-    metadata_interval_sec: float = 120.0
-    max_processed_cache: int = 10000
-    alarm_cooldown_sec: float = 600.0
-    cleanup_retention_days: int = 2
+    process_interval_sec: float = PROCESS_INTERVAL_SEC
+    integrity_interval_sec: float = INTEGRITY_INTERVAL_SEC
+    metadata_interval_sec: float = METADATA_INTERVAL_SEC
+    max_processed_cache: int = MAX_PROCESSED_CACHE
+    alarm_cooldown_sec: float = ALARM_COOLDOWN_SEC
+    cleanup_retention_days: int = CLEANUP_RETENTION_DAYS
 
 
 @dataclass
 class HotspotConfig:
-    min_size: int = 3
-    min_size_max: int = 10
+    min_size: int = DEFAULT_HOTSPOT_MIN_SIZE
+    min_size_max: int = DEFAULT_HOTSPOT_MIN_SIZE_MAX
 
 
 @dataclass
 class PathsConfig:
-    dataset_dir: str = "thermal_dataset"
-    overlay_dir: str = "thermal_dataset/overlay"
-    homography_path: str = "thermal_to_rgb.npy"
+    dataset_dir: str = DEFAULT_DATASET_DIR
+    overlay_dir: str = DEFAULT_OVERLAY_DIR
+    homography_path: str = DEFAULT_HOMOGRAPHY_PATH
 
 
 @dataclass
 class DisplayConfig:
-    roi_display_width: int = 640
-    roi_display_height: int = 480
-    display_width: int = 800
+    roi_display_width: int = DEFAULT_ROI_DISPLAY_WIDTH
+    roi_display_height: int = DEFAULT_ROI_DISPLAY_HEIGHT
+    display_width: int = DEFAULT_DISPLAY_WIDTH
 
 
 @dataclass
 class ToolsConfig:
-    exiftool_path: str = ""
-    mode: str = "both"
+    exiftool_path: str = DEFAULT_EXIFTOOL_PATH
+    mode: str = DEFAULT_TOOLS_MODE
 
 
 @dataclass
 class BackendConfig:
-    """thermal_monitoring ↔ Backend API 연동 설정"""
-    url: str = "http://127.0.0.1:8000"
-    enabled: bool = True
-    timeout_sec: float = 5.0
+    """thermal_monitoring ↔ Backend API 런타임 연결 기본값."""
+
+    url: str = DEFAULT_BACKEND_URL
+    enabled: bool = DEFAULT_BACKEND_ENABLED
+    timeout_sec: float = DEFAULT_BACKEND_TIMEOUT_SEC
 
 
 @dataclass
@@ -128,147 +166,121 @@ class AppConfig:
     backend: BackendConfig = field(default_factory=BackendConfig)
 
 
-# ════════════════════════════════════════════════════════════
-# Internal helpers
-# ════════════════════════════════════════════════════════════
-
-def _dict_to_dataclass(d: dict, dc: type):
-    """중첩 dict를 dataclass 인스턴스로 변환"""
-    field_names = {f.name for f in dc.__dataclass_fields__.values()}
-    kwargs = {}
-    for k, v in d.items():
-        if k in field_names:
-            kwargs[k] = v
-    return dc(**kwargs)
-
-
-def _from_dict(raw: dict) -> AppConfig:
-    roi_raw = raw.get("roi", {})
-    rois_list = []
-    for entry in roi_raw.get("rois", []):
-        if isinstance(entry, dict):
-            rois_list.append(RoiEntry(
-                name=entry.get("name", "ROI"),
-                x1=int(entry.get("x1", 0)),
-                y1=int(entry.get("y1", 0)),
-                x2=int(entry.get("x2", 640)),
-                y2=int(entry.get("y2", 480)),
-                db_roi_id=entry.get("db_roi_id"),
-            ))
-
-    roi_config = _dict_to_dataclass(roi_raw, RoiConfig)
-    roi_config.rois = rois_list
-
-    return AppConfig(
-        camera=_dict_to_dataclass(raw.get("camera", {}), CameraConfig),
-        identity=_dict_to_dataclass(raw.get("identity", {}), IdentityConfig),
-        roi=roi_config,
-        monitoring=_dict_to_dataclass(raw.get("monitoring", {}), MonitoringConfig),
-        hotspot=_dict_to_dataclass(raw.get("hotspot", {}), HotspotConfig),
-        paths=_dict_to_dataclass(raw.get("paths", {}), PathsConfig),
-        display=_dict_to_dataclass(raw.get("display", {}), DisplayConfig),
-        tools=_dict_to_dataclass(raw.get("tools", {}), ToolsConfig),
-        backend=_dict_to_dataclass(raw.get("backend", {}), BackendConfig),
-    )
-
-
-def _backup_and_remove(filepath: str) -> None:
-    """파일을 .bak으로 백업"""
-    if os.path.isfile(filepath):
-        bak_path = filepath + ".bak"
-        try:
-            shutil.move(filepath, bak_path)
-            print(f"[config] Migrated: {filepath} → {bak_path}")
-        except OSError:
-            pass
-
-
-# ════════════════════════════════════════════════════════════
-# Load / Save
-# ════════════════════════════════════════════════════════════
-
 _cached_config: Optional[AppConfig] = None
+_cached_config_path: Optional[str] = None
+
+
+def _path_config_from_raw(
+    raw: object,
+    runtime_config: Optional[AppConfig] = None,
+) -> AppConfig:
+    """경로 전용 JSON을 AppConfig 호환 객체에 병합합니다."""
+
+    cfg = runtime_config or AppConfig()
+    # force_reload 시 파일/키가 삭제된 경우에도 이전 로컬 경로가 캐시에
+    # 잔류하지 않도록, 영속 대상 필드만 먼저 기본값으로 되돌립니다.
+    cfg.paths = PathsConfig()
+    cfg.tools.exiftool_path = DEFAULT_EXIFTOOL_PATH
+    if not isinstance(raw, dict):
+        return cfg
+
+    paths_raw = raw.get("paths")
+    if isinstance(paths_raw, dict):
+        allowed = PathsConfig.__dataclass_fields__
+        path_values = {
+            key: str(value)
+            for key, value in paths_raw.items()
+            if key in allowed and value is not None
+        }
+        cfg.paths = PathsConfig(**path_values)
+
+    tools_raw = raw.get("tools")
+    if isinstance(tools_raw, dict) and tools_raw.get("exiftool_path") is not None:
+        cfg.tools.exiftool_path = str(tools_raw["exiftool_path"])
+    return cfg
 
 
 def load_config(config_path: str = CONFIG_PATH, force_reload: bool = False) -> AppConfig:
-    """
-    통합 설정을 로드. config.json이 없으면 기존 파일에서 자동 이관.
+    """로컬 경로를 읽고 비경로 필드는 코드 기본값으로 구성합니다.
 
-    Args:
-        config_path: 설정 파일 경로
-        force_reload: True이면 캐시를 무시하고 다시 읽음
+    레거시 JSON에 비경로 키가 남아 있어도 읽지 않습니다. DB 관리값의 실제
+    hydration은 호출 계층이 반환된 ``AppConfig``에 적용해야 합니다.
     """
-    global _cached_config
 
-    if _cached_config is not None and not force_reload:
+    global _cached_config, _cached_config_path
+
+    normalized_path = os.path.abspath(config_path)
+    if (
+        _cached_config is not None
+        and _cached_config_path == normalized_path
+        and not force_reload
+    ):
         return _cached_config
 
-    # 이미 config.json이 있으면 바로 로드
-    if os.path.isfile(config_path):
+    cfg = (
+        _cached_config
+        if _cached_config is not None and _cached_config_path == normalized_path
+        else AppConfig()
+    )
+    # 파일이 사라진 경우에도 로컬 영속 필드는 기본값으로 복원하되,
+    # 같은 객체에 DB에서 주입된 비경로 런타임 값은 유지합니다.
+    cfg = _path_config_from_raw({}, cfg)
+    if os.path.isfile(normalized_path):
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            _cached_config = _from_dict(raw)
-            return _cached_config
-        except (json.JSONDecodeError, TypeError) as e:
-            print(f"[config] WARNING: Failed to parse {config_path}: {e}")
-            print("[config] Falling back to defaults + migration")
-
-    # config.json 없음 → 기본값 + 이전 파일에서 이관
-    cfg = AppConfig()
-
-    migrated = False
-
-    # roi_config.json → AppConfig.roi
-    if os.path.isfile(OLD_ROI_CONFIG):
-        try:
-            with open(OLD_ROI_CONFIG, "r", encoding="utf-8") as f:
-                old = json.load(f)
-            roi = old.get("thermal_roi", {})
-            cfg.roi.x1 = int(roi.get("x1", cfg.roi.x1))
-            cfg.roi.y1 = int(roi.get("y1", cfg.roi.y1))
-            cfg.roi.x2 = int(roi.get("x2", cfg.roi.x2))
-            cfg.roi.y2 = int(roi.get("y2", cfg.roi.y2))
-            cfg.roi.baseline_temp = float(old.get("baseline_temp", cfg.roi.baseline_temp))
-            cfg.roi.warning_delta = float(old.get("warning_delta", cfg.roi.warning_delta))
-            cfg.roi.critical_delta = float(old.get("critical_delta", cfg.roi.critical_delta))
-            print(f"[config] Migrated settings from {OLD_ROI_CONFIG}")
-            migrated = True
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            print(f"[config] WARNING: Failed to migrate {OLD_ROI_CONFIG}: {e}")
-
-    # experiment_config.json → AppConfig.identity
-    if os.path.isfile(OLD_EXP_CONFIG):
-        try:
-            with open(OLD_EXP_CONFIG, "r", encoding="utf-8") as f:
-                old = json.load(f)
-            cfg.identity.camera_id = str(old.get("camera_id", cfg.identity.camera_id))
-            cfg.identity.robot_id = str(old.get("robot_id", cfg.identity.robot_id))
-            print(f"[config] Migrated settings from {OLD_EXP_CONFIG}")
-            migrated = True
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            print(f"[config] WARNING: Failed to migrate {OLD_EXP_CONFIG}: {e}")
-
-    # 새 config.json 저장
-    save_config(cfg, config_path)
-
-    # 이관 완료된 파일 → .bak 백업
-    if migrated:
-        _backup_and_remove(OLD_ROI_CONFIG)
-        _backup_and_remove(OLD_EXP_CONFIG)
+            with open(normalized_path, "r", encoding="utf-8") as stream:
+                cfg = _path_config_from_raw(json.load(stream), cfg)
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            print(f"[config] WARNING: Failed to read {normalized_path}: {exc}")
 
     _cached_config = cfg
-    return _cached_config
+    _cached_config_path = normalized_path
+    return cfg
 
 
 def save_config(cfg: AppConfig, config_path: str = CONFIG_PATH) -> None:
-    """현재 설정을 config.json에 저장"""
-    raw = asdict(cfg)
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2, ensure_ascii=False)
+    """로컬 경로만 같은 디렉터리의 임시 파일을 거쳐 원자 저장합니다."""
+
+    global _cached_config, _cached_config_path
+
+    normalized_path = os.path.abspath(config_path)
+    parent_dir = os.path.dirname(normalized_path)
+    os.makedirs(parent_dir, exist_ok=True)
+    payload = {
+        "paths": asdict(cfg.paths),
+        "tools": {"exiftool_path": str(cfg.tools.exiftool_path)},
+    }
+
+    temporary_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=parent_dir,
+            prefix=f".{os.path.basename(normalized_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = stream.name
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        os.replace(temporary_path, normalized_path)
+        temporary_path = None
+        _cached_config = cfg
+        _cached_config_path = normalized_path
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
 
 
 def reset_cache() -> None:
-    """캐시 초기화 (테스트용)"""
-    global _cached_config
+    """런타임 설정 캐시를 초기화합니다(주로 테스트용)."""
+
+    global _cached_config, _cached_config_path
     _cached_config = None
+    _cached_config_path = None

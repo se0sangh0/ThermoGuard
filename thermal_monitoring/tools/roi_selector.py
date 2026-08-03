@@ -31,11 +31,11 @@ from tkinter import messagebox
 import cv2
 import numpy as np
 
-from ..config import load_config, save_config, RoiEntry
+from ..config import DEFAULT_DISPLAY_WIDTH, RoiEntry, load_config
 
 cfg = load_config()
 DATASET_DIR = cfg.paths.dataset_dir
-DISPLAY_WIDTH = cfg.display.display_width
+DISPLAY_WIDTH = DEFAULT_DISPLAY_WIDTH
 
 # ── UI 상수 ──
 BUTTON_BAR_HEIGHT = 44
@@ -58,6 +58,7 @@ thermal_resolution = (640, 480) # 최종 저장 좌표계 기준
 _running = False                # main loop 실행 중 여부
 _quit_flag = False              # Q / ESC (저장 없이 종료)
 _save_flag = False              # S (저장 후 종료)
+_save_handler = None            # ROI DB 저장 callback; config.json에는 ROI를 저장하지 않음
 
 ROI_COLORS = [
     (0, 255, 0),    # 초록
@@ -163,13 +164,14 @@ def undo_last_action() -> int:
     return selected_idx
 
 
-def save_and_exit() -> bool:
+def save_and_exit(save_handler=None) -> bool:
     """모든 ROI 저장 후 종료 플래그 설정. 성공 여부 반환."""
     global _save_flag
     if rois:
-        _save_all_rois()
-        _save_flag = True
-        return True
+        saved = _save_all_rois(save_handler=save_handler)
+        if saved:
+            _save_flag = True
+        return saved
     print("No ROI defined. Add at least one ROI with New button or drag on the image.")
     return False
 
@@ -339,8 +341,8 @@ def load_existing_rois():
     return len(rois)
 
 
-def _save_all_rois():
-    """config.json에 모든 ROI 저장 (visual 모드면 thermal 좌표로 변환)"""
+def _save_all_rois(save_handler=None) -> bool:
+    """ROI 좌표를 변환해 DB 저장 callback과 런타임 설정에 반영합니다."""
     c = load_config(force_reload=True)
     entries = []
     for r in rois:
@@ -410,17 +412,36 @@ def _save_all_rois():
         entries.append({"name": r["name"], "x1": x1, "y1": y1, "x2": x2, "y2": y2})
     if not entries:
         print("[roi_selector] 모든 ROI가 유효하지 않아 저장을 취소합니다.")
-        return
-    c.roi.rois = entries
+        return False
+
+    handler = save_handler or _save_handler
+    if handler is None:
+        messagebox.showerror(
+            "ROI DB 저장 미구성",
+            "ROI는 DB 관리값이므로 저장 처리기가 필요합니다.\n"
+            "ProductDashboard의 환경설정 화면에서 다시 시도하세요.",
+        )
+        print("[roi_selector] DB save handler is required; ROI was not saved.")
+        return False
+
+    runtime_entries = [RoiEntry(**entry) for entry in entries]
+    try:
+        handler(runtime_entries)
+    except Exception as exc:
+        messagebox.showerror("ROI DB 저장 실패", str(exc))
+        print(f"[roi_selector] ROI DB save failed: {exc}")
+        return False
+
+    c.roi.rois = runtime_entries
     if entries:
         c.roi.x1 = entries[0]["x1"]
         c.roi.y1 = entries[0]["y1"]
         c.roi.x2 = entries[0]["x2"]
         c.roi.y2 = entries[0]["y2"]
-    save_config(c)
-    print(f"[roi_selector] {len(entries)} ROI(s) saved to config.json in thermal 640×480 coordinates:")
+    print(f"[roi_selector] {len(entries)} ROI(s) saved to DB and applied at runtime:")
     for e in entries:
         print(f"  {e['name']}: ({e['x1']},{e['y1']})-({e['x2']},{e['y2']})")
+    return True
 
 
 def _get_color(idx: int) -> tuple:
@@ -431,10 +452,12 @@ def _get_color(idx: int) -> tuple:
 #  main
 # ───────────────────────────────────────────────────────────────
 
-def main(event_pump=None, display_bounds=None):
+def main(event_pump=None, display_bounds=None, save_handler=None):
     global scale, selected_idx, rois, roi_start, roi_end, dragging
     global H_inv, use_visual, _running, _quit_flag, _save_flag
-    global _canvas_h, _canvas_w, _image_x_offset, _display_image_h
+    global _canvas_h, _canvas_w, _image_x_offset, _display_image_h, _save_handler
+
+    _save_handler = save_handler
 
     # ── 인자 파싱 ──
     thermal_path: str | None = None

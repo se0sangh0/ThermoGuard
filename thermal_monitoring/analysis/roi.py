@@ -1,9 +1,4 @@
-"""
-roi.py - ROI 설정 및 온도 통계 추출
-
-config.json에서 ROI 좌표를 불러와 .npy 온도 행렬에서
-해당 영역의 온도 통계값을 계산합니다.
-"""
+"""DB에서 주입된 런타임 ROI로 온도 통계를 추출합니다."""
 
 import os
 from dataclasses import dataclass, field
@@ -12,14 +7,20 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from ..config import load_config, RoiConfig as AppRoiConfig, RoiEntry
+from ..config import (
+    DEFAULT_ROI_DISPLAY_HEIGHT,
+    DEFAULT_ROI_DISPLAY_WIDTH,
+    RoiConfig as AppRoiConfig,
+    RoiEntry,
+    load_config,
+)
 from ..logger import get_logger
 
 _log = get_logger("analysis.roi")
 
 # Thermal 이미지 vs .npy 해상도 차이 보정
-DISPLAY_W = load_config().display.roi_display_width
-DISPLAY_H = load_config().display.roi_display_height
+DISPLAY_W = DEFAULT_ROI_DISPLAY_WIDTH
+DISPLAY_H = DEFAULT_ROI_DISPLAY_HEIGHT
 
 # 하위 호환을 위한 wrapper
 RoiConfig = AppRoiConfig
@@ -40,7 +41,7 @@ class RoiResult:
 
 
 def load_roi_config() -> RoiConfig:
-    """config.json 에서 ROI 설정 불러오기 (다중 ROI 지원)"""
+    """DB hydration이 적용된 런타임 ROI 설정을 불러옵니다."""
     cfg = load_config()
     rois_list = []
     for entry in cfg.roi.rois:
@@ -99,7 +100,7 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
 
     Args:
         npy_path: .npy 파일 경로
-        config: ROI 설정 (None이면 roi_config.json 자동 로드)
+        config: ROI 설정 (None이면 런타임 설정 사용)
 
     Returns:
         RoiResult (roi_thermal, max_temp, mean_temp, hot_temp_95, roi_bounds)

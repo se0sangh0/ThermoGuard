@@ -18,7 +18,7 @@ import sys
 import os
 import glob
 
-from ..config import load_config
+from ..config import DEFAULT_DISPLAY_WIDTH, load_config
 
 thermal_pts = []
 rgb_pts = []
@@ -129,7 +129,7 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
 
     cfg = load_config()
     DATASET_DIR = cfg.paths.dataset_dir
-    DISPLAY_WIDTH = cfg.display.display_width
+    DISPLAY_WIDTH = DEFAULT_DISPLAY_WIDTH
 
     if thermal_path is None:
         if len(sys.argv) >= 3:

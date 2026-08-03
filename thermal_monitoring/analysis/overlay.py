@@ -14,7 +14,11 @@ import sys
 import cv2
 import numpy as np
 
-from ..config import load_config
+from ..config import (
+    DEFAULT_ROI_DISPLAY_HEIGHT,
+    DEFAULT_ROI_DISPLAY_WIDTH,
+    load_config,
+)
 from ..logger import get_logger
 
 _log = get_logger("analysis.overlay")
@@ -23,8 +27,8 @@ cfg = load_config()
 DATASET_DIR = cfg.paths.dataset_dir
 HOMOGRAPHY_PATH = cfg.paths.homography_path
 OVERLAY_DIR = cfg.paths.overlay_dir
-DISPLAY_W = cfg.display.roi_display_width
-DISPLAY_H = cfg.display.roi_display_height
+DISPLAY_W = DEFAULT_ROI_DISPLAY_WIDTH
+DISPLAY_H = DEFAULT_ROI_DISPLAY_HEIGHT
 
 # 시각화 스타일
 ROI_COLOR_NORMAL = (0, 255, 0)    # 초록

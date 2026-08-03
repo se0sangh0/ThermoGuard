@@ -3,7 +3,7 @@
 대시보드·monitor·도구가 각자 dataset.glob(...)로 재구현하던 "쌍 찾기" 로직을
 한곳으로 모은다. 파일명 규약:
     {base}.jpg            → thermal
-    {base}_visual.jpg     → visual (정상 모드에서만 저장; 과열 모드는 thermal-only)
+    {base}_visual.jpg     → visual (mode=both인 정기/명시 캡처에서 저장)
     {base}_thermal.npy    → 온도 행렬 (JPEG에서 지연 추출)
 """
 
@@ -41,9 +41,8 @@ def npy_for(thermal: Path) -> Path:
 def latest_complete_pair(dataset_dir) -> Optional[tuple[Path, Path]]:
     """visual이 존재하는 가장 최근 (thermal, visual) 쌍. 없으면 None.
 
-    과열(경고) 모드에서는 최신 thermal에 visual이 없을 수 있으므로,
-    visual이 있는 가장 최근 thermal까지 거슬러 찾는다. ROI·캘리브레이션
-    도구가 과열 중에도 마지막 완성 쌍으로 동작할 수 있게 한다.
+    이전 버전의 thermal-only 파일이나 불완전 캡처가 남아 있을 수 있으므로,
+    visual이 있는 가장 최근 thermal까지 거슬러 찾습니다.
     """
     for thermal in reversed(thermal_jpgs(dataset_dir)):
         visual = visual_for(thermal)

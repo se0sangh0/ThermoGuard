@@ -40,7 +40,7 @@ from ..data.cleanup import run_cleanup_if_due
 from ..data.metadata import run_metadata
 from ..data.pairs import capture_time_from_file, latest_analysis_pair
 from ..data.quality import assess_image_quality
-from ..config import load_config, save_config
+from ..config import NORMAL_CAPTURE_INTERVAL_SEC, load_config, save_config
 from ..logger import get_logger
 from .telegram_dispatcher import TelegramDispatcher
 
@@ -93,7 +93,6 @@ class RuntimeMetrics:
 
 class ProductDashboard:
     REFRESH_SECONDS = 30
-    REFRESH_FAST_SECONDS = 5    # Warning/Critical 상태일 때 분석 간격
     TREND_HISTORY_DAYS = 7
     TREND_API_LIMIT = 150000
     TREND_DRAW_POINTS = 1000
@@ -921,29 +920,11 @@ class ProductDashboard:
         self.capture_paused_by_user = False
         self.monitoring = True
         self.capture_toggle_button.configure(text="■  촬영 정지")
-        roi = self.cfg.roi
-        baseline = roi.baseline_temp
-        warning_delta = roi.warning_delta
-
-        def _probe_callback(max_temp: float) -> bool:
-            capture = self.capture
-            if not self.monitoring or capture is None:
-                return False
-            if max_temp >= baseline + warning_delta:
-                capture.set_warning_mode(True)
-                self._schedule_refresh(100)  # 즉시 분석 가속
-                w_interval = getattr(capture, '_warning_interval', 5.0)
-                self._add_operating_log("프로브", "과열 감지", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
-                return True
-            else:
-                capture.set_warning_mode(False)
-                return False
 
         self.capture = CaptureSession(
             cam_ip=self.cfg.camera.ip, mode=self.cfg.tools.mode,
-            interval=max(10.0, float(self.cfg.camera.capture_interval_sec)),
+            interval=NORMAL_CAPTURE_INTERVAL_SEC,
             save_dir=self.cfg.paths.dataset_dir, log_callback=self._capture_log,
-            probe_callback=_probe_callback,
         )
         self.capture.start()
 
@@ -1214,26 +1195,14 @@ class ProductDashboard:
 
     def _latest_pair(self):
         """Return the newest thermal, visual and NPY paths for analysis."""
-        capture = self.capture
-        thermal_only_warning = bool(
-            capture is not None and capture.warning_mode
-        )
         return latest_analysis_pair(
             self.cfg.paths.dataset_dir,
-            visual_mode=(
-                self.cfg.tools.mode == "both"
-                and not thermal_only_warning
-            ),
+            visual_mode=self.cfg.tools.mode == "both",
         )
 
     def _visual_required_for_quality(self, visual_img) -> bool:
-        """Require visual frames except during the intentional thermal-only warning mode."""
-        if self.cfg.tools.mode != "both":
-            return False
-        if visual_img is not None:
-            return True
-        capture = self.capture
-        return not (capture is not None and capture.warning_mode)
+        """Require visual frames whenever the configured image mode is ``both``."""
+        return self.cfg.tools.mode == "both"
 
     def _process_pair_to_dict(self, pair: dict) -> dict:
         base = pair["base"]
@@ -1316,11 +1285,7 @@ class ProductDashboard:
             "captured_at": captured_at,
             "image_quality_ok": image_quality_ok,
             "image_quality_reason": image_quality_reason,
-            "thermal_only_mode": (
-                self.cfg.tools.mode == "both"
-                and visual_img is None
-                and not visual_required
-            ),
+            "thermal_only_mode": self.cfg.tools.mode != "both",
         }
 
     def _apply_analysis_result(self, result: dict, generation: int):
@@ -1337,7 +1302,7 @@ class ProductDashboard:
         capture_id = str(result.get("base", ""))
         freshness_limit = max(
             self.REFRESH_SECONDS * 2,
-            float(self.cfg.camera.capture_interval_sec) * 2,
+            NORMAL_CAPTURE_INTERVAL_SEC * 2,
         ) + 5.0
         capture_age = max(0.0, (datetime.now() - captured_at).total_seconds())
         self._latest_pair_fresh = capture_age <= freshness_limit
@@ -1364,11 +1329,11 @@ class ProductDashboard:
             result["_local_event_id"] = local_event["id"]
             self._last_alert_capture = captured_at
         elif status == Status.NORMAL and previous != Status.NORMAL:
-            if self.capture:
-                self.capture.set_warning_mode(False)
-            self._add_operating_log("과열 해제", "정상 복귀",
-                                    f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
-                                    else "정상 복귀")
+            self._add_operating_log(
+                "과열 해제",
+                "정상 복귀",
+                "온도 상태 정상화 · REST 캡처 주기 유지",
+            )
 
         # 새로 촬영된 이미지일 때만 백엔드 DB에 측정값을 기록한다.
         if (
@@ -1462,7 +1427,7 @@ class ProductDashboard:
             stamp = captured_at.strftime("촬영 시각 %Y-%m-%d %H:%M:%S")
             self.thermal_stamp.configure(text=stamp)
             if result.get("thermal_only_mode", False):
-                self.visual_stamp.configure(text="과열 모드 · 가시광 촬영 생략")
+                self.visual_stamp.configure(text="열화상 전용 모드 · 가시광 촬영 생략")
             else:
                 self.visual_stamp.configure(text=stamp)
         else:

@@ -12,8 +12,7 @@ monitor.py 실시간 감시나 tools.py GUI에서 백그라운드로 동작합�
     from cleanup import run_cleanup_if_due
     run_cleanup_if_due(save_dir=..., retention_days=7)
 
-설정:
-    config.json의 monitoring.cleanup_retention_days (기본 7일)
+기본 보존 기간은 코드 전역 상수로 관리하며 호출자가 명시적으로 덮어쓸 수 있습니다.
 """
 
 import csv
@@ -23,12 +22,12 @@ import glob
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
+from ..config import CLEANUP_RETENTION_DAYS
 from ..logger import get_logger
 
 _logger = get_logger("data.cleanup")
 
 _RELATIVE_SAVE_DIR = "thermal_dataset"
-_DEFAULT_RETENTION_DAYS = 2
 
 
 @dataclass
@@ -102,7 +101,7 @@ def _get_file_size(path: str) -> int:
 
 def run_cleanup(
     save_dir: str | None = None,
-    retention_days: int = _DEFAULT_RETENTION_DAYS,
+    retention_days: int = CLEANUP_RETENTION_DAYS,
     log_callback=None,
 ) -> CleanupResult:
     """
@@ -273,7 +272,7 @@ _CLEANUP_INTERVAL_SEC = 900.0  # 15분
 
 def run_cleanup_if_due(
     save_dir: str | None = None,
-    retention_days: int = _DEFAULT_RETENTION_DAYS,
+    retention_days: int = CLEANUP_RETENTION_DAYS,
     log_callback=None,
 ) -> CleanupResult | None:
     """

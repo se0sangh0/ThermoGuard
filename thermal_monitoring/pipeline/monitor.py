@@ -25,7 +25,15 @@ from typing import Optional
 
 import numpy as np
 
-from ..config import load_config
+from ..config import (
+    DEFAULT_CAMERA_IP,
+    INTEGRITY_INTERVAL_SEC,
+    MAX_PROCESSED_CACHE as DEFAULT_MAX_PROCESSED_CACHE,
+    METADATA_INTERVAL_SEC,
+    NORMAL_CAPTURE_INTERVAL_SEC,
+    PROCESS_INTERVAL_SEC,
+    load_config,
+)
 from ..capture.capture import CaptureSession
 from ..data.checking import run_check
 from ..data.metadata import run_metadata
@@ -55,13 +63,13 @@ MAX_PARALLEL_PAIRS = max(2, (os.cpu_count() or 4) // 2)
 _log_monitor = get_logger("pipeline.monitor")
 
 # 처리 루프가 새 파일을 확인하는 주기 (초)
-PROCESS_INTERVAL = _cfg.monitoring.process_interval_sec
+PROCESS_INTERVAL = PROCESS_INTERVAL_SEC
 # 무결성 검사 주기 (초)
-INTEGRITY_INTERVAL = _cfg.monitoring.integrity_interval_sec
+INTEGRITY_INTERVAL = INTEGRITY_INTERVAL_SEC
 # 메타데이터 업데이트 주기 (초)
-METADATA_INTERVAL = _cfg.monitoring.metadata_interval_sec
+METADATA_INTERVAL = METADATA_INTERVAL_SEC
 # 처리 완료된 파일 캐시 최대 개수 (메모리 관리)
-MAX_PROCESSED_CACHE = _cfg.monitoring.max_processed_cache
+MAX_PROCESSED_CACHE = DEFAULT_MAX_PROCESSED_CACHE
 
 # 전송 실패한 CRITICAL 알람의 재시도 최소 간격 (초). CRITICAL이 지속되는 동안
 # 성공할 때까지 재시도하되, 네트워크 장애 시 과도한 요청을 막기 위한 백오프.
@@ -73,8 +81,8 @@ class MonitorSequencer:
 
     def __init__(
         self,
-        cam_ip: str = "192.168.0.51",
-        capture_interval: float = 1.0,
+        cam_ip: str = DEFAULT_CAMERA_IP,
+        capture_interval: float = NORMAL_CAPTURE_INTERVAL_SEC,
         process_interval: float = PROCESS_INTERVAL,
     ):
         self.cam_ip = cam_ip
@@ -100,8 +108,8 @@ class MonitorSequencer:
         """시작 시점에 이미 존재하는 모든 thermal base를 반환.
 
         _scan_new_pairs와 동일하게 thermal JPG 기준(visual 유무 무관)으로 스캔한다.
-        visual까지 요구하면, 이전 실행의 thermal-only(경고 모드) 잔여 파일이
-        프라임에서 누락되어 과거 데이터로 재분석/오알람될 수 있다.
+        이전 버전의 thermal-only 잔여 파일까지 포함해 과거 데이터의
+        재분석·오알람을 방지합니다.
         """
         if not os.path.isdir(DATASET_DIR):
             return set()
@@ -309,17 +317,18 @@ class MonitorSequencer:
             prev_status = self.state.status
             self.state.status = new_status
 
-            # 상태 변화 시 캡처 주기 전환
+            # 분석 상태와 REST 이미지 캡처 주기는 독립적입니다. 5초 온도 감시는
+            # 별도 TemperatureMonitor/GigE adapter가 담당하며 여기서 이미지를
+            # 추가로 생성하지 않습니다.
             if prev_status == Status.NORMAL and new_status != Status.NORMAL:
-                if self.capture:
-                    self.capture.set_warning_mode(True)
-                _log_monitor.info("Capture interval switched to warning mode (%.1fs) — status: %s",
-                                  _cfg.camera.warning_interval_sec, new_status.value)
+                _log_monitor.info(
+                    "Thermal state elevated: %s (REST capture interval unchanged)",
+                    new_status.value,
+                )
             elif prev_status != Status.NORMAL and new_status == Status.NORMAL:
-                if self.capture:
-                    self.capture.set_warning_mode(False)
-                _log_monitor.info("Capture interval restored to normal (%.1fs) — status: Normal",
-                                  _cfg.camera.capture_interval_sec)
+                _log_monitor.info(
+                    "Thermal state restored to Normal (REST capture interval unchanged)"
+                )
 
             self._status_counts[new_status.value] += 1
 
@@ -357,8 +366,7 @@ class MonitorSequencer:
                     self._log(f"Hotspots: {roi_result.hotspot_centroids}")
                     self._log(f"Count: {len(roi_result.hotspot_centroids)}")
 
-                    # 카메라 2중 접근 방지: 배경 캡처가 방금 저장한 최신 쌍을 재사용.
-                    # (경고 모드면 visual이 없어 thermal-only 오버레이로 폴백)
+                    # 카메라 2중 접근 방지: 정기/명시 캡처가 저장한 최신 쌍을 재사용.
                     overlay_thermal = pair["thermal_jpg"]
                     overlay_visual = pair["visual_jpg"]
                     if self.capture:
@@ -527,26 +535,14 @@ class MonitorSequencer:
 
         self._running = True
 
-        # 프로브 콜백: 캡처 대기 중 1초마다 경량 Thermal 체크
-        baseline = self.roi_config.baseline_temp
-        warning = self.roi_config.warning_delta
-
-        def _probe_callback(max_temp: float) -> bool:
-            if max_temp >= baseline + warning:
-                _log_monitor.info("Probe triggered: %.1f°C >= %.1f°C (baseline %.0f + %d)",
-                                  max_temp, baseline + warning, baseline, warning)
-                self.capture.set_warning_mode(True)
-                return True
-            return False
-
-        # 백그라운드 캡처 시작 (논스톱, 독립 스레드)
+        # REST 이미지 캡처 시작. 온도 감시는 향후 별도 GigE/Mono16 adapter가
+        # TemperatureMonitor에 값을 공급하며 이 세션에는 probe를 연결하지 않습니다.
         self.capture = CaptureSession(
             cam_ip=self.cam_ip,
             mode="both",
             interval=self.capture_interval,
             save_dir=DATASET_DIR,
             log_callback=self._log,
-            probe_callback=_probe_callback,
         )
         self.capture.start()
 
@@ -583,7 +579,9 @@ def main():
 
     monitor = MonitorSequencer(
         cam_ip=os.environ.get("CAM_IP", cfg.camera.ip),
-        capture_interval=float(os.environ.get("CAPTURE_INTERVAL", str(cfg.camera.capture_interval_sec))),
+        capture_interval=float(os.environ.get(
+            "CAPTURE_INTERVAL", str(NORMAL_CAPTURE_INTERVAL_SEC)
+        )),
     )
 
     monitor.start()
