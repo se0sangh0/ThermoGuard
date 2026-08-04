@@ -1059,8 +1059,21 @@ class ProductDashboard:
         if not reader.start():
             return
         self._gige_reader = reader
-        self._add_operating_log("GigE", "성공", "5초 주기 온도 프로브 시작")
+        self._add_operating_log("GigE", "성공", "리더 연결 완료")
+        # 리더 연결 즉시 5초 프로브 타이머 시작
         self._schedule_gige_probe()
+
+    def _start_gige_timer(self):
+        """5초 GigE 프로브 타이머를 시작한다. 이미 실행 중이면 무시."""
+        if self._gige_probe_timer is not None:
+            return
+        self._schedule_gige_probe()
+
+    def _stop_gige_timer(self):
+        """5초 GigE 프로브 타이머만 중지한다. 리더는 유지."""
+        if self._gige_probe_timer:
+            self.root.after_cancel(self._gige_probe_timer)
+            self._gige_probe_timer = None
 
     def _schedule_gige_probe(self):
         """5000ms 후 다음 GigE 프로브를 예약한다."""
@@ -1069,7 +1082,7 @@ class ProductDashboard:
         self._gige_probe_timer = self.root.after(5000, self._run_gige_probe)
 
     def _run_gige_probe(self):
-        """GigE 온도를 읽고 임계 초과 시 경고 모드로 전환한다."""
+        """5초마다 GigE 온도를 확인하고 임계 초과 시 경고 모드로 전환한다."""
         if not self.monitoring or self._gige_reader is None:
             self._gige_probe_timer = None
             return
@@ -1081,9 +1094,8 @@ class ProductDashboard:
                 if capture:
                     capture.set_warning_mode(True)
                 self._schedule_refresh(100)
-                w_interval = getattr(capture, '_warning_interval', 5.0)
                 self._add_operating_log(
-                    "GigE", "성공", f"{temp:.1f}°C (threshold {threshold:.1f}°C) - 캡처 주기 {w_interval:.0f}초로 전환"
+                    "GigE", "성공", f"{temp:.1f}°C (threshold {threshold:.1f}°C) - 분석 가속"
                 )
             else:
                 if capture:
@@ -1092,10 +1104,8 @@ class ProductDashboard:
             self._schedule_gige_probe()
 
     def _stop_gige_probe(self):
-        """GigE 프로브를 중지하고 리소스를 정리한다."""
-        if self._gige_probe_timer:
-            self.root.after_cancel(self._gige_probe_timer)
-            self._gige_probe_timer = None
+        """GigE 프로브를 완전히 중지하고 리소스를 정리한다."""
+        self._stop_gige_timer()
         reader, self._gige_reader = self._gige_reader, None
         if reader is not None:
             reader.stop()
