@@ -12,3 +12,4 @@ config.json
 /.commandcode
 .DS_Store
 AGENTS.md
+/scripts
