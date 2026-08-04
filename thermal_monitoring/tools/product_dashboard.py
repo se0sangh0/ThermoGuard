@@ -34,6 +34,7 @@ from ..analysis.threshold import (
     apply_roi_state_updates,
 )
 from ..capture.capture import CaptureSession, camera_image_url
+from ..capture.gige_backend import GigeTemperatureReader
 from ..data import pairs
 from ..data.checking import run_check
 from ..data.cleanup import run_cleanup_if_due
@@ -156,6 +157,10 @@ class ProductDashboard:
         self._latest_pair_quality_ok = False
         self._latest_pair_fresh = False
         self._last_successful_capture_at: Optional[datetime] = None
+
+        # GigE 5초 프로브
+        self._gige_reader: Optional[GigeTemperatureReader] = None
+        self._gige_probe_timer: Optional[str] = None
 
         self._analysis_executor = ThreadPoolExecutor(max_workers=1)
         self._analysis_running = False
@@ -993,31 +998,16 @@ class ProductDashboard:
         self.capture_paused_by_user = False
         self.monitoring = True
         self.capture_toggle_button.configure(text="■  촬영 정지")
-        roi = self.cfg.roi
-        baseline = roi.baseline_temp
-        warning_delta = roi.warning_delta
-
-        def _probe_callback(max_temp: float) -> bool:
-            capture = self.capture
-            if not self.monitoring or capture is None:
-                return False
-            if max_temp >= baseline + warning_delta:
-                capture.set_warning_mode(True)
-                self._schedule_refresh(100)  # 즉시 분석 가속
-                w_interval = getattr(capture, '_warning_interval', 5.0)
-                self._add_operating_log("분석", "성공", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
-                return True
-            else:
-                capture.set_warning_mode(False)
-                return False
 
         self.capture = CaptureSession(
             cam_ip=self.cfg.camera.ip, mode=self.cfg.tools.mode,
             interval=max(10.0, float(self.cfg.camera.capture_interval_sec)),
             save_dir=self.cfg.paths.dataset_dir, log_callback=self._capture_log,
-            probe_callback=_probe_callback,
         )
         self.capture.start()
+
+        # GigE 5초 온도 프로브 (PySpin 미설치 시 무시)
+        self._start_gige_probe()
 
     def toggle_capture(self):
         """현장 사용자가 촬영만 정지하거나 다시 시작할 수 있게 한다."""
@@ -1034,6 +1024,7 @@ class ProductDashboard:
             return
         self.capture_paused_by_user = True
         self.monitoring = False
+        self._stop_gige_probe()
         capture = self.capture
         self.capture = None
         if capture:
@@ -1054,6 +1045,61 @@ class ProductDashboard:
             self.root.after(0, self._check_connection_async)
         self.root.after(0, self._update_connection_stability_display)
         self._update_metric_text_async()
+
+    # ── GigE 5초 프로브 ─────────────────────────────────────
+
+    def _start_gige_probe(self):
+        """GigE Vision 5초 주기 온도 프로브를 시작한다. 실패 시 무시."""
+        if not self.cfg.camera.gige_enabled:
+            return
+        try:
+            reader = GigeTemperatureReader(device_index=self.cfg.camera.gige_device_index)
+        except Exception:
+            return
+        if not reader.start():
+            return
+        self._gige_reader = reader
+        self._add_operating_log("GigE", "성공", "5초 주기 온도 프로브 시작")
+        self._schedule_gige_probe()
+
+    def _schedule_gige_probe(self):
+        """5000ms 후 다음 GigE 프로브를 예약한다."""
+        if self.lifecycle != "running":
+            return
+        self._gige_probe_timer = self.root.after(5000, self._run_gige_probe)
+
+    def _run_gige_probe(self):
+        """GigE 온도를 읽고 임계 초과 시 경고 모드로 전환한다."""
+        if not self.monitoring or self._gige_reader is None:
+            self._gige_probe_timer = None
+            return
+        temp = self._gige_reader.read_temperature()
+        if temp is not None:
+            threshold = self.cfg.roi.baseline_temp + self.cfg.roi.warning_delta
+            capture = self.capture
+            if temp >= threshold:
+                if capture:
+                    capture.set_warning_mode(True)
+                self._schedule_refresh(100)
+                w_interval = getattr(capture, '_warning_interval', 5.0)
+                self._add_operating_log(
+                    "GigE", "성공", f"{temp:.1f}°C (threshold {threshold:.1f}°C) - 캡처 주기 {w_interval:.0f}초로 전환"
+                )
+            else:
+                if capture:
+                    capture.set_warning_mode(False)
+        if self.monitoring:
+            self._schedule_gige_probe()
+
+    def _stop_gige_probe(self):
+        """GigE 프로브를 중지하고 리소스를 정리한다."""
+        if self._gige_probe_timer:
+            self.root.after_cancel(self._gige_probe_timer)
+            self._gige_probe_timer = None
+        reader, self._gige_reader = self._gige_reader, None
+        if reader is not None:
+            reader.stop()
+            self._add_operating_log("GigE", "성공", "온도 프로브 정지")
 
     def _record_api_result(self, success, status_code=None, error_kind=None):
         if success:
@@ -1957,6 +2003,7 @@ class ProductDashboard:
         self._set_system_state("종료 중", COLORS["orange"])
         if self.timer_id:
             self.root.after_cancel(self.timer_id); self.timer_id = None
+        self._stop_gige_probe()
         if self.capture:
             self.capture.request_stop()
         self.monitoring = False
