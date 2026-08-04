@@ -1,4 +1,4 @@
-"""현장 관리자용 상품형 열화상 모니터링 대시보드."""
+﻿"""현장 관리자용 상품형 열화상 모니터링 대시보드."""
 
 from __future__ import annotations
 
@@ -656,14 +656,14 @@ class ProductDashboard:
             event["ack_pending"] = True
             self._add_operating_log(
                 "알림",
-                "확인 처리 중",
+                "처리 중",
                 f"{event['asset']} · {event['temp']:.1f}°C",
             )
             self._render_alert_cards()
             self._acknowledge_event_backend(event)
             return
         self._mark_event_acknowledged(event)
-        self._add_operating_log("알림", "확인 완료", f"{event['asset']} · {event['temp']:.1f}°C")
+        self._add_operating_log("알림", "성공", f"{event['asset']} · {event['temp']:.1f}°C")
         self._render_alert_cards()
 
     @staticmethod
@@ -1005,7 +1005,7 @@ class ProductDashboard:
                 capture.set_warning_mode(True)
                 self._schedule_refresh(100)  # 즉시 분석 가속
                 w_interval = getattr(capture, '_warning_interval', 5.0)
-                self._add_operating_log("분석", "과열 감지", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
+                self._add_operating_log("분석", "성공", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
                 return True
             else:
                 capture.set_warning_mode(False)
@@ -1026,7 +1026,7 @@ class ProductDashboard:
         else:
             self._set_system_state("연결 확인 중", COLORS["orange"])
             self.capture_toggle_button.configure(text="연결 확인 중...", state="disabled")
-            self._add_operating_log("캡처", "연결 확인", "촬영 시작 전 카메라 응답 확인")
+            self._add_operating_log("캡처", "시작", "촬영 시작 전 카메라 응답 확인")
             self._check_connection_async(resume_on_success=True)
 
     def stop_monitoring(self):
@@ -1040,7 +1040,7 @@ class ProductDashboard:
             capture.request_stop()
         self.capture_toggle_button.configure(text="▶  촬영 시작")
         self._set_system_state("촬영 정지", COLORS["orange"])
-        self._add_operating_log("캡처", "정지", "사용자가 촬영을 정지함")
+        self._add_operating_log("캡처", "성공", "사용자가 촬영을 정지함")
 
     def _capture_log(self, message: str):
         if "saved" in message:
@@ -1049,7 +1049,7 @@ class ProductDashboard:
             self._record_api_result(True)
         elif any(word in message.lower() for word in ("error", "timeout", "http", "connection")):
             self.metrics.capture_attempts += 1; self.metrics.exception_count += 1
-            self._add_operating_log("캡처", "예외 처리", message)
+            self._add_operating_log("캡처", "실패", message)
             self._record_api_message(message)
             self.root.after(0, self._check_connection_async)
         self.root.after(0, self._update_connection_stability_display)
@@ -1279,7 +1279,7 @@ class ProductDashboard:
             self._finish_analysis(generation)
             return
         self.metrics.exception_count += 1
-        self._add_operating_log("분석", "예외 처리", message)
+        self._add_operating_log("분석", "실패", message)
         self._append_event("Error", 0.0, f"분석 예외: {message}")
         self._update_metric_text()
         self._finish_analysis(generation)
@@ -1438,7 +1438,7 @@ class ProductDashboard:
         elif status == Status.NORMAL and previous != Status.NORMAL:
             if self.capture:
                 self.capture.set_warning_mode(False)
-            self._add_operating_log("분석", "정상 복귀",
+            self._add_operating_log("분석", "성공",
                                     f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
                                     else "정상 복귀")
 
@@ -1490,19 +1490,19 @@ class ProductDashboard:
                 self.metrics.image_quality_successes += 1
             else:
                 self._add_operating_log(
-                    "분석", "영상 품질 이상", result.get("image_quality_reason", "영상 확인 필요")
+                    "분석", "실패", result.get("image_quality_reason", "영상 확인 필요")
                 )
             self._image_quality_window.append(quality_ok)
             del self._image_quality_window[:-20]
         elif is_new_capture:
             self._add_operating_log(
-                "분석", "캡처 오래됨",
+                "분석", "실패",
                 f"{capture_id} · 촬영 후 {capture_age:.0f}초 경과",
             )
         self.latest_status = status
         self.last_update = datetime.now()
         self.metrics.analysis_ok += 1
-        self._add_operating_log("분석", "정상 완료",
+        self._add_operating_log("분석", "성공",
                                 f"{result['base']} · {status.value} · Max {result['max_temp']:.1f}°C")
         self._update_values_with_result(result)
         self._finish_analysis(generation)
@@ -1914,13 +1914,13 @@ class ProductDashboard:
             self._mark_event_acknowledged(event, acknowledged_at)
             self._add_operating_log(
                 "알림",
-                "확인 완료",
+                "성공",
                 f"{event['asset']} · {event['temp']:.1f}°C",
             )
         else:
             self._add_operating_log(
                 "알림",
-                "확인 실패",
+                "실패",
                 detail or f"alert_id={event.get('backend_id')}",
             )
         self._render_alert_cards()
@@ -1953,7 +1953,7 @@ class ProductDashboard:
     def on_close(self):
         if self.lifecycle != "running": return
         self.lifecycle = "closing"
-        self._add_operating_log("프로그램", "종료 시작", "running → closing")
+        self._add_operating_log("프로그램", "시작", "running → closing")
         self._set_system_state("종료 중", COLORS["orange"])
         if self.timer_id:
             self.root.after_cancel(self.timer_id); self.timer_id = None
@@ -1961,7 +1961,7 @@ class ProductDashboard:
             self.capture.request_stop()
         self.monitoring = False
         self.lifecycle = "closed"
-        self._add_operating_log("프로그램", "종료 완료", "closing → closed")
+        self._add_operating_log("프로그램", "성공", "closing → closed")
         self._analysis_executor.shutdown(wait=False)
         self.root.destroy()
 
@@ -2233,7 +2233,7 @@ class SettingsDialog:
         connected, detail = result
         if connected:
             notifier.configure(token, chat_id, enabled=False, persist=True)
-            self.d._add_operating_log("Telegram", "로그인 성공", detail)
+            self.d._add_operating_log("Telegram", "성공", detail)
             self._refresh_telegram_controls()
             self._close_telegram_login_window()
             messagebox.showinfo(
@@ -2247,7 +2247,7 @@ class SettingsDialog:
                     text=detail,
                     foreground=COLORS["red"],
                 )
-            self.d._add_operating_log("Telegram", "로그인 실패", detail)
+            self.d._add_operating_log("Telegram", "실패", detail)
 
     def _logout_telegram(self):
         from ..analysis import notifier
@@ -2261,7 +2261,7 @@ class SettingsDialog:
         notifier.logout(persist=True)
         self.telegram_token.set("")
         self.telegram_chat_id.set("")
-        self.d._add_operating_log("Telegram", "로그아웃", "로컬 로그인 정보 삭제")
+        self.d._add_operating_log("Telegram", "성공", "로컬 로그인 정보 삭제")
         self._refresh_telegram_controls()
 
     def _toggle_telegram_delivery(self):
@@ -2276,7 +2276,7 @@ class SettingsDialog:
         updated = notifier.get_settings()["enabled"]
         self.d._add_operating_log(
             "Telegram",
-            "알림 활성화" if updated else "알림 비활성화",
+            "성공",
             "자동 위험(Critical) 알림 전송",
         )
         self._refresh_telegram_controls()
@@ -2346,7 +2346,7 @@ class SettingsDialog:
         """ROI/캘리브레이션 도구는 프로세스에서 한 번에 하나만 실행한다."""
         if self._tool_running:
             self.d._add_operating_log(
-                "설정", "중복 실행 차단", f"{self._tool_running} 작업이 이미 실행 중"
+                "설정", "실패", f"{self._tool_running} 작업이 이미 실행 중"
             )
             messagebox.showinfo(
                 "작업 진행 중",
@@ -2476,7 +2476,7 @@ class SettingsDialog:
                 threshold_result = self._sync_thresholds_to_backend(entries)
                 self.d._add_operating_log(
                     "DB",
-                    "저장 완료",
+                    "성공",
                     f"camera_id={result.camera_id}, "
                     f"신규 버전 {result.created}개, 변경 없음 {result.unchanged}개 · "
                     f"threshold 생성 {threshold_result.created}개, "
@@ -2490,7 +2490,7 @@ class SettingsDialog:
                 save_handler=save_rois_to_db,
             )
             self.d.cfg = load_config(force_reload=True)
-            result_text = "완료" if saved else "종료"
+            result_text = "성공"
             self.d._add_operating_log(
                 "설정", result_text,
                 f"{len(self.d.cfg.roi.rois)}개 영역 저장됨" if saved else "저장 없이 종료",
@@ -2530,12 +2530,12 @@ class SettingsDialog:
                 display_bounds=self._tool_display_bounds(),
             ))
             if saved:
-                self.d._add_operating_log("설정", "완료", self.d.cfg.paths.homography_path)
+                self.d._add_operating_log("설정", "성공", self.d.cfg.paths.homography_path)
             else:
-                self.d._add_operating_log("설정", "종료", "저장 없이 종료")
+                self.d._add_operating_log("설정", "성공", "저장 없이 종료")
         except Exception as exc:
             self.d.metrics.exception_count += 1
-            self.d._add_operating_log("설정", "예외 처리", str(exc))
+            self.d._add_operating_log("설정", "실패", str(exc))
             messagebox.showerror("캘리브레이션", str(exc), parent=self.win)
             saved = False
         finally:
@@ -2625,10 +2625,10 @@ class SettingsDialog:
                 "저장 완료",
                 f"카메라 연결 정보 저장 (camera_id={registration.camera_id})",
             )
-            self.d._add_operating_log("설정", "저장 경로 변경", dataset_path)
+            self.d._add_operating_log("설정", "성공", dataset_path)
             self.d._add_operating_log(
                 "설정",
-                "즉시 적용",
+                "성공",
                 (
                     f"정상 {self.d.cfg.roi.baseline_temp:.1f}°C · "
                     f"경고 +{self.d.cfg.roi.warning_delta:.1f}°C · "
@@ -2649,7 +2649,7 @@ class SettingsDialog:
         except ValueError:
             messagebox.showerror("입력 오류", "숫자 설정값을 확인하세요.", parent=self.win)
         except Exception as exc:
-            self.d._add_operating_log("DB", "저장 실패", str(exc))
+            self.d._add_operating_log("DB", "실패", str(exc))
             messagebox.showerror(
                 "카메라 정보 DB 저장 실패",
                 f"카메라 연결 정보를 저장하지 못했습니다.\n\n{exc}",
@@ -2677,7 +2677,7 @@ class SettingsDialog:
         if not roi_ids:
             self.d._add_operating_log(
                 "DB",
-                "보류",
+                "실패",
                 "저장된 DB ROI ID가 없어 ROI 저장 후 생성합니다.",
             )
             from .threshold_api_client import ThresholdSyncResult
@@ -2710,7 +2710,7 @@ class SettingsDialog:
         )
         self.d._add_operating_log(
             "DB",
-            "저장 완료",
+            "성공",
             f"ROI {len(result.roi_ids)}개 · 생성 {result.created}개 · "
             f"갱신 {result.updated}개",
         )

@@ -47,7 +47,7 @@ class TelegramDispatcher:
         if self._running():
             self._dash.root.after(
                 0,
-                lambda: self._dash._add_operating_log("텔레그램 알림", result, detail),
+                lambda: self._dash._add_operating_log("Telegram", result, detail),
             )
 
     def _trace(self, msg: str, *args):
@@ -132,11 +132,11 @@ class TelegramDispatcher:
 
         if not settings["configured"]:
             self._trace("SKIP — not configured")
-            self._op_log("보류", "미로그인 — 환경설정에서 Telegram에 로그인하세요")
+            self._op_log("실패", "미로그인 — 환경설정에서 Telegram에 로그인하세요")
             return
         if not settings["enabled"]:
             self._trace("SKIP — disabled")
-            self._op_log("보류", "알림 전송 비활성화")
+            self._op_log("실패", "알림 전송 비활성화")
             return
         if not pending_quality_ok:
             self._trace(
@@ -144,7 +144,7 @@ class TelegramDispatcher:
                 pending_result.get("image_quality_reason", "?"),
             )
             self._op_log(
-                "보류",
+                "실패",
                 pending_result.get("image_quality_reason", "영상 품질 미달로 미발송"),
             )
             return
@@ -179,7 +179,7 @@ class TelegramDispatcher:
             is_retry,
         )
         self._op_log(
-            "재전송 시도" if is_retry else "전송 시도",
+            "처리 중",
             f"{pending_result.get('roi_name', 'ROI')} · "
             f"{pending_result['max_temp']:.1f}°C",
         )
@@ -190,7 +190,7 @@ class TelegramDispatcher:
             # the in-flight guard so the pending alarm remains retryable.
             self._complete_dispatch(False, pending_captured_at)
             _log.error("Telegram dispatch start error: %s", exc, exc_info=True)
-            self._op_log("오류", f"전송 시작 실패: {exc}")
+            self._op_log("실패", f"전송 시작 실패: {exc}")
 
     # ── 전송 실행 ────────────────────────────────────────────
 
@@ -266,14 +266,14 @@ class TelegramDispatcher:
                 )
                 self._trace("send_alarm returned ok=%s", ok)
                 self._op_log(
-                    "전송 성공" if ok else "전송 실패",
+                    "성공" if ok else "실패",
                     f"{temp:.1f}°C · {'사진' if image_path else '텍스트'}",
                 )
             except RuntimeError:
-                self._op_log("미설정", ".env의 BOT_TOKEN / CHAT_ID를 확인하세요")
+                self._op_log("실패", ".env의 BOT_TOKEN / CHAT_ID를 확인하세요")
             except Exception as e:
                 _log.error("Telegram dispatch error: %s", e, exc_info=True)
-                self._op_log("오류", str(e))
+                self._op_log("실패", str(e))
             finally:
                 if tmp_path:
                     try:
@@ -364,7 +364,7 @@ class TelegramDispatcher:
                 )
                 sync_result = self._ensure_threshold_profile(camera_id, roi_id)
                 self._op_log(
-                    "자동 복구",
+                    "성공",
                     f"ROI {roi_id} threshold 생성 {sync_result.created}개 · "
                     f"갱신 {sync_result.updated}개",
                 )
@@ -390,7 +390,7 @@ class TelegramDispatcher:
                             data.get("capture_id"),
                         )
                         self._op_log(
-                            "저장 오류",
+                            "실패",
                             "Critical 알람의 alert_id가 생성되지 않았습니다",
                         )
                     elif alert_id is not None:
@@ -423,7 +423,7 @@ class TelegramDispatcher:
         except Exception as exc:
             self._dash.metrics.api_other_errors += 1
             _log.error("measurement POST failed: %s", exc, exc_info=True)
-            self._op_log("저장 실패", str(exc))
+            self._op_log("실패", str(exc))
         finally:
             if backend_event is not None:
                 try:
