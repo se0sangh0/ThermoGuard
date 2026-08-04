@@ -32,6 +32,8 @@ MAX_MEAN_ERROR_PX = 5.0   # 평균 재투영 오차 허용 기준
 MAX_POINT_ERROR_PX = 25.0  # 개별 최대 오차 허용 기준
 BUTTON_BAR_HEIGHT = 44
 CALIBRATION_WINDOW_TITLE = "Calibration - Thermal | RGB"
+CALIBRATION_WINDOW_WIDTH = 1344
+CALIBRATION_WINDOW_HEIGHT = 756
 _BUTTONS = [
     ("Save",  (50, 160, 50), "save"),
     ("Undo",  (160, 160, 50), "undo"),
@@ -129,7 +131,6 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
 
     cfg = load_config()
     DATASET_DIR = cfg.paths.dataset_dir
-    DISPLAY_WIDTH = cfg.display.display_width
 
     if thermal_path is None:
         if len(sys.argv) >= 3:
@@ -179,16 +180,23 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
     print("  S = compute & save   R = reset   Z = undo   ESC/Q = quit without saving")
 
     screen_x, screen_y, screen_w, screen_h = display_bounds or (0, 0, 1920, 1080)
-    max_window_width = max(240, min(DISPLAY_WIDTH // 2, (screen_w - 48) // 2))
-    max_window_height = max(200, screen_h - BUTTON_BAR_HEIGHT - 96)
+    # 1920×1080 이상의 화면에서는 ROI 설정 창과 동일한 1344×756 작업 영역을
+    # 사용한다. 더 작은 화면에서만 화면 밖으로 벗어나지 않도록 축소한다.
+    canvas_width = min(CALIBRATION_WINDOW_WIDTH, max(240, screen_w - 48))
+    canvas_width -= canvas_width % 2
+    canvas_height = min(CALIBRATION_WINDOW_HEIGHT, max(200, screen_h - 96))
+    image_area_height = canvas_height - BUTTON_BAR_HEIGHT
+    panel_width = canvas_width // 2
 
-    thermal_width_by_height = int(max_window_height * thermal.shape[1] / thermal.shape[0])
+    thermal_width_by_height = int(
+        image_area_height * thermal.shape[1] / thermal.shape[0]
+    )
     rgb_width_by_height = int(
-        max(1, max_window_height - BUTTON_BAR_HEIGHT) * rgb.shape[1] / rgb.shape[0]
+        image_area_height * rgb.shape[1] / rgb.shape[0]
     )
     responsive_width = max(
         240,
-        min(DISPLAY_WIDTH, max_window_width, thermal_width_by_height, rgb_width_by_height),
+        min(panel_width, thermal_width_by_height, rgb_width_by_height),
     )
 
     cv2.namedWindow(CALIBRATION_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
@@ -202,36 +210,54 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
     thermal_disp = resize_for_display(thermal, responsive_width)
     rgb_disp = resize_for_display(rgb, responsive_width)
 
-    panel_width = responsive_width
-    image_height = max(thermal_disp.shape[0], rgb_disp.shape[0])
-    canvas_width = panel_width * 2
+    rgb_x_offset = (panel_width - rgb_disp.shape[1]) // 2
+    thermal_x_offset = panel_width + (panel_width - thermal_disp.shape[1]) // 2
+    rgb_y_offset = (image_area_height - rgb_disp.shape[0]) // 2
+    thermal_y_offset = (image_area_height - thermal_disp.shape[0]) // 2
     cv2.moveWindow(
         CALIBRATION_WINDOW_TITLE,
         screen_x + max(12, (screen_w - canvas_width) // 2),
-        screen_y + 36,
+        screen_y + max(12, (screen_h - canvas_height) // 2),
     )
 
     thermal_scale = thermal.shape[1] / thermal_disp.shape[1]
     rgb_scale = rgb.shape[1] / rgb_disp.shape[1]
-    button_rects = _compute_button_rects(canvas_width, image_height)
+    button_rects = _compute_button_rects(canvas_width, image_area_height)
     button_action = {"value": None}
 
     def calibration_callback(event, x, y, flags, param):
-        if y >= image_height:
+        if y >= image_area_height:
             if event == cv2.EVENT_LBUTTONDOWN:
                 for (_, _, action), (x1, y1, x2, y2) in zip(_BUTTONS, button_rects):
                     if x1 <= x <= x2 and y1 <= y <= y2:
                         button_action["value"] = action
                         break
             return
-        if x < panel_width and y < rgb_disp.shape[0]:
+        rgb_local_x = x - rgb_x_offset
+        rgb_local_y = y - rgb_y_offset
+        if (
+            0 <= rgb_local_x < rgb_disp.shape[1]
+            and 0 <= rgb_local_y < rgb_disp.shape[0]
+        ):
             return click_rgb(
-                event, int(x * rgb_scale), int(y * rgb_scale), flags, param,
+                event,
+                int(rgb_local_x * rgb_scale),
+                int(rgb_local_y * rgb_scale),
+                flags,
+                param,
             )
-        thermal_x = x - panel_width
-        if 0 <= thermal_x < panel_width and y < thermal_disp.shape[0]:
+        thermal_local_x = x - thermal_x_offset
+        thermal_local_y = y - thermal_y_offset
+        if (
+            0 <= thermal_local_x < thermal_disp.shape[1]
+            and 0 <= thermal_local_y < thermal_disp.shape[0]
+        ):
             return click_thermal(
-                event, int(thermal_x * thermal_scale), int(y * thermal_scale), flags, param,
+                event,
+                int(thermal_local_x * thermal_scale),
+                int(thermal_local_y * thermal_scale),
+                flags,
+                param,
             )
 
     cv2.setMouseCallback(CALIBRATION_WINDOW_TITLE, calibration_callback)
@@ -312,12 +338,18 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
                     (10, r.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         canvas = np.zeros(
-            (image_height + BUTTON_BAR_HEIGHT, canvas_width, 3), dtype=np.uint8,
+            (canvas_height, canvas_width, 3), dtype=np.uint8,
         )
-        canvas[:r.shape[0], :panel_width] = r
-        canvas[:t.shape[0], panel_width:panel_width * 2] = t
+        canvas[
+            rgb_y_offset:rgb_y_offset + r.shape[0],
+            rgb_x_offset:rgb_x_offset + r.shape[1],
+        ] = r
+        canvas[
+            thermal_y_offset:thermal_y_offset + t.shape[0],
+            thermal_x_offset:thermal_x_offset + t.shape[1],
+        ] = t
         cv2.line(
-            canvas, (panel_width, 0), (panel_width, image_height),
+            canvas, (panel_width, 0), (panel_width, image_area_height),
             (120, 120, 120), 1,
         )
         cv2.putText(
@@ -328,7 +360,7 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
             canvas, "THERMAL", (panel_width + 10, 22),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
         )
-        _draw_button_bar(canvas, image_height, button_rects)
+        _draw_button_bar(canvas, image_area_height, button_rects)
 
         cv2.imshow(CALIBRATION_WINDOW_TITLE, canvas)
         windows_rendered = True
