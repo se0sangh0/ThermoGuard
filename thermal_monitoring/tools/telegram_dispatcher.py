@@ -294,6 +294,23 @@ class TelegramDispatcher:
             if not self._dash.cfg.backend.enabled:
                 return
 
+            measurement_status = result.get(
+                "measurement_status",
+                result.get("alarm_status", result["status"]),
+            )
+            status_value = (
+                measurement_status.value.lower()
+                if isinstance(measurement_status, Status)
+                else str(measurement_status).lower()
+            )
+            if status_value == "normal":
+                self._trace(
+                    "measurement POST skipped: status=%s base=%s",
+                    status_value,
+                    result.get("base", "?"),
+                )
+                return
+
             camera_id = self._dash.cfg.identity.db_camera_id
             roi = result.get("measurement_roi")
             roi_id = getattr(roi, "db_roi_id", None) if roi is not None else None
@@ -308,15 +325,6 @@ class TelegramDispatcher:
                 )
                 return
 
-            measurement_status = result.get(
-                "measurement_status",
-                result.get("alarm_status", result["status"]),
-            )
-            status_value = (
-                measurement_status.value.lower()
-                if isinstance(measurement_status, Status)
-                else str(measurement_status).lower()
-            )
             do_alarm = bool(result.get("alarm", False))
 
             self._trace(

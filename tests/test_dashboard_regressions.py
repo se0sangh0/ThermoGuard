@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -329,7 +330,7 @@ def test_threshold_sync_waits_until_roi_has_database_id(monkeypatch):
     assert operating_logs[-1][1] == "보류"
 
 
-def test_measurement_uses_matching_roi_identity_and_status(monkeypatch):
+def test_measurement_uses_matching_roi_identity_and_abnormal_statuses(monkeypatch):
     posted = []
     dashboard = SimpleNamespace(
         lifecycle="running",
@@ -377,12 +378,74 @@ def test_measurement_uses_matching_roi_identity_and_status(monkeypatch):
     }
 
     dispatcher.post_measurement(result)
+    result["measurement_status"] = Status.CRITICAL
+    dispatcher.post_measurement(result)
 
     payload = posted[0][1]
     assert payload["camera_id"] == 7
     assert payload["roi_id"] == 12
     assert payload["max_temp"] == 61.0
-    assert payload["status"] == "warning"
+    assert [post_payload["status"] for _, post_payload in posted] == [
+        "warning",
+        "critical",
+    ]
+
+
+def test_normal_measurement_is_skipped_and_completes_backend_event(monkeypatch):
+    posted = []
+    backend_event = threading.Event()
+    dashboard = SimpleNamespace(
+        lifecycle="running",
+        cfg=SimpleNamespace(
+            backend=SimpleNamespace(
+                enabled=True,
+                url="http://backend",
+                timeout_sec=5,
+            ),
+            identity=SimpleNamespace(
+                db_camera_id=7,
+                robot_id="Robot-01",
+            ),
+        ),
+        metrics=SimpleNamespace(
+            api_successes=0,
+            api_timeouts=0,
+            api_connection_errors=0,
+            api_other_errors=0,
+        ),
+        _record_api_result=lambda *_args, **_kwargs: None,
+    )
+    dispatcher = TelegramDispatcher(dashboard)
+    monkeypatch.setattr(
+        "thermal_monitoring.tools.telegram_dispatcher.requests.post",
+        lambda *args, **kwargs: posted.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_ensure_threshold_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Normal 측정은 threshold sync를 호출하면 안 됩니다.")
+        ),
+    )
+    result = {
+        "measurement_roi": SimpleNamespace(db_roi_id=None),
+        "roi_name": "ROI-2",
+        "status": Status.CRITICAL,
+        "measurement_status": Status.NORMAL,
+        "alarm": True,
+        "_backend_posted_event": backend_event,
+    }
+
+    dispatcher.post_measurement(result)
+
+    assert posted == []
+    assert backend_event.is_set()
+    assert vars(dashboard.metrics) == {
+        "api_successes": 0,
+        "api_timeouts": 0,
+        "api_connection_errors": 0,
+        "api_other_errors": 0,
+    }
 
 
 def test_measurement_repairs_missing_threshold_and_retries_once(monkeypatch):
@@ -464,7 +527,7 @@ def test_measurement_repairs_missing_threshold_and_retries_once(monkeypatch):
         "hot_temp_95": 38.0,
         "over_temp_pixels": 0,
         "max_hotspot_size": 0,
-        "status": Status.NORMAL,
+        "status": Status.WARNING,
         "alarm": False,
     }
 
