@@ -34,6 +34,10 @@ BUTTON_BAR_HEIGHT = 44
 CALIBRATION_WINDOW_TITLE = "Calibration - Thermal | RGB"
 CALIBRATION_WINDOW_WIDTH = 1344
 CALIBRATION_WINDOW_HEIGHT = 756
+CALIBRATION_WINDOW_MIN_WIDTH = 400
+CALIBRATION_WINDOW_MIN_HEIGHT = 240
+# 현장 PC 모니터 해상도에 맞춰 사용하는 최종 작업창 비율이다.
+CALIBRATION_WINDOW_RATIO = 0.40
 _BUTTONS = [
     ("Save",  (50, 160, 50), "save"),
     ("Undo",  (160, 160, 50), "undo"),
@@ -180,11 +184,17 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
     print("  S = compute & save   R = reset   Z = undo   ESC/Q = quit without saving")
 
     screen_x, screen_y, screen_w, screen_h = display_bounds or (0, 0, 1920, 1080)
-    # 1920×1080 이상의 화면에서는 ROI 설정 창과 동일한 1344×756 작업 영역을
-    # 사용한다. 더 작은 화면에서만 화면 밖으로 벗어나지 않도록 축소한다.
-    canvas_width = min(CALIBRATION_WINDOW_WIDTH, max(240, screen_w - 48))
+    # 실제 캘리브레이션 캔버스는 화면의 40%를 사용한다. 바깥쪽 OpenCV/OS
+    # 프레임까지 포함하면 ROI 창보다 조금 작은 수준의 체감 크기가 된다.
+    canvas_width = max(
+        CALIBRATION_WINDOW_MIN_WIDTH,
+        min(int(screen_w * CALIBRATION_WINDOW_RATIO), CALIBRATION_WINDOW_WIDTH),
+    )
     canvas_width -= canvas_width % 2
-    canvas_height = min(CALIBRATION_WINDOW_HEIGHT, max(200, screen_h - 96))
+    canvas_height = max(
+        CALIBRATION_WINDOW_MIN_HEIGHT,
+        min(int(screen_h * CALIBRATION_WINDOW_RATIO), CALIBRATION_WINDOW_HEIGHT),
+    )
     image_area_height = canvas_height - BUTTON_BAR_HEIGHT
     panel_width = canvas_width // 2
 
@@ -195,11 +205,19 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
         image_area_height * rgb.shape[1] / rgb.shape[0]
     )
     responsive_width = max(
-        240,
+        160,
         min(panel_width, thermal_width_by_height, rgb_width_by_height),
     )
 
-    cv2.namedWindow(CALIBRATION_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+    # WINDOW_AUTOSIZE는 창 관리자·DPI 환경에 따라 이미지 원본 크기를 우선해
+    # 계산된 반응형 크기가 적용되지 않을 수 있다. WINDOW_NORMAL로 생성한 뒤
+    # 목표 작업 영역을 명시적으로 지정한다.
+    cv2.namedWindow(CALIBRATION_WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(
+        CALIBRATION_WINDOW_TITLE,
+        canvas_width,
+        canvas_height,
+    )
     try:
         cv2.setWindowProperty(
             CALIBRATION_WINDOW_TITLE, cv2.WND_PROP_TOPMOST, 1,

@@ -219,8 +219,8 @@ class ProductDashboard:
         body = tk.Frame(self.root, bg=COLORS["bg"])
         body.pack(fill="both", expand=True, padx=10, pady=10)
         body.grid_columnconfigure(0, weight=1)
-        body.grid_rowconfigure(1, weight=7, minsize=420)
-        body.grid_rowconfigure(3, weight=3, minsize=190)
+        body.grid_rowconfigure(1, weight=3, minsize=150)
+        body.grid_rowconfigure(3, weight=7, minsize=190)
         self.dashboard_body = body
 
         self._build_toolbar(body)
@@ -340,8 +340,8 @@ class ProductDashboard:
         self.carousel_expanded = expanded
         if expanded:
             self.carousel_container.grid()
-            self.dashboard_body.grid_rowconfigure(1, weight=7, minsize=420)
-            self.dashboard_body.grid_rowconfigure(3, weight=3, minsize=190)
+            self.dashboard_body.grid_rowconfigure(1, weight=3, minsize=150)
+            self.dashboard_body.grid_rowconfigure(3, weight=7, minsize=190)
         else:
             self.carousel_container.grid_remove()
             self.dashboard_body.grid_rowconfigure(1, weight=1, minsize=420)
@@ -2355,7 +2355,13 @@ class SettingsDialog:
         guard.title("작업 진행 중")
         guard.transient(self.win)
         guard.resizable(False, False)
-        guard.geometry("320x130")
+        # 실제 캘리브레이션 작업창과는 별도인 안내창이다. 고정 320×130은
+        # 고해상도·고DPI 화면에서 지나치게 작으므로 화면 비율 안에서 제한한다.
+        screen_width = self.win.winfo_screenwidth()
+        screen_height = self.win.winfo_screenheight()
+        guard_width = max(380, min(460, int(screen_width * 0.28)))
+        guard_height = max(160, min(190, int(screen_height * 0.18)))
+        guard.geometry(f"{guard_width}x{guard_height}")
         guard.protocol("WM_DELETE_WINDOW", lambda: None)
 
         body = ttk.Frame(guard, padding=18)
