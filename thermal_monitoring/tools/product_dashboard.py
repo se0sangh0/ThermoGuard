@@ -2487,8 +2487,8 @@ class SettingsDialog:
     def _latest_complete_image_pair(dataset: Path):
         """가장 최신의 Thermal/Visual 완성 쌍을 반환한다 (공용 pairs 모듈 위임)."""
         return pairs.latest_complete_pair(dataset)
-
     def open_roi_editor(self):
+
         dataset = Path(self.d.cfg.paths.dataset_dir)
         if not dataset.exists():
             messagebox.showwarning("ROI 설정", "데이터셋 폴더가 없습니다.", parent=self.win); return
