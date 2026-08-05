@@ -67,6 +67,22 @@ def fit_image_rect(
     )
 
 
+def calibration_hull_canvas_points(
+    hull: np.ndarray | None,
+    image_rect: ImageRect,
+) -> list[int]:
+    """Convert the saved Visual calibration hull to Tk canvas coordinates."""
+    if hull is None:
+        return []
+    points = np.asarray(hull, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 3:
+        return []
+    canvas_points: list[int] = []
+    for x, y in points:
+        canvas_points.extend(image_rect.to_canvas(float(x), float(y)))
+    return canvas_points
+
+
 def recommended_window_size(
     screen_width: int,
     screen_height: int,
@@ -281,6 +297,29 @@ class RoiTkDialog:
             image=self.photo,
             anchor="nw",
         )
+        hull_points = calibration_hull_canvas_points(
+            self._calib_hull,
+            self.image_rect,
+        )
+        if hull_points:
+            # 저장 시 pointPolygonTest에 사용하는 것과 동일한 영역을 먼저 그린다.
+            self.canvas.create_polygon(
+                *hull_points,
+                fill="#e2a93b",
+                stipple="gray25",
+                outline="#ffd166",
+                width=2,
+                dash=(6, 4),
+            )
+            label_x, label_y = hull_points[0], hull_points[1]
+            self.canvas.create_text(
+                label_x + 6,
+                max(self.image_rect.y + 12, label_y - 12),
+                text="캘리브레이션 ROI 설정 가능 영역",
+                fill="#ffd166",
+                anchor="w",
+                font=("맑은 고딕", 9, "bold"),
+            )
         for index, roi in enumerate(self.rois):
             x1, y1 = self.image_rect.to_canvas(roi["x1"], roi["y1"])
             x2, y2 = self.image_rect.to_canvas(roi["x2"], roi["y2"])

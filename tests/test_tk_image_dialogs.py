@@ -1,4 +1,7 @@
+import numpy as np
+
 from thermal_monitoring.tools.tk_image_dialogs import (
+    calibration_hull_canvas_points,
     fit_image_rect,
     recommended_window_size,
 )
@@ -28,6 +31,24 @@ def test_image_rect_rejects_letterbox_area():
 
     assert not rect.contains(20, 250)
     assert rect.contains(rect.x, rect.y)
+
+
+def test_calibration_hull_uses_roi_image_coordinate_transform():
+    rect = fit_image_rect(1920, 1080, 0, 0, 1000, 500)
+    hull = np.array([[[100, 100]], [[500, 100]], [[500, 400]], [[100, 400]]])
+
+    assert calibration_hull_canvas_points(hull, rect) == [
+        *rect.to_canvas(100, 100),
+        *rect.to_canvas(500, 100),
+        *rect.to_canvas(500, 400),
+        *rect.to_canvas(100, 400),
+    ]
+
+
+def test_legacy_calibration_without_points_has_no_visible_hull():
+    rect = fit_image_rect(640, 480, 0, 0, 640, 480)
+
+    assert calibration_hull_canvas_points(None, rect) == []
 
 
 def test_resolution_aware_popup_sizes_for_1920_by_1200():
