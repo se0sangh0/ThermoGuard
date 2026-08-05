@@ -4,6 +4,9 @@ from thermal_monitoring.tools.tk_image_dialogs import (
     calibration_hull_canvas_points,
     fit_image_rect,
     recommended_window_size,
+    roi_coordinate_text,
+    thermal_bounds_for_roi,
+    transformed_roi_bounds,
 )
 from thermal_monitoring.tools.product_dashboard import SettingsDialog
 
@@ -49,6 +52,47 @@ def test_legacy_calibration_without_points_has_no_visible_hull():
     rect = fit_image_rect(640, 480, 0, 0, 640, 480)
 
     assert calibration_hull_canvas_points(None, rect) == []
+
+
+def test_roi_coordinate_text_formats_bounds_and_size():
+    assert roi_coordinate_text({
+        "x1": 120, "y1": 80, "x2": 420, "y2": 260,
+    }) == "(120, 80)-(420, 260) · 300×180 px"
+
+
+def test_transformed_roi_bounds_uses_inverse_calibration_coordinates():
+    visual_to_thermal = np.array([
+        [0.25, 0.0, 0.0],
+        [0.0, 0.25, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+
+    assert transformed_roi_bounds({
+        "x1": 1000, "y1": 400, "x2": 1800, "y2": 1200,
+    }, visual_to_thermal) == {
+        "x1": 250, "y1": 100, "x2": 450, "y2": 300,
+    }
+
+
+def test_existing_roi_keeps_saved_thermal_bounds_until_edited():
+    inverse = np.diag([0.25, 0.25, 1.0]).astype(np.float32)
+    roi = {
+        "x1": 1000, "y1": 400, "x2": 1800, "y2": 1200,
+        "_thermal_bounds": {"x1": 125, "y1": 117, "x2": 566, "y2": 371},
+    }
+
+    assert thermal_bounds_for_roi(roi, inverse) == {
+        "x1": 125, "y1": 117, "x2": 566, "y2": 371,
+    }
+
+
+def test_edited_roi_uses_inverse_calibration_bounds():
+    inverse = np.diag([0.25, 0.25, 1.0]).astype(np.float32)
+    roi = {"x1": 1000, "y1": 400, "x2": 1800, "y2": 1200}
+
+    assert thermal_bounds_for_roi(roi, inverse) == {
+        "x1": 250, "y1": 100, "x2": 450, "y2": 300,
+    }
 
 
 def test_resolution_aware_popup_sizes_for_1920_by_1200():

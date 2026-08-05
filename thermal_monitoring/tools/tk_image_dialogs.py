@@ -83,6 +83,38 @@ def calibration_hull_canvas_points(
     return canvas_points
 
 
+def roi_coordinate_text(roi: dict) -> str:
+    """환경설정 ROI 편집창에 표시할 좌표 문자열."""
+    x1, y1 = int(roi["x1"]), int(roi["y1"])
+    x2, y2 = int(roi["x2"]), int(roi["y2"])
+    return f"({x1}, {y1})-({x2}, {y2}) · {abs(x2 - x1)}×{abs(y2 - y1)} px"
+
+
+def transformed_roi_bounds(roi: dict, homography: np.ndarray) -> dict:
+    """ROI 사각형 네 꼭짓점을 변환하고 축 정렬 좌표 범위를 반환한다."""
+    corners = np.array([
+        [roi["x1"], roi["y1"]],
+        [roi["x2"], roi["y1"]],
+        [roi["x2"], roi["y2"]],
+        [roi["x1"], roi["y2"]],
+    ], dtype=np.float32).reshape(-1, 1, 2)
+    transformed = cv2.perspectiveTransform(corners, homography).reshape(-1, 2)
+    return {
+        "x1": int(round(transformed[:, 0].min())),
+        "y1": int(round(transformed[:, 1].min())),
+        "x2": int(round(transformed[:, 0].max())),
+        "y2": int(round(transformed[:, 1].max())),
+    }
+
+
+def thermal_bounds_for_roi(roi: dict, inverse_homography: np.ndarray) -> dict:
+    """기존 ROI는 저장 원본을, 편집된 ROI는 Visual 역변환값을 반환한다."""
+    original = roi.get("_thermal_bounds")
+    if original is not None:
+        return dict(original)
+    return transformed_roi_bounds(roi, inverse_homography)
+
+
 def recommended_window_size(
     screen_width: int,
     screen_height: int,
@@ -261,6 +293,11 @@ class RoiTkDialog:
                 "y1": int(round(visual[:, 1].min())),
                 "x2": int(round(visual[:, 0].max())),
                 "y2": int(round(visual[:, 1].max())),
+                # 화면 표시용 Visual AABB와 별도로 기존 Thermal ROI를 보존한다.
+                # 사용자가 이 ROI를 다시 그리면 새 dict로 교체되어 이 값이 제거된다.
+                "_thermal_bounds": {
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                },
             })
         self.selected = 0 if self.rois else -1
 
@@ -337,8 +374,31 @@ class RoiTkDialog:
             x1, y1 = self.image_rect.to_canvas(*self.drag_start)
             x2, y2 = self.image_rect.to_canvas(*self.drag_end)
             self.canvas.create_rectangle(x1, y1, x2, y2, outline="#ffff00", width=2)
-        selected_name = self.rois[self.selected]["name"] if 0 <= self.selected < len(self.rois) else "없음"
-        self.status.configure(text=f"선택: {selected_name} · 전체 {len(self.rois)}개")
+            drag_roi = {
+                "x1": min(self.drag_start[0], self.drag_end[0]),
+                "y1": min(self.drag_start[1], self.drag_end[1]),
+                "x2": max(self.drag_start[0], self.drag_end[0]),
+                "y2": max(self.drag_start[1], self.drag_end[1]),
+            }
+            self.status.configure(
+                text=(
+                    "설정 중(Thermal 640×480 좌표): "
+                    f"{roi_coordinate_text(transformed_roi_bounds(drag_roi, self.inverse_homography))}"
+                ),
+            )
+        elif 0 <= self.selected < len(self.rois):
+            selected = self.rois[self.selected]
+            thermal_bounds = thermal_bounds_for_roi(
+                selected, self.inverse_homography,
+            )
+            self.status.configure(
+                text=(
+                    f"선택: {selected['name']} · Thermal 640×480 좌표: "
+                    f"{roi_coordinate_text(thermal_bounds)} · 전체 {len(self.rois)}개"
+                ),
+            )
+        else:
+            self.status.configure(text=f"선택: 없음 · 전체 {len(self.rois)}개")
 
     def _source_point(self, event) -> tuple[int, int] | None:
         if not self.image_rect or not self.image_rect.contains(event.x, event.y):
@@ -452,19 +512,13 @@ class RoiTkDialog:
                         return False
 
             # 사각형 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스 사용.
-            visual = np.array([
-                [roi["x1"], roi["y1"]],  # top-left
-                [roi["x2"], roi["y1"]],  # top-right
-                [roi["x2"], roi["y2"]],  # bottom-right
-                [roi["x1"], roi["y2"]],  # bottom-left
-            ], dtype=np.float32).reshape(-1, 1, 2)
-            thermal = cv2.perspectiveTransform(
-                visual, self.inverse_homography,
-            ).reshape(-1, 2)
-            raw_x1 = int(round(thermal[:, 0].min()))
-            raw_y1 = int(round(thermal[:, 1].min()))
-            raw_x2 = int(round(thermal[:, 0].max()))
-            raw_y2 = int(round(thermal[:, 1].max()))
+            thermal_bounds = thermal_bounds_for_roi(
+                roi, self.inverse_homography,
+            )
+            raw_x1 = thermal_bounds["x1"]
+            raw_y1 = thermal_bounds["y1"]
+            raw_x2 = thermal_bounds["x2"]
+            raw_y2 = thermal_bounds["y2"]
 
             # 클램핑 → 원하지 않은 위치로 바뀌므로 저장 거부
             x1 = max(0, min(raw_x1, 639))

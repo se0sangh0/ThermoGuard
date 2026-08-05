@@ -30,6 +30,7 @@ ZOOM_SIZE = 10      # 확대경 영역 크기 (px)
 ZOOM_SCALE = 3.0    # 확대 배율
 MAX_MEAN_ERROR_PX = 50.0   # 평균 재투영 오차 허용 기준
 MAX_POINT_ERROR_PX = 100.0  # 개별 최대 오차 허용 기준
+MIN_CALIBRATION_POINT_PAIRS = 6
 BUTTON_BAR_HEIGHT = 44
 CALIBRATION_WINDOW_TITLE = "Calibration - Thermal | RGB"
 CALIBRATION_WINDOW_WIDTH = 1344
@@ -418,8 +419,12 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
             else:
                 print("[Undo] Nothing to undo.")
         elif key == ord('s') or action == "save":
-            if len(thermal_pts) < 4:
-                print(f"[Save] Need at least 4 point pairs, currently have {len(thermal_pts)}")
+            if len(thermal_pts) < MIN_CALIBRATION_POINT_PAIRS:
+                print(
+                    f"[Save] Need at least {MIN_CALIBRATION_POINT_PAIRS} point pairs, "
+                    f"currently have {len(thermal_pts)}"
+                )
+                _show_minimum_points_dialog(len(thermal_pts))
             elif len(thermal_pts) != len(rgb_pts):
                 print(f"[Save] Point count mismatch: thermal={len(thermal_pts)} vs rgb={len(rgb_pts)}")
             else:
@@ -487,6 +492,27 @@ def _show_error_dialog(mean_error: float, max_error: float, pair_count: int):
             f"최대 오차: {max_error:.2f}px\n\n"
             f"허용 기준: 평균 {MAX_MEAN_ERROR_PX:.1f}px 이하, 최대 {MAX_POINT_ERROR_PX:.1f}px 이하\n\n"
             "전체 리셋(R) 후 화면 전체에 고르게 분포된 대응점을 다시 선택하세요.",
+        )
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _show_minimum_points_dialog(pair_count: int):
+    """대응점이 6쌍 미만이면 저장하지 않고 추가 선택을 안내한다."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "캘리브레이션 대응점 부족",
+            "캘리브레이션을 완료하려면 대응점을 6쌍 이상 지정해야 합니다.\n"
+            "보정값을 저장하지 않았습니다.\n\n"
+            f"현재 대응점: {pair_count}쌍\n"
+            f"필요 대응점: {MIN_CALIBRATION_POINT_PAIRS}쌍 이상\n\n"
+            "RGB와 Thermal 이미지에서 같은 위치의 대응점을 추가로 선택한 뒤 "
+            "다시 저장하세요.",
         )
         root.destroy()
     except Exception:
