@@ -130,6 +130,18 @@ def thermal_bounds_for_roi(roi: dict, inverse_homography: np.ndarray) -> dict:
     return transformed_roi_bounds(roi, inverse_homography)
 
 
+def thermal_roi_bounds_are_valid(
+    bounds: dict,
+    width: int = 640,
+    height: int = 480,
+) -> bool:
+    """끝 좌표 미포함 규칙으로 Thermal ROI 범위를 검사한다."""
+    return (
+        0 <= bounds["x1"] < bounds["x2"] <= width
+        and 0 <= bounds["y1"] < bounds["y2"] <= height
+    )
+
+
 def recommended_window_size(
     screen_width: int,
     screen_height: int,
@@ -555,36 +567,25 @@ class RoiTkDialog:
             raw_x2 = thermal_bounds["x2"]
             raw_y2 = thermal_bounds["y2"]
 
-            # 클램핑 → 원하지 않은 위치로 바뀌므로 저장 거부
-            x1 = max(0, min(raw_x1, 639))
-            y1 = max(0, min(raw_y1, 479))
-            x2 = max(0, min(raw_x2, 639))
-            y2 = max(0, min(raw_y2, 479))
-
-            if raw_x1 != x1 or raw_y1 != y1 or raw_x2 != x2 or raw_y2 != y2:
+            # Thermal ROI는 640×480 표준 좌표계의 끝 좌표 미포함 규칙을 사용한다.
+            # 좌표를 임의로 클램핑하지 않고 유효한 변환값만 그대로 저장한다.
+            if not thermal_roi_bounds_are_valid(thermal_bounds):
                 messagebox.showwarning(
                     "ROI 범위 초과",
-                    f"'{roi['name']}' ROI가 열화상 카메라 시야를 벗어납니다.\n\n"
+                    f"'{roi['name']}' ROI의 열화상 좌표가 유효하지 않습니다.\n\n"
                     f"변환 좌표: ({raw_x1},{raw_y1})-({raw_x2},{raw_y2})\n"
-                    f"열화상 범위: 0~639 × 0~479\n\n"
+                    "허용 범위: 0 ≤ x1 < x2 ≤ 640\n"
+                    "           0 ≤ y1 < y2 ≤ 480\n\n"
+                    "오른쪽·아래쪽 끝 좌표 640/480은 영역에 포함되지 않는 경계입니다.\n\n"
                     f"ROI를 카메라 중앙 쪽으로 옮기거나\n"
                     f"캘리브레이션 대응점을 카메라 전체에 고르게 다시 지정하세요.",
                     parent=self.win,
                 )
                 return False
 
-            if x1 >= x2 or y1 >= y2:
-                messagebox.showwarning(
-                    "ROI 설정",
-                    f"'{roi['name']}' 영역이 유효하지 않습니다.\n"
-                    f"좌표: ({x1},{y1})-({x2},{y2})\n"
-                    "ROI 박스가 너무 작거나 화면 밖으로 벗어났습니다.",
-                    parent=self.win,
-                )
-                return False
             entries.append(RoiEntry(
                 name=roi["name"],
-                x1=x1, y1=y1, x2=x2, y2=y2,
+                x1=raw_x1, y1=raw_y1, x2=raw_x2, y2=raw_y2,
             ))
         if not entries:
             return False

@@ -7,6 +7,7 @@ from thermal_monitoring.tools.tk_image_dialogs import (
     roi_is_inside_calibration_hull,
     roi_coordinate_text,
     thermal_bounds_for_roi,
+    thermal_roi_bounds_are_valid,
     transformed_roi_bounds,
 )
 from thermal_monitoring.tools.product_dashboard import SettingsDialog
@@ -114,6 +115,27 @@ def test_edited_roi_uses_inverse_calibration_bounds():
     assert thermal_bounds_for_roi(roi, inverse) == {
         "x1": 250, "y1": 100, "x2": 450, "y2": 300,
     }
+
+
+def test_thermal_roi_bounds_use_exclusive_end_coordinates():
+    assert thermal_roi_bounds_are_valid(
+        {"x1": 0, "y1": 0, "x2": 640, "y2": 480},
+    )
+    assert thermal_roi_bounds_are_valid(
+        {"x1": 639, "y1": 479, "x2": 640, "y2": 480},
+    )
+
+
+def test_thermal_roi_bounds_reject_outside_or_empty_coordinates():
+    assert not thermal_roi_bounds_are_valid(
+        {"x1": -1, "y1": 0, "x2": 640, "y2": 480},
+    )
+    assert not thermal_roi_bounds_are_valid(
+        {"x1": 0, "y1": 0, "x2": 641, "y2": 480},
+    )
+    assert not thermal_roi_bounds_are_valid(
+        {"x1": 100, "y1": 50, "x2": 100, "y2": 200},
+    )
 
 
 def test_resolution_aware_popup_sizes_for_1920_by_1200():
