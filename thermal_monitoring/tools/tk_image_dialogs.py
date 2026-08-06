@@ -83,6 +83,21 @@ def calibration_hull_canvas_points(
     return canvas_points
 
 
+def roi_is_inside_calibration_hull(roi: dict, hull: np.ndarray | None) -> bool:
+    """ROI의 네 꼭짓점이 모두 캘리브레이션 Hull 내부인지 확인한다."""
+    if hull is None:
+        return True
+    return all(
+        cv2.pointPolygonTest(hull, (float(x), float(y)), False) >= 0
+        for x, y in (
+            (roi["x1"], roi["y1"]),
+            (roi["x2"], roi["y1"]),
+            (roi["x2"], roi["y2"]),
+            (roi["x1"], roi["y2"]),
+        )
+    )
+
+
 def roi_coordinate_text(roi: dict) -> str:
     """환경설정 ROI 편집창에 표시할 좌표 문자열."""
     x1, y1 = int(roi["x1"]), int(roi["y1"])
@@ -373,18 +388,27 @@ class RoiTkDialog:
         if self.drag_start and self.drag_end:
             x1, y1 = self.image_rect.to_canvas(*self.drag_start)
             x2, y2 = self.image_rect.to_canvas(*self.drag_end)
-            self.canvas.create_rectangle(x1, y1, x2, y2, outline="#ffff00", width=2)
             drag_roi = {
                 "x1": min(self.drag_start[0], self.drag_end[0]),
                 "y1": min(self.drag_start[1], self.drag_end[1]),
                 "x2": max(self.drag_start[0], self.drag_end[0]),
                 "y2": max(self.drag_start[1], self.drag_end[1]),
             }
+            inside_hull = roi_is_inside_calibration_hull(
+                drag_roi, self._calib_hull,
+            )
+            drag_color = "#ffff00" if inside_hull else "#ff3b30"
+            self.canvas.create_rectangle(
+                x1, y1, x2, y2, outline=drag_color, width=3,
+            )
+            state_text = "" if inside_hull else " · ⚠ 캘리브레이션 가능 영역 밖"
             self.status.configure(
                 text=(
                     "설정 중(Thermal 640×480 좌표): "
                     f"{roi_coordinate_text(transformed_roi_bounds(drag_roi, self.inverse_homography))}"
+                    f"{state_text}"
                 ),
+                foreground=drag_color,
             )
         elif 0 <= self.selected < len(self.rois):
             selected = self.rois[self.selected]
@@ -396,9 +420,13 @@ class RoiTkDialog:
                     f"선택: {selected['name']} · Thermal 640×480 좌표: "
                     f"{roi_coordinate_text(thermal_bounds)} · 전체 {len(self.rois)}개"
                 ),
+                foreground="",
             )
         else:
-            self.status.configure(text=f"선택: 없음 · 전체 {len(self.rois)}개")
+            self.status.configure(
+                text=f"선택: 없음 · 전체 {len(self.rois)}개",
+                foreground="",
+            )
 
     def _source_point(self, event) -> tuple[int, int] | None:
         if not self.image_rect or not self.image_rect.contains(event.x, event.y):
@@ -430,6 +458,18 @@ class RoiTkDialog:
         x1, x2 = sorted((self.drag_start[0], self.drag_end[0]))
         y1, y2 = sorted((self.drag_start[1], self.drag_end[1]))
         if x2 - x1 > 5 and y2 - y1 > 5:
+            candidate = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+            if not roi_is_inside_calibration_hull(candidate, self._calib_hull):
+                self.drag_start = self.drag_end = None
+                self.redraw()
+                messagebox.showwarning(
+                    "ROI 범위 초과",
+                    "선택한 ROI가 캘리브레이션 가능 영역을 벗어났습니다.\n\n"
+                    "노란색 캘리브레이션 영역 안에서 다시 지정하세요.\n"
+                    "기존 ROI 좌표는 변경하지 않았습니다.",
+                    parent=self.win,
+                )
+                return
             self._snapshot()
             if 0 <= self.selected < len(self.rois):
                 name = self.rois[self.selected]["name"]
@@ -496,20 +536,15 @@ class RoiTkDialog:
         entries = []
         for roi in self.rois:
             # hull boundary check: 네 꼭짓점이 모두 hull 안에 있어야 통과
-            if self._calib_hull is not None:
-                for corner in (
-                    (roi["x1"], roi["y1"]), (roi["x2"], roi["y1"]),
-                    (roi["x2"], roi["y2"]), (roi["x1"], roi["y2"]),
-                ):
-                    if cv2.pointPolygonTest(self._calib_hull, corner, False) < 0:
-                        messagebox.showwarning(
-                            "ROI 범위 초과",
-                            f"'{roi['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
-                            f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
-                            f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
-                            parent=self.win,
-                        )
-                        return False
+            if not roi_is_inside_calibration_hull(roi, self._calib_hull):
+                messagebox.showwarning(
+                    "ROI 범위 초과",
+                    f"'{roi['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
+                    f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
+                    f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
+                    parent=self.win,
+                )
+                return False
 
             # 사각형 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스 사용.
             thermal_bounds = thermal_bounds_for_roi(

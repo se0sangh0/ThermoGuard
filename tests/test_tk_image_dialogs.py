@@ -4,6 +4,7 @@ from thermal_monitoring.tools.tk_image_dialogs import (
     calibration_hull_canvas_points,
     fit_image_rect,
     recommended_window_size,
+    roi_is_inside_calibration_hull,
     roi_coordinate_text,
     thermal_bounds_for_roi,
     transformed_roi_bounds,
@@ -52,6 +53,26 @@ def test_legacy_calibration_without_points_has_no_visible_hull():
     rect = fit_image_rect(640, 480, 0, 0, 640, 480)
 
     assert calibration_hull_canvas_points(None, rect) == []
+
+
+def test_roi_hull_check_accepts_inside_and_boundary_but_rejects_outside():
+    hull = np.array([[[10, 10]], [[100, 10]], [[100, 100]], [[10, 100]]], dtype=np.float32)
+
+    assert roi_is_inside_calibration_hull(
+        {"x1": 20, "y1": 20, "x2": 90, "y2": 90}, hull,
+    )
+    assert roi_is_inside_calibration_hull(
+        {"x1": 10, "y1": 10, "x2": 100, "y2": 100}, hull,
+    )
+    assert not roi_is_inside_calibration_hull(
+        {"x1": 5, "y1": 20, "x2": 90, "y2": 90}, hull,
+    )
+
+
+def test_roi_hull_check_allows_legacy_calibration_without_hull():
+    assert roi_is_inside_calibration_hull(
+        {"x1": 0, "y1": 0, "x2": 100, "y2": 100}, None,
+    )
 
 
 def test_roi_coordinate_text_formats_bounds_and_size():
