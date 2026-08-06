@@ -142,6 +142,26 @@ def thermal_roi_bounds_are_valid(
     )
 
 
+def calibration_resolution_status(
+    saved_thermal_size,
+    saved_visual_size,
+    current_thermal_size,
+    current_visual_size,
+) -> str:
+    """캘리브레이션과 현재 원본 이미지 해상도의 비교 상태를 반환한다."""
+    if saved_thermal_size is None or saved_visual_size is None:
+        return "unknown"
+    saved_thermal = tuple(int(value) for value in saved_thermal_size)
+    saved_visual = tuple(int(value) for value in saved_visual_size)
+    current_thermal = tuple(int(value) for value in current_thermal_size)
+    current_visual = tuple(int(value) for value in current_visual_size)
+    return (
+        "match"
+        if saved_thermal == current_thermal and saved_visual == current_visual
+        else "mismatch"
+    )
+
+
 def recommended_window_size(
     screen_width: int,
     screen_height: int,
@@ -217,9 +237,13 @@ class RoiTkDialog:
         if isinstance(calib_data, dict):
             self.homography = calib_data["H"]
             self._calib_visual_pts = calib_data.get("visual_pts")
+            self._calib_thermal_size = calib_data.get("thermal_size")
+            self._calib_visual_size = calib_data.get("visual_size")
         else:
             self.homography = calib_data
             self._calib_visual_pts = None
+            self._calib_thermal_size = None
+            self._calib_visual_size = None
         if self.homography.shape != (3, 3):
             raise ValueError("캘리브레이션 행렬 형식이 올바르지 않습니다.")
         self.inverse_homography = np.linalg.inv(self.homography)
@@ -231,8 +255,17 @@ class RoiTkDialog:
                 self._calib_visual_pts.reshape(-1, 1, 2).astype(np.float32)
             )
         
+        with Image.open(thermal_path) as thermal_image:
+            self.current_thermal_size = thermal_image.size
         self.image = Image.open(visual_path).convert("RGB")
         self.source_width, self.source_height = self.image.size
+        self.current_visual_size = self.image.size
+        self._resolution_status = calibration_resolution_status(
+            self._calib_thermal_size,
+            self._calib_visual_size,
+            self.current_thermal_size,
+            self.current_visual_size,
+        )
         self._load_rois()
 
         self.win = tk.Toplevel(parent)
@@ -296,6 +329,43 @@ class RoiTkDialog:
             ("<Escape>", self.close),
         ):
             self.win.bind(key, lambda _event, fn=command: fn())
+        self.win.after_idle(self._show_resolution_status)
+
+    def _show_resolution_status(self):
+        current_text = (
+            f"현재 이미지: Thermal {self.current_thermal_size[0]}×{self.current_thermal_size[1]} / "
+            f"Visual {self.current_visual_size[0]}×{self.current_visual_size[1]}"
+        )
+        if self._resolution_status == "unknown":
+            messagebox.showinfo(
+                "캘리브레이션 해상도 검사 불가",
+                "기존 캘리브레이션 파일에 원본 이미지 해상도 정보가 없습니다.\n\n"
+                f"{current_text}\n\n"
+                "ROI 작업은 계속할 수 있습니다. 다음 캘리브레이션부터 해상도가 저장됩니다.",
+                parent=self.win,
+            )
+            return
+
+        saved_thermal = tuple(int(value) for value in self._calib_thermal_size)
+        saved_visual = tuple(int(value) for value in self._calib_visual_size)
+        saved_text = (
+            f"캘리브레이션: Thermal {saved_thermal[0]}×{saved_thermal[1]} / "
+            f"Visual {saved_visual[0]}×{saved_visual[1]}"
+        )
+        if self._resolution_status == "match":
+            messagebox.showinfo(
+                "캘리브레이션 해상도 일치",
+                f"{saved_text}\n{current_text}\n\n원본 이미지 해상도가 일치합니다.",
+                parent=self.win,
+            )
+        else:
+            messagebox.showwarning(
+                "캘리브레이션 해상도 불일치",
+                f"{saved_text}\n{current_text}\n\n"
+                "원본 이미지 해상도가 다르므로 ROI 좌표가 어긋날 수 있습니다.\n"
+                "검사 결과만 안내하며 ROI 작업은 차단하지 않습니다.",
+                parent=self.win,
+            )
 
     def _load_rois(self):
         entries = self.cfg.roi.rois or []

@@ -5,6 +5,30 @@ from thermal_monitoring.tools import calibration, product_dashboard
 from thermal_monitoring.tools.product_dashboard import SettingsDialog
 
 
+def test_calibration_point_metrics_report_distribution_without_thresholds():
+    metrics = calibration.calibration_point_metrics(
+        [(0, 0), (640, 0), (640, 480), (0, 480), (320, 240), (500, 300)],
+        640,
+        480,
+    )
+
+    assert metrics["point_count"] == 6
+    assert metrics["x_span_ratio"] == 1.0
+    assert metrics["y_span_ratio"] == 1.0
+    assert metrics["hull_area_ratio"] == 1.0
+
+
+def test_calibration_point_metrics_allow_narrow_distribution():
+    metrics = calibration.calibration_point_metrics(
+        [(100, 100), (120, 100), (120, 120), (100, 120), (110, 110), (115, 115)],
+        640,
+        480,
+    )
+
+    assert metrics["point_count"] == 6
+    assert metrics["hull_area_ratio"] < 0.01
+
+
 def _dialog(tmp_path: Path):
     logs = []
     lifecycle = []

@@ -1,6 +1,7 @@
 import numpy as np
 
 from thermal_monitoring.tools.tk_image_dialogs import (
+    calibration_resolution_status,
     calibration_hull_canvas_points,
     fit_image_rect,
     recommended_window_size,
@@ -19,6 +20,21 @@ def test_fit_image_rect_preserves_aspect_ratio_and_centers_image():
     assert (rect.width, rect.height) == (666, 500)
     assert rect.x == 167
     assert rect.y == 0
+
+
+def test_calibration_resolution_status_reports_match_and_mismatch():
+    assert calibration_resolution_status(
+        (640, 480), (2592, 1944), (640, 480), (2592, 1944),
+    ) == "match"
+    assert calibration_resolution_status(
+        (640, 480), (2592, 1944), (640, 480), (1920, 1080),
+    ) == "mismatch"
+
+
+def test_calibration_resolution_status_supports_legacy_files():
+    assert calibration_resolution_status(
+        None, None, (640, 480), (2592, 1944),
+    ) == "unknown"
 
 
 def test_image_rect_coordinate_round_trip_after_resize():

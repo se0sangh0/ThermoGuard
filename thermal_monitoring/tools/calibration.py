@@ -88,6 +88,31 @@ def resize_for_display(img, width):
     return cv2.resize(img, (width, height))
 
 
+def calibration_point_metrics(points, image_width: int, image_height: int) -> dict:
+    """대응점의 가로·세로 분포와 Convex Hull 면적 비율을 계산한다."""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(pts) == 0 or image_width <= 0 or image_height <= 0:
+        return {
+            "point_count": len(pts),
+            "x_span_ratio": 0.0,
+            "y_span_ratio": 0.0,
+            "hull_area_ratio": 0.0,
+        }
+
+    x_span = float(pts[:, 0].max() - pts[:, 0].min()) / image_width
+    y_span = float(pts[:, 1].max() - pts[:, 1].min()) / image_height
+    hull_area = 0.0
+    if len(pts) >= 3:
+        hull = cv2.convexHull(pts.reshape(-1, 1, 2))
+        hull_area = float(cv2.contourArea(hull))
+    return {
+        "point_count": len(pts),
+        "x_span_ratio": x_span,
+        "y_span_ratio": y_span,
+        "hull_area_ratio": hull_area / float(image_width * image_height),
+    }
+
+
 def _compute_button_rects(canvas_width: int, image_height: int):
     """ROI 설정 도구와 같은 방식으로 하단 버튼 위치를 계산한다."""
     gap = 8
@@ -464,11 +489,33 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
         "H": H,
         "thermal_pts": np.array(thermal_pts, dtype=np.float32),
         "visual_pts": np.array(rgb_pts, dtype=np.float32),
+        "thermal_size": (thermal.shape[1], thermal.shape[0]),
+        "visual_size": (rgb.shape[1], rgb.shape[0]),
     }
     np.save(output_path, calib_data)
     print(f"Homography saved: {output_path}")
     print("Homography matrix:")
     print(H)
+
+    thermal_metrics = calibration_point_metrics(
+        thermal_pts, thermal.shape[1], thermal.shape[0],
+    )
+    visual_metrics = calibration_point_metrics(
+        rgb_pts, rgb.shape[1], rgb.shape[0],
+    )
+    for label, metrics in (("Thermal", thermal_metrics), ("Visual", visual_metrics)):
+        print(
+            f"{label} 대응점 분포: "
+            f"가로 {metrics['x_span_ratio'] * 100:.1f}% / "
+            f"세로 {metrics['y_span_ratio'] * 100:.1f}% / "
+            f"Hull 면적 {metrics['hull_area_ratio'] * 100:.1f}%"
+        )
+    _show_calibration_quality_dialog(
+        thermal_metrics,
+        visual_metrics,
+        mean_error,
+        max_error,
+    )
 
     pt = np.array([[[320, 240]]], dtype=np.float32)
     rgb_pt = cv2.perspectiveTransform(pt, H)
@@ -513,6 +560,41 @@ def _show_minimum_points_dialog(pair_count: int):
             f"필요 대응점: {MIN_CALIBRATION_POINT_PAIRS}쌍 이상\n\n"
             "RGB와 Thermal 이미지에서 같은 위치의 대응점을 추가로 선택한 뒤 "
             "다시 저장하세요.",
+        )
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _show_calibration_quality_dialog(
+    thermal_metrics: dict,
+    visual_metrics: dict,
+    mean_error: float,
+    max_error: float,
+):
+    """저장을 차단하지 않고 캘리브레이션 점 분포 정보를 보여준다."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        def metrics_text(label: str, metrics: dict) -> str:
+            return (
+                f"{label} ({metrics['point_count']}점)\n"
+                f"- 가로 분포: {metrics['x_span_ratio'] * 100:.1f}%\n"
+                f"- 세로 분포: {metrics['y_span_ratio'] * 100:.1f}%\n"
+                f"- Convex Hull 면적: {metrics['hull_area_ratio'] * 100:.1f}%"
+            )
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "캘리브레이션 저장 완료 · 점 분포 정보",
+            "캘리브레이션을 저장했습니다.\n"
+            "\n"
+            f"{metrics_text('Thermal', thermal_metrics)}\n\n"
+            f"{metrics_text('Visual', visual_metrics)}\n\n"
+            f"평균 재투영 오차: {mean_error:.2f}px\n"
+            f"최대 재투영 오차: {max_error:.2f}px",
         )
         root.destroy()
     except Exception:
