@@ -1424,8 +1424,23 @@ class ProductDashboard:
             roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
         )
 
+        overlay_path = None
+        if status != Status.NORMAL:
+            overlay_dir = Path(self.cfg.paths.overlay_dir)
+            overlay_dir.mkdir(parents=True, exist_ok=True)
+            candidate = overlay_dir / f"{base}_overlay.jpg"
+            if cv2.imwrite(str(candidate), overlay):
+                overlay_path = candidate
+
+        mean_difference = None
+        if thermal_img is not None and visual_img is not None:
+            thermal_small = cv2.resize(thermal_img, (160, 120))
+            visual_small = cv2.resize(visual_img, (160, 120))
+            mean_difference = float(cv2.absdiff(thermal_small, visual_small).mean())
+
         return {
-            "base": base, "overlay": overlay, "visual_img": visual_img,
+            "base": base, "overlay": overlay, "thermal_img": thermal_img,
+            "visual_img": visual_img,
             "max_temp": roi_result.max_temp, "mean_temp": roi_result.mean_temp,
             "min_temp": getattr(roi_result, 'min_temp', roi_result.max_temp),
             "hot_temp_95": roi_result.hot_temp_95,
@@ -1444,6 +1459,12 @@ class ProductDashboard:
             "captured_at": captured_at,
             "image_quality_ok": image_quality_ok,
             "image_quality_reason": image_quality_reason,
+            "image_quality_mean_difference": mean_difference,
+            "thermal_path": thermal,
+            "visual_path": visual,
+            "npy_path": npy,
+            "overlay_path": overlay_path,
+            "hotspots": merged_hotspots,
             "thermal_only_mode": (
                 self.cfg.tools.mode == "both"
                 and visual_img is None
@@ -1792,6 +1813,25 @@ class ProductDashboard:
         self.operating_logs.insert(0, row)
         del self.operating_logs[1000:]
         _file_log.info("[%s] %s | %s", category, result, detail)
+        if self.cfg.backend.enabled:
+            payload = {
+                "category": category,
+                "action": category,
+                "result": result,
+                "detail": {"message": detail},
+            }
+
+            def persist_operation_log():
+                try:
+                    requests.post(
+                        f"{self.cfg.backend.url}/api/operation-logs",
+                        json=payload,
+                        timeout=self.cfg.backend.timeout_sec,
+                    )
+                except requests.RequestException:
+                    _file_log.debug("operation_logs API unavailable", exc_info=True)
+
+            threading.Thread(target=persist_operation_log, daemon=True).start()
 
     def _sync_temperature_history(self):
         """Load the selected period and join it to live in-memory readings."""
@@ -2578,7 +2618,7 @@ class SettingsDialog:
         thermal, visual = pair
         if not self._begin_tool("캘리브레이션"):
             return
-        self.d._add_operating_log("설정", "시작", thermal.name)
+        self.d._add_operating_log("캘리브레이션", "시작", thermal.name)
         saved = False
         calibration_window_title = None
         try:
@@ -2586,19 +2626,36 @@ class SettingsDialog:
             calibration_window_title = CALIBRATION_WINDOW_TITLE
             self._tool_window_titles = (CALIBRATION_WINDOW_TITLE,)
             self._show_tool_guard()
+            def save_calibration_to_db(calibration_data):
+                if not self.d.cfg.backend.enabled:
+                    return
+                camera_id = self.d.cfg.identity.db_camera_id
+                if camera_id is None:
+                    raise RuntimeError("캘리브레이션을 저장할 DB camera_id가 없습니다.")
+                response = requests.post(
+                    f"{self.d.cfg.backend.url}/api/calibrations",
+                    json={"camera_id": camera_id, **calibration_data},
+                    timeout=self.d.cfg.backend.timeout_sec,
+                )
+                response.raise_for_status()
+                body = response.json()
+                if body.get("status") != "created":
+                    raise RuntimeError(body.get("error", "캘리브레이션 DB 저장 실패"))
+
             saved = bool(run_calibration(
                 str(thermal),
                 str(visual),
                 event_pump=self._pump_tool_events,
                 display_bounds=self._tool_display_bounds(),
+                result_callback=save_calibration_to_db,
             ))
             if saved:
-                self.d._add_operating_log("설정", "성공", self.d.cfg.paths.homography_path)
+                self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
             else:
-                self.d._add_operating_log("설정", "성공", "저장 없이 종료")
+                self.d._add_operating_log("캘리브레이션", "종료", "저장 없이 종료")
         except Exception as exc:
             self.d.metrics.exception_count += 1
-            self.d._add_operating_log("설정", "실패", str(exc))
+            self.d._add_operating_log("캘리브레이션", "예외 처리", str(exc))
             messagebox.showerror("캘리브레이션", str(exc), parent=self.win)
             saved = False
         finally:
@@ -2740,7 +2797,7 @@ class SettingsDialog:
         if not roi_ids:
             self.d._add_operating_log(
                 "DB",
-                "실패",
+                "보류",
                 "저장된 DB ROI ID가 없어 ROI 저장 후 생성합니다.",
             )
             from .threshold_api_client import ThresholdSyncResult
@@ -2773,7 +2830,7 @@ class SettingsDialog:
         )
         self.d._add_operating_log(
             "DB",
-            "성공",
+            "저장 완료",
             f"ROI {len(result.roi_ids)}개 · 생성 {result.created}개 · "
             f"갱신 {result.updated}개",
         )

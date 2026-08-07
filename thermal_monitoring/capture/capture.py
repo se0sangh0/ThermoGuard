@@ -70,6 +70,10 @@ class CaptureSession:
         # 카메라를 다시 치지 않고 최신 프레임을 재사용할 수 있게 노출한다.
         self._last_pair: tuple[str | None, str | None] = (None, None)
         self._last_pair_lock = threading.Lock()
+        self._backend_enabled = cfg.backend.enabled
+        self._backend_url = cfg.backend.url
+        self._backend_timeout = cfg.backend.timeout_sec
+        self._db_camera_id = cfg.identity.db_camera_id
         # GUI-UPDATE: cam_ip 인자가 None이어도 config에서 확정된 self.cam_ip를 사용한다.
         self._urls = {
             "thermal": camera_image_url(self.cam_ip),
@@ -83,6 +87,18 @@ class CaptureSession:
             self.log_callback(msg)
         else:
             print(msg)
+
+    def _report_connection_status(self, status: str) -> None:
+        if not self._backend_enabled or self._db_camera_id is None:
+            return
+        try:
+            requests.patch(
+                f"{self._backend_url}/api/cameras/{self._db_camera_id}/status",
+                json={"connection_status": status},
+                timeout=self._backend_timeout,
+            )
+        except requests.RequestException:
+            _log.debug("camera status API unavailable", exc_info=True)
 
     def start(self):
         if self._running:
@@ -308,10 +324,13 @@ class CaptureSession:
                 if all_ok:
                     if not self._was_connected:
                         _log.info("Camera connection restored: %s", self.cam_ip)
+                        self._report_connection_status("connected")
                         self._was_connected = True
                     self._consecutive_failures = 0
                 else:
                     self._consecutive_failures += 1
+                    if self._was_connected:
+                        self._report_connection_status("disconnected")
                     self._was_connected = False
                     if self._consecutive_failures == 5:
                         _log.warning("Camera unreachable for 5 consecutive attempts: %s", self.cam_ip)

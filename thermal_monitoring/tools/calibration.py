@@ -151,7 +151,13 @@ def _draw_button_bar(canvas, image_height, button_rects):
         )
 
 
-def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_bounds=None):
+def run_calibration(
+    thermal_path=None,
+    rgb_path=None,
+    event_pump=None,
+    display_bounds=None,
+    result_callback=None,
+):
     """GUI 또는 CLI에서 호출 가능한 캘리브레이션 진입점."""
     global thermal_pts, rgb_pts, pair_state, t_mouse_x, t_mouse_y, r_mouse_x, r_mouse_y
     thermal_pts.clear()
@@ -516,6 +522,20 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
         mean_error,
         max_error,
     )
+
+    if result_callback is not None:
+        result_callback({
+            "thermal_points": thermal_arr.tolist(),
+            "visual_points": rgb_arr.tolist(),
+            "homography_matrix": H.tolist(),
+            "mean_error_px": mean_error,
+            "max_error_px": max_error,
+            "scale_ratio": float(
+                ((rgb.shape[1] * rgb.shape[0]) / (thermal.shape[1] * thermal.shape[0])) ** 0.5
+            ),
+            "result": "success",
+            "active": True,
+        })
 
     pt = np.array([[[320, 240]]], dtype=np.float32)
     rgb_pt = cv2.perspectiveTransform(pt, H)

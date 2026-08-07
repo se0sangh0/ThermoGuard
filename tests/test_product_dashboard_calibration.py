@@ -78,13 +78,10 @@ def test_open_calibration_uses_existing_calibration_api(monkeypatch, tmp_path):
 
     dialog.open_calibration()
 
-    assert calls == [(
-        (str(thermal), str(visual)),
-        {
-            "event_pump": dialog._pump_tool_events,
-            "display_bounds": (10, 20, 1920, 1080),
-        },
-    )]
+    assert calls[0][0] == (str(thermal), str(visual))
+    assert calls[0][1]["event_pump"] is dialog._pump_tool_events
+    assert calls[0][1]["display_bounds"] == (10, 20, 1920, 1080)
+    assert callable(calls[0][1]["result_callback"])
     assert lifecycle == [("begin", "캘리브레이션"), ("guard",), ("end",)]
     assert ("캘리브레이션", "완료", str(tmp_path / "thermal_to_rgb.npy")) in logs
 

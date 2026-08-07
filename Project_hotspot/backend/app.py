@@ -2,9 +2,10 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
+import json
 
 from database import engine
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Hotspot Guard API",
@@ -90,6 +91,71 @@ class MeasurementCreate(BaseModel):
     algorithm_version: str = "v2.0"
     do_alarm: bool = False
     alarm_message: str | None = None
+
+    captured_at: datetime | None = None
+    capture_mode: str | None = None
+    thermal_status: str = "success"
+    visual_status: str = "skipped"
+    pair_status: str = "complete"
+    files: list["CaptureFileCreate"] = Field(default_factory=list)
+    hotspots: list["HotspotCreate"] = Field(default_factory=list)
+    image_quality: "ImageQualityCreate | None" = None
+
+
+class CaptureFileCreate(BaseModel):
+    file_type: str
+    storage_path: str
+    width: int | None = None
+    height: int | None = None
+    size_bytes: int | None = None
+    checksum_sha256: str | None = None
+
+
+class HotspotCreate(BaseModel):
+    center_x: int
+    center_y: int
+    max_temp: float
+    area_pixels: int | None = None
+
+
+class ImageQualityCreate(BaseModel):
+    is_valid: bool
+    reason_code: str
+    reason_message: str | None = None
+    thermal_width: int | None = None
+    thermal_height: int | None = None
+    visual_width: int | None = None
+    visual_height: int | None = None
+    mean_difference: float | None = None
+
+
+class OperationLogCreate(BaseModel):
+    category: str
+    action: str
+    result: str
+    detail: dict | list | str | int | float | bool | None = None
+    user_id: int | None = None
+
+
+class CalibrationCreate(BaseModel):
+    camera_id: int
+    thermal_points: list[list[float]]
+    visual_points: list[list[float]]
+    homography_matrix: list[list[float]]
+    mean_error_px: float | None = None
+    max_error_px: float | None = None
+    scale_ratio: float | None = None
+    result: str = "success"
+    active: bool = True
+    performed_by: int | None = None
+
+
+MeasurementCreate.model_rebuild()
+
+
+class CameraStatusUpdate(BaseModel):
+    connection_status: str
+    error_message: str | None = None
 
 class ThresholdUpdate(BaseModel):
     baseline_temp: float | None = None
@@ -855,6 +921,19 @@ def create_notification_delivery(
 def create_factory(factory: FactoryCreate):
     try:
         with engine.begin() as connection:
+            existing = connection.execute(
+                text("""
+                    SELECT factory_id FROM factories
+                    WHERE factory_name = :factory_name AND timezone = :timezone
+                    ORDER BY factory_id LIMIT 1
+                """),
+                {"factory_name": factory.factory_name, "timezone": factory.timezone},
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "status": "created", "factory_id": existing[0],
+                    "factory_name": factory.factory_name, "existing": True,
+                }
             result = connection.execute(
                 text("""
                     INSERT INTO factories (
@@ -891,6 +970,16 @@ def create_factory(factory: FactoryCreate):
 def create_production_line(line: ProductionLineCreate):
     try:
         with engine.begin() as connection:
+            existing = connection.execute(
+                text("""
+                    SELECT line_id FROM production_lines
+                    WHERE factory_id = :factory_id AND line_name = :line_name
+                    ORDER BY line_id LIMIT 1
+                """),
+                {"factory_id": line.factory_id, "line_name": line.line_name},
+            ).fetchone()
+            if existing is not None:
+                return {"status": "created", "line_id": existing[0], "existing": True}
             result = connection.execute(
                 text("""
                     INSERT INTO production_lines (
@@ -929,6 +1018,16 @@ def create_production_line(line: ProductionLineCreate):
 def create_robot(robot: RobotCreate):
     try:
         with engine.begin() as connection:
+            existing = connection.execute(
+                text("""
+                    SELECT robot_id FROM robots
+                    WHERE line_id = :line_id AND robot_code = :robot_code
+                    ORDER BY robot_id LIMIT 1
+                """),
+                {"line_id": robot.line_id, "robot_code": robot.robot_code},
+            ).fetchone()
+            if existing is not None:
+                return {"status": "created", "robot_id": existing[0], "existing": True}
             result = connection.execute(
                 text("""
                     INSERT INTO robots (
@@ -979,6 +1078,24 @@ def create_robot(robot: RobotCreate):
 def create_camera(camera: CameraCreate):
     try:
         with engine.begin() as connection:
+            existing = connection.execute(
+                text("""
+                    SELECT camera_id FROM cameras
+                    WHERE robot_id = :robot_id
+                      AND (camera_code = :camera_code OR ip_address = :ip_address)
+                    ORDER BY camera_id LIMIT 1
+                """),
+                {
+                    "robot_id": camera.robot_id,
+                    "camera_code": camera.camera_code,
+                    "ip_address": camera.ip_address,
+                },
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "status": "created", "camera_id": existing[0],
+                    "camera_code": camera.camera_code, "existing": True,
+                }
             result = connection.execute(
                 text("""
                     INSERT INTO cameras (
@@ -1132,6 +1249,79 @@ def create_threshold(threshold: ThresholdCreate):
             "error": str(e)
         }
 
+
+@app.post("/api/operation-logs")
+def create_operation_log(data: OperationLogCreate):
+    try:
+        detail = data.detail
+        if detail is not None and not isinstance(detail, (dict, list)):
+            detail = {"message": detail}
+        with engine.begin() as connection:
+            result = connection.execute(
+                text("""
+                    INSERT INTO operation_logs (
+                        occurred_at, user_id, category, action, result, detail
+                    ) VALUES (
+                        NOW(6), :user_id, :category, :action, :result, :detail
+                    )
+                """),
+                {
+                    "user_id": data.user_id,
+                    "category": data.category,
+                    "action": data.action,
+                    "result": data.result,
+                    "detail": json.dumps(detail, ensure_ascii=False) if detail is not None else None,
+                }
+            )
+        return {"status": "created", "operation_id": result.lastrowid}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/api/calibrations")
+def create_calibration(data: CalibrationCreate):
+    try:
+        with engine.begin() as connection:
+            camera = connection.execute(
+                text("SELECT camera_id FROM cameras WHERE camera_id = :camera_id"),
+                {"camera_id": data.camera_id},
+            ).fetchone()
+            if camera is None:
+                return {"status": "error", "error": "해당 camera_id가 없습니다."}
+            if data.active:
+                connection.execute(
+                    text("UPDATE calibrations SET active = 0 WHERE camera_id = :camera_id"),
+                    {"camera_id": data.camera_id},
+                )
+            result = connection.execute(
+                text("""
+                    INSERT INTO calibrations (
+                        camera_id, performed_at, performed_by, thermal_points,
+                        visual_points, homography_matrix, mean_error_px,
+                        max_error_px, scale_ratio, result, active
+                    ) VALUES (
+                        :camera_id, NOW(6), :performed_by, :thermal_points,
+                        :visual_points, :homography_matrix, :mean_error_px,
+                        :max_error_px, :scale_ratio, :result, :active
+                    )
+                """),
+                {
+                    "camera_id": data.camera_id,
+                    "performed_by": data.performed_by,
+                    "thermal_points": json.dumps(data.thermal_points),
+                    "visual_points": json.dumps(data.visual_points),
+                    "homography_matrix": json.dumps(data.homography_matrix),
+                    "mean_error_px": data.mean_error_px,
+                    "max_error_px": data.max_error_px,
+                    "scale_ratio": data.scale_ratio,
+                    "result": data.result,
+                    "active": 1 if data.active else 0,
+                },
+            )
+        return {"status": "created", "calibration_id": result.lastrowid}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 @app.post("/api/measurements")
 def create_measurement(data: MeasurementCreate):
     try:
@@ -1199,10 +1389,10 @@ def create_measurement(data: MeasurementCreate):
             # 3. 상태 및 캡처 모드는 thermal_monitoring에서 전달한 값 사용
             status = data.status
 
-            capture_mode = (
+            capture_mode = data.capture_mode or (
                 "warning" if status in ("warning", "critical") else "normal"
             )
-            visual_status = "success" if status == "normal" else "skipped"
+            captured_at = data.captured_at or datetime.now()
 
             # 4. 촬영 기록 생성
             capture_result = connection.execute(
@@ -1219,23 +1409,46 @@ def create_measurement(data: MeasurementCreate):
                     )
                     VALUES (
                         :camera_id,
-                        NOW(6),
-                        NOW(6),
+                        :captured_at,
+                        :captured_at,
                         NOW(6),
                         :capture_mode,
-                        'success',
+                        :thermal_status,
                         :visual_status,
-                        'complete'
+                        :pair_status
                     )
                 """),
                 {
                     "camera_id": data.camera_id,
+                    "captured_at": captured_at,
                     "capture_mode": capture_mode,
-                    "visual_status": visual_status,
+                    "thermal_status": data.thermal_status,
+                    "visual_status": data.visual_status,
+                    "pair_status": data.pair_status,
                 }
             )
 
             capture_id = capture_result.lastrowid
+
+            overlay_file_id = None
+            for capture_file in data.files:
+                file_result = connection.execute(
+                    text("""
+                        INSERT INTO capture_files (
+                            capture_id, file_type, storage_path, width, height,
+                            size_bytes, checksum_sha256
+                        ) VALUES (
+                            :capture_id, :file_type, :storage_path, :width, :height,
+                            :size_bytes, :checksum_sha256
+                        )
+                    """),
+                    {
+                        "capture_id": capture_id,
+                        **capture_file.model_dump(),
+                    }
+                )
+                if capture_file.file_type == "overlay":
+                    overlay_file_id = file_result.lastrowid
 
             # 5. 분석 실행 기록 생성 (thermal_monitoring의 algorithm_version 사용)
             analysis_result = connection.execute(
@@ -1315,6 +1528,37 @@ def create_measurement(data: MeasurementCreate):
 
             measurement_id = measurement_result.lastrowid
 
+            for hotspot in data.hotspots:
+                connection.execute(
+                    text("""
+                        INSERT INTO hotspots (
+                            measurement_id, center_x, center_y, max_temp, area_pixels
+                        ) VALUES (
+                            :measurement_id, :center_x, :center_y, :max_temp, :area_pixels
+                        )
+                    """),
+                    {"measurement_id": measurement_id, **hotspot.model_dump()}
+                )
+
+            if data.image_quality is not None:
+                connection.execute(
+                    text("""
+                        INSERT INTO image_quality_results (
+                            capture_id, checked_at, is_valid, reason_code,
+                            reason_message, thermal_width, thermal_height,
+                            visual_width, visual_height, mean_difference
+                        ) VALUES (
+                            :capture_id, NOW(6), :is_valid, :reason_code,
+                            :reason_message, :thermal_width, :thermal_height,
+                            :visual_width, :visual_height, :mean_difference
+                        )
+                    """),
+                    {
+                        "capture_id": capture_id,
+                        **data.image_quality.model_dump(),
+                    }
+                )
+
             alert_id = None
 
             # 7. do_alarm이 True인 경우만 alert_events 생성
@@ -1351,7 +1595,8 @@ def create_measurement(data: MeasurementCreate):
                             severity,
                             max_temp,
                             message,
-                            event_status
+                            event_status,
+                            overlay_file_id
                         )
                         VALUES (
                             :capture_id,
@@ -1362,7 +1607,8 @@ def create_measurement(data: MeasurementCreate):
                             :severity,
                             :max_temp,
                             :message,
-                            'open'
+                            'open',
+                            :overlay_file_id
                         )
                     """),
                     {
@@ -1372,6 +1618,7 @@ def create_measurement(data: MeasurementCreate):
                         "roi_id": data.roi_id,
                         "severity": status,
                         "max_temp": data.max_temp,
+                        "overlay_file_id": overlay_file_id,
                         "message": (
                             data.alarm_message or
                             f"ROI {data.roi_id} 온도 이상 감지: "
@@ -1381,6 +1628,18 @@ def create_measurement(data: MeasurementCreate):
                 )
 
                 alert_id = alert_result.lastrowid
+
+            connection.execute(
+                text("""
+                    INSERT INTO api_request_logs (
+                        camera_id, requested_at, endpoint_type, result,
+                        http_status, retry_count
+                    ) VALUES (
+                        :camera_id, NOW(6), 'measurements', 'success', 200, 0
+                    )
+                """),
+                {"camera_id": data.camera_id}
+            )
 
         return {
             "status": "created",
@@ -1402,6 +1661,38 @@ def create_measurement(data: MeasurementCreate):
         }
 
 #=====여기서부터는 patch=====#
+
+@app.patch("/api/cameras/{camera_id}/status")
+def update_camera_status(camera_id: int, data: CameraStatusUpdate):
+    try:
+        allowed = {"connected", "disconnected", "error", "unknown"}
+        if data.connection_status not in allowed:
+            return {"status": "error", "error": "지원하지 않는 connection_status입니다."}
+        with engine.begin() as connection:
+            result = connection.execute(
+                text("""
+                    UPDATE cameras
+                    SET connection_status = :connection_status,
+                        last_connected_at = CASE
+                            WHEN :connection_status = 'connected' THEN NOW(6)
+                            ELSE last_connected_at
+                        END,
+                        last_failed_at = CASE
+                            WHEN :connection_status IN ('disconnected', 'error') THEN NOW(6)
+                            ELSE last_failed_at
+                        END
+                    WHERE camera_id = :camera_id
+                """),
+                {
+                    "camera_id": camera_id,
+                    "connection_status": data.connection_status,
+                },
+            )
+        if result.rowcount == 0:
+            return {"status": "error", "error": "해당 camera_id가 없습니다."}
+        return {"status": "updated", "camera_id": camera_id}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 @app.patch("/api/thresholds/{threshold_id}")
 def update_threshold(

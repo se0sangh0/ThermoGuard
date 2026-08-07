@@ -391,7 +391,7 @@ def test_measurement_uses_matching_roi_identity_and_abnormal_statuses(monkeypatc
     ]
 
 
-def test_normal_measurement_is_skipped_and_completes_backend_event(monkeypatch):
+def test_normal_measurement_is_persisted_and_completes_backend_event(monkeypatch):
     posted = []
     backend_event = threading.Event()
     dashboard = SimpleNamespace(
@@ -418,7 +418,10 @@ def test_normal_measurement_is_skipped_and_completes_backend_event(monkeypatch):
     dispatcher = TelegramDispatcher(dashboard)
     monkeypatch.setattr(
         "thermal_monitoring.tools.telegram_dispatcher.requests.post",
-        lambda *args, **kwargs: posted.append((args, kwargs)),
+        lambda *args, **kwargs: (
+            posted.append((args, kwargs))
+            or _Response({"status": "created", "capture_id": 1, "alert_id": None})
+        ),
     )
     monkeypatch.setattr(
         dispatcher,
@@ -428,20 +431,26 @@ def test_normal_measurement_is_skipped_and_completes_backend_event(monkeypatch):
         ),
     )
     result = {
-        "measurement_roi": SimpleNamespace(db_roi_id=None),
+        "base": "capture",
+        "measurement_roi": SimpleNamespace(db_roi_id=12),
         "roi_name": "ROI-2",
+        "max_temp": 31.0,
+        "min_temp": 25.0,
+        "mean_temp": 28.0,
+        "hot_temp_95": 30.0,
         "status": Status.CRITICAL,
         "measurement_status": Status.NORMAL,
-        "alarm": True,
+        "alarm": False,
         "_backend_posted_event": backend_event,
     }
 
     dispatcher.post_measurement(result)
 
-    assert posted == []
+    assert len(posted) == 1
+    assert posted[0][1]["json"]["status"] == "normal"
     assert backend_event.is_set()
     assert vars(dashboard.metrics) == {
-        "api_successes": 0,
+        "api_successes": 1,
         "api_timeouts": 0,
         "api_connection_errors": 0,
         "api_other_errors": 0,
