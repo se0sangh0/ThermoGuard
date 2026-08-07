@@ -77,6 +77,33 @@ def test_dashboard_keeps_visual_grace_in_normal_both_mode(monkeypatch):
     assert calls == [("/dataset", {"visual_mode": True})]
 
 
+def test_critical_popup_only_fires_when_entering_critical():
+    should_show = ProductDashboard._should_show_critical_popup
+
+    assert should_show(Status.NORMAL, Status.CRITICAL) is True
+    assert should_show(Status.WARNING, Status.CRITICAL) is True
+    assert should_show(Status.CRITICAL, Status.CRITICAL) is False
+    assert should_show(Status.NORMAL, Status.WARNING) is False
+    assert should_show(Status.WARNING, Status.NORMAL) is False
+
+
+def test_critical_popup_can_fire_again_after_recovery():
+    statuses = [
+        Status.NORMAL,
+        Status.CRITICAL,
+        Status.CRITICAL,
+        Status.WARNING,
+        Status.CRITICAL,
+    ]
+
+    transitions = [
+        ProductDashboard._should_show_critical_popup(previous, current)
+        for previous, current in zip(statuses, statuses[1:])
+    ]
+
+    assert transitions == [True, False, False, True]
+
+
 def test_roi_analysis_preserves_database_roi_id(tmp_path, monkeypatch):
     cfg = config.AppConfig()
     cfg.roi.rois = [

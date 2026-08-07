@@ -123,6 +123,8 @@ class ProductDashboard:
         self.metrics = RuntimeMetrics()
         self.latest_result: Optional[RoiResult] = None
         self.latest_status = Status.NORMAL          # 표시용(raw) 이전 상태
+        self.latest_alarm_status = Status.NORMAL    # 팝업용(클러스터 판정) 이전 상태
+        self.critical_popup: Optional[tk.Toplevel] = None
         self.last_update: Optional[datetime] = None
         self.visual_photo = None
         self.thermal_photo = None
@@ -1494,9 +1496,14 @@ class ProductDashboard:
             return
 
         status = result["status"]
+        alarm_status = result.get("alarm_status", status)
         previous = self.latest_status
         captured_at = result.get("captured_at") or datetime.now()
         quality_ok = bool(result.get("image_quality_ok", False))
+        if quality_ok:
+            if self._should_show_critical_popup(self.latest_alarm_status, alarm_status):
+                self._show_critical_popup(result, captured_at)
+            self.latest_alarm_status = alarm_status
         capture_id = str(result.get("base", ""))
         freshness_limit = max(
             self.REFRESH_SECONDS * 2,
@@ -1602,6 +1609,85 @@ class ProductDashboard:
                                 f"{result['base']} · {status.value} · Max {result['max_temp']:.1f}°C")
         self._update_values_with_result(result)
         self._finish_analysis(generation)
+
+    @staticmethod
+    def _should_show_critical_popup(previous: Status, current: Status) -> bool:
+        """위험 상태로 새로 진입할 때만 팝업을 허용한다."""
+        return previous != Status.CRITICAL and current == Status.CRITICAL
+
+    def _show_critical_popup(self, result: dict, captured_at: datetime) -> None:
+        """Show one non-blocking local popup for a new Critical transition."""
+        if self.lifecycle != "running":
+            return
+        try:
+            if self.critical_popup is not None and self.critical_popup.winfo_exists():
+                self.critical_popup.lift()
+                self.critical_popup.focus_force()
+                return
+        except tk.TclError:
+            self.critical_popup = None
+
+        current_temp = float(result.get("overall_max_temp", result.get("max_temp", 0.0)))
+        critical_temp = float(self.cfg.roi.baseline_temp + self.cfg.roi.critical_delta)
+        roi_name = result.get("overall_max_roi_name") or result.get("roi_name") or "ROI"
+
+        win = tk.Toplevel(self.root)
+        self.critical_popup = win
+        win.title("위험 온도 감지")
+        win.configure(bg="#2a1010")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.attributes("-topmost", True)
+
+        def close_popup():
+            self.critical_popup = None
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", close_popup)
+        container = tk.Frame(win, bg="#2a1010", padx=28, pady=24)
+        container.pack(fill="both", expand=True)
+        tk.Label(
+            container,
+            text="⚠  위험 온도 감지",
+            bg="#2a1010", fg="#ff5a5a",
+            font=("맑은 고딕", 18, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            container,
+            text=f"{roi_name}의 온도가 위험 수준에 도달했습니다.",
+            bg="#2a1010", fg="white",
+            font=("맑은 고딕", 12, "bold"),
+        ).pack(anchor="w", pady=(14, 12))
+        details = (
+            f"현재 최고온도   {current_temp:.1f}°C\n"
+            f"위험 기준온도   {critical_temp:.1f}°C\n"
+            f"감지 시각       {captured_at:%Y-%m-%d %H:%M:%S}"
+        )
+        tk.Label(
+            container,
+            text=details,
+            justify="left", anchor="w",
+            bg="#2a1010", fg="#f3dddd",
+            font=("맑은 고딕", 11),
+        ).pack(fill="x", pady=(0, 18))
+        ttk.Button(container, text="확인", command=close_popup).pack(fill="x")
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.lift()
+        win.focus_force()
+        try:
+            self.root.bell()
+        except tk.TclError:
+            pass
+        self._add_operating_log(
+            "위험 팝업", "표시", f"{roi_name} · {current_temp:.1f}°C",
+        )
 
     def _update_values_with_result(self, result: dict):
         s = result["status"]
