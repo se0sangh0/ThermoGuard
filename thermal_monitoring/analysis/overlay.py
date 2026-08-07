@@ -305,6 +305,100 @@ def create_overlay(
     return img
 
 
+def create_visual_roi_overlay(
+    visual_img: np.ndarray,
+    roi_bounds_list: list[tuple],
+    roi_names: list[str] | None,
+    roi_statuses: list | None,
+    *,
+    calibration_path: str = HOMOGRAPHY_PATH,
+    thermal_size: tuple[int, int] | None = None,
+) -> tuple[np.ndarray, str | None]:
+    """Project thermal ROI polygons onto the visual image.
+
+    Returns the untouched visual frame plus a warning when calibration is
+    unavailable or its saved resolutions do not match the current frames.
+    """
+    if visual_img is None or visual_img.size == 0:
+        return visual_img, "가시광 이미지 없음"
+    raw = visual_img.copy()
+    if not os.path.isfile(calibration_path):
+        return raw, "캘리브레이션 정보 없음"
+
+    try:
+        data = np.load(calibration_path, allow_pickle=True)
+        if isinstance(data, np.ndarray) and data.ndim == 0:
+            data = data.item()
+        if not isinstance(data, dict):
+            return raw, "캘리브레이션 해상도 정보 없음"
+
+        homography = np.asarray(data.get("H"), dtype=np.float64)
+        if homography.shape != (3, 3) or not np.isfinite(homography).all():
+            return raw, "캘리브레이션 행렬 오류"
+
+        saved_thermal = data.get("thermal_size")
+        saved_visual = data.get("visual_size")
+        current_visual = (visual_img.shape[1], visual_img.shape[0])
+        if saved_thermal is None or saved_visual is None or thermal_size is None:
+            return raw, "캘리브레이션 해상도 정보 없음"
+        if (
+            tuple(int(v) for v in saved_thermal) != tuple(int(v) for v in thermal_size)
+            or tuple(int(v) for v in saved_visual) != current_visual
+        ):
+            return raw, "캘리브레이션 해상도 불일치"
+
+        projected_rois = []
+        for bounds in roi_bounds_list:
+            x1, y1, x2, y2 = bounds
+            corners = np.array(
+                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            projected = cv2.perspectiveTransform(corners, homography).reshape(-1, 2)
+            if not np.isfinite(projected).all():
+                return raw, "ROI 좌표 변환 실패"
+            projected_rois.append(np.rint(projected).astype(np.int32))
+
+        image = raw.copy()
+        height, width = image.shape[:2]
+        thickness = max(2, round(width / 1000))
+        for index, points in enumerate(projected_rois):
+            if (
+                points[:, 0].max() < 0 or points[:, 1].max() < 0
+                or points[:, 0].min() >= width or points[:, 1].min() >= height
+            ):
+                return raw, "투영 ROI가 가시광 범위를 벗어남"
+
+            status = roi_statuses[index] if roi_statuses and index < len(roi_statuses) else "Normal"
+            status_value = getattr(status, "value", str(status))
+            color = _status_color(status_value)
+            cv2.polylines(image, [points.reshape(-1, 1, 2)], True, color, thickness, cv2.LINE_AA)
+
+            label = roi_names[index] if roi_names and index < len(roi_names) else f"ROI-{index + 1}"
+            label_origin = points[np.argmin(points[:, 1])]
+            label_x = max(4, min(int(label_origin[0]), width - 8))
+            label_y = max(24, min(int(label_origin[1]) - 8, height - 8))
+            font_scale = max(0.55, width / 2600)
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label, FONT, font_scale, thickness,
+            )
+            cv2.rectangle(
+                image,
+                (label_x - 3, label_y - text_height - 5),
+                (min(width - 1, label_x + text_width + 4), min(height - 1, label_y + baseline + 3)),
+                TEXT_BG,
+                -1,
+            )
+            cv2.putText(
+                image, label, (label_x, label_y), FONT, font_scale,
+                color, thickness, cv2.LINE_AA,
+            )
+        return image, None
+    except (OSError, ValueError, TypeError, cv2.error) as exc:
+        _log.warning("Visual ROI projection disabled: %s", exc)
+        return raw, "캘리브레이션 정보 읽기 실패"
+
+
 def _draw_multi_roi_boxes(
     img: np.ndarray,
     roi_bounds_list: list[tuple],

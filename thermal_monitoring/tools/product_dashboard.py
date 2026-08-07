@@ -19,7 +19,7 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
-from ..analysis.overlay import create_overlay
+from ..analysis.overlay import create_overlay, create_visual_roi_overlay
 from ..analysis.roi import (
     RoiResult,
     load_roi_config,
@@ -1413,6 +1413,18 @@ class ProductDashboard:
 
         merged_hotspots = merge_roi_hotspot_centroids(roi_results)
 
+        visual_display_img = visual_img
+        visual_projection_warning = None
+        if visual_img is not None and thermal_img is not None:
+            visual_display_img, visual_projection_warning = create_visual_roi_overlay(
+                visual_img,
+                [result.roi_bounds for result in roi_results],
+                [result.roi_name or f"ROI-{index + 1}" for index, result in enumerate(roi_results)],
+                [item["status"] for item in per_roi_statuses],
+                calibration_path=self.cfg.paths.homography_path,
+                thermal_size=(thermal_img.shape[1], thermal_img.shape[0]),
+            )
+
         overlay = create_overlay(
             # This panel is explicitly the Thermal view. Passing the visual
             # path would make create_overlay use RGB as its background when a
@@ -1440,7 +1452,9 @@ class ProductDashboard:
 
         return {
             "base": base, "overlay": overlay, "thermal_img": thermal_img,
-            "visual_img": visual_img,
+            "visual_img": visual_display_img,
+            "visual_raw_img": visual_img,
+            "visual_projection_warning": visual_projection_warning,
             "max_temp": roi_result.max_temp, "mean_temp": roi_result.mean_temp,
             "min_temp": getattr(roi_result, 'min_temp', roi_result.max_temp),
             "hot_temp_95": roi_result.hot_temp_95,
@@ -1571,6 +1585,11 @@ class ProductDashboard:
                 )
             self._image_quality_window.append(quality_ok)
             del self._image_quality_window[:-20]
+            projection_warning = result.get("visual_projection_warning")
+            if quality_ok and projection_warning:
+                self._add_operating_log(
+                    "캘리브레이션", "경고", f"가시광 ROI 숨김 · {projection_warning}",
+                )
         elif is_new_capture:
             self._add_operating_log(
                 "분석", "실패",
@@ -1612,8 +1631,13 @@ class ProductDashboard:
             self.thermal_stamp.configure(text=stamp)
             if result.get("thermal_only_mode", False):
                 self.visual_stamp.configure(text="과열 모드 · 가시광 촬영 생략")
+            elif result.get("visual_projection_warning"):
+                self.visual_stamp.configure(
+                    text=f"ROI 숨김 · {result['visual_projection_warning']}",
+                    fg=COLORS["orange"],
+                )
             else:
-                self.visual_stamp.configure(text=stamp)
+                self.visual_stamp.configure(text=f"{stamp} · ROI 투영", fg=COLORS["muted"])
         else:
             issue = result.get("image_quality_reason", "영상 종류 확인 필요")
             hold_text = f"갱신 보류 · {issue}"
