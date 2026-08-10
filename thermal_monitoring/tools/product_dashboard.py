@@ -19,7 +19,7 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
-from ..analysis.overlay import create_overlay
+from ..analysis.overlay import create_overlay, create_visual_roi_overlay
 from ..analysis.roi import (
     RoiResult,
     load_roi_config,
@@ -34,6 +34,7 @@ from ..analysis.threshold import (
     apply_roi_state_updates,
 )
 from ..capture.capture import CaptureSession, camera_image_url
+from ..capture.gige_backend import GigeTemperatureReader
 from ..data import pairs
 from ..data.checking import run_check
 from ..data.cleanup import run_cleanup_if_due
@@ -122,6 +123,8 @@ class ProductDashboard:
         self.metrics = RuntimeMetrics()
         self.latest_result: Optional[RoiResult] = None
         self.latest_status = Status.NORMAL          # 표시용(raw) 이전 상태
+        self.latest_alarm_status = Status.NORMAL    # 팝업용(클러스터 판정) 이전 상태
+        self.critical_popup: Optional[tk.Toplevel] = None
         self.last_update: Optional[datetime] = None
         self.visual_photo = None
         self.thermal_photo = None
@@ -156,6 +159,10 @@ class ProductDashboard:
         self._latest_pair_quality_ok = False
         self._latest_pair_fresh = False
         self._last_successful_capture_at: Optional[datetime] = None
+
+        # GigE 5초 프로브
+        self._gige_reader: Optional[GigeTemperatureReader] = None
+        self._gige_probe_timer: Optional[str] = None
 
         self._analysis_executor = ThreadPoolExecutor(max_workers=1)
         self._analysis_running = False
@@ -214,8 +221,8 @@ class ProductDashboard:
         body = tk.Frame(self.root, bg=COLORS["bg"])
         body.pack(fill="both", expand=True, padx=10, pady=10)
         body.grid_columnconfigure(0, weight=1)
-        body.grid_rowconfigure(1, weight=7, minsize=420)
-        body.grid_rowconfigure(3, weight=3, minsize=190)
+        body.grid_rowconfigure(1, weight=3, minsize=150)
+        body.grid_rowconfigure(3, weight=7, minsize=190)
         self.dashboard_body = body
 
         self._build_toolbar(body)
@@ -335,8 +342,8 @@ class ProductDashboard:
         self.carousel_expanded = expanded
         if expanded:
             self.carousel_container.grid()
-            self.dashboard_body.grid_rowconfigure(1, weight=7, minsize=420)
-            self.dashboard_body.grid_rowconfigure(3, weight=3, minsize=190)
+            self.dashboard_body.grid_rowconfigure(1, weight=3, minsize=150)
+            self.dashboard_body.grid_rowconfigure(3, weight=7, minsize=190)
         else:
             self.carousel_container.grid_remove()
             self.dashboard_body.grid_rowconfigure(1, weight=1, minsize=420)
@@ -993,31 +1000,16 @@ class ProductDashboard:
         self.capture_paused_by_user = False
         self.monitoring = True
         self.capture_toggle_button.configure(text="■  촬영 정지")
-        roi = self.cfg.roi
-        baseline = roi.baseline_temp
-        warning_delta = roi.warning_delta
-
-        def _probe_callback(max_temp: float) -> bool:
-            capture = self.capture
-            if not self.monitoring or capture is None:
-                return False
-            if max_temp >= baseline + warning_delta:
-                capture.set_warning_mode(True)
-                self._schedule_refresh(100)  # 즉시 분석 가속
-                w_interval = getattr(capture, '_warning_interval', 5.0)
-                self._add_operating_log("분석", "성공", f"{max_temp:.1f}°C — 캡처 주기 {w_interval:.0f}초로 전환")
-                return True
-            else:
-                capture.set_warning_mode(False)
-                return False
 
         self.capture = CaptureSession(
             cam_ip=self.cfg.camera.ip, mode=self.cfg.tools.mode,
             interval=max(10.0, float(self.cfg.camera.capture_interval_sec)),
             save_dir=self.cfg.paths.dataset_dir, log_callback=self._capture_log,
-            probe_callback=_probe_callback,
         )
         self.capture.start()
+
+        # GigE 5초 온도 프로브 (PySpin 미설치 시 무시)
+        self._start_gige_probe()
 
     def toggle_capture(self):
         """현장 사용자가 촬영만 정지하거나 다시 시작할 수 있게 한다."""
@@ -1034,6 +1026,7 @@ class ProductDashboard:
             return
         self.capture_paused_by_user = True
         self.monitoring = False
+        self._stop_gige_probe()
         capture = self.capture
         self.capture = None
         if capture:
@@ -1054,6 +1047,71 @@ class ProductDashboard:
             self.root.after(0, self._check_connection_async)
         self.root.after(0, self._update_connection_stability_display)
         self._update_metric_text_async()
+
+    # ── GigE 5초 프로브 ─────────────────────────────────────
+
+    def _start_gige_probe(self):
+        """GigE Vision 5초 주기 온도 프로브를 시작한다. 실패 시 무시."""
+        if not self.cfg.camera.gige_enabled:
+            return
+        try:
+            reader = GigeTemperatureReader(device_index=self.cfg.camera.gige_device_index)
+        except Exception:
+            return
+        if not reader.start():
+            return
+        self._gige_reader = reader
+        self._add_operating_log("GigE", "성공", "리더 연결 완료")
+        # 리더 연결 즉시 5초 프로브 타이머 시작
+        self._schedule_gige_probe()
+
+    def _start_gige_timer(self):
+        """5초 GigE 프로브 타이머를 시작한다. 이미 실행 중이면 무시."""
+        if self._gige_probe_timer is not None:
+            return
+        self._schedule_gige_probe()
+
+    def _stop_gige_timer(self):
+        """5초 GigE 프로브 타이머만 중지한다. 리더는 유지."""
+        if self._gige_probe_timer:
+            self.root.after_cancel(self._gige_probe_timer)
+            self._gige_probe_timer = None
+
+    def _schedule_gige_probe(self):
+        """5000ms 후 다음 GigE 프로브를 예약한다."""
+        if self.lifecycle != "running":
+            return
+        self._gige_probe_timer = self.root.after(5000, self._run_gige_probe)
+
+    def _run_gige_probe(self):
+        """5초마다 GigE 온도를 확인하고 임계 초과 시 경고 모드로 전환한다."""
+        if not self.monitoring or self._gige_reader is None:
+            self._gige_probe_timer = None
+            return
+        temp = self._gige_reader.read_temperature()
+        if temp is not None:
+            threshold = self.cfg.roi.baseline_temp + self.cfg.roi.warning_delta
+            capture = self.capture
+            if temp >= threshold:
+                if capture:
+                    capture.set_warning_mode(True)
+                self._schedule_refresh(100)
+                self._add_operating_log(
+                    "GigE", "성공", f"{temp:.1f}°C (threshold {threshold:.1f}°C) - 분석 가속"
+                )
+            else:
+                if capture:
+                    capture.set_warning_mode(False)
+        if self.monitoring:
+            self._schedule_gige_probe()
+
+    def _stop_gige_probe(self):
+        """GigE 프로브를 완전히 중지하고 리소스를 정리한다."""
+        self._stop_gige_timer()
+        reader, self._gige_reader = self._gige_reader, None
+        if reader is not None:
+            reader.stop()
+            self._add_operating_log("GigE", "성공", "온도 프로브 정지")
 
     def _record_api_result(self, success, status_code=None, error_kind=None):
         if success:
@@ -1357,6 +1415,18 @@ class ProductDashboard:
 
         merged_hotspots = merge_roi_hotspot_centroids(roi_results)
 
+        visual_display_img = visual_img
+        visual_projection_warning = None
+        if visual_img is not None and thermal_img is not None:
+            visual_display_img, visual_projection_warning = create_visual_roi_overlay(
+                visual_img,
+                [result.roi_bounds for result in roi_results],
+                [result.roi_name or f"ROI-{index + 1}" for index, result in enumerate(roi_results)],
+                [item["status"] for item in per_roi_statuses],
+                calibration_path=self.cfg.paths.homography_path,
+                thermal_size=(thermal_img.shape[1], thermal_img.shape[0]),
+            )
+
         overlay = create_overlay(
             # This panel is explicitly the Thermal view. Passing the visual
             # path would make create_overlay use RGB as its background when a
@@ -1368,8 +1438,25 @@ class ProductDashboard:
             roi_names=[r.roi_name for r in roi_results] if len(roi_results) > 1 else None,
         )
 
+        overlay_path = None
+        if status != Status.NORMAL:
+            overlay_dir = Path(self.cfg.paths.overlay_dir)
+            overlay_dir.mkdir(parents=True, exist_ok=True)
+            candidate = overlay_dir / f"{base}_overlay.jpg"
+            if cv2.imwrite(str(candidate), overlay):
+                overlay_path = candidate
+
+        mean_difference = None
+        if thermal_img is not None and visual_img is not None:
+            thermal_small = cv2.resize(thermal_img, (160, 120))
+            visual_small = cv2.resize(visual_img, (160, 120))
+            mean_difference = float(cv2.absdiff(thermal_small, visual_small).mean())
+
         return {
-            "base": base, "overlay": overlay, "visual_img": visual_img,
+            "base": base, "overlay": overlay, "thermal_img": thermal_img,
+            "visual_img": visual_display_img,
+            "visual_raw_img": visual_img,
+            "visual_projection_warning": visual_projection_warning,
             "max_temp": roi_result.max_temp, "mean_temp": roi_result.mean_temp,
             "min_temp": getattr(roi_result, 'min_temp', roi_result.max_temp),
             "hot_temp_95": roi_result.hot_temp_95,
@@ -1388,6 +1475,12 @@ class ProductDashboard:
             "captured_at": captured_at,
             "image_quality_ok": image_quality_ok,
             "image_quality_reason": image_quality_reason,
+            "image_quality_mean_difference": mean_difference,
+            "thermal_path": thermal,
+            "visual_path": visual,
+            "npy_path": npy,
+            "overlay_path": overlay_path,
+            "hotspots": merged_hotspots,
             "thermal_only_mode": (
                 self.cfg.tools.mode == "both"
                 and visual_img is None
@@ -1403,9 +1496,14 @@ class ProductDashboard:
             return
 
         status = result["status"]
+        alarm_status = result.get("alarm_status", status)
         previous = self.latest_status
         captured_at = result.get("captured_at") or datetime.now()
         quality_ok = bool(result.get("image_quality_ok", False))
+        if quality_ok:
+            if self._should_show_critical_popup(self.latest_alarm_status, alarm_status):
+                self._show_critical_popup(result, captured_at)
+            self.latest_alarm_status = alarm_status
         capture_id = str(result.get("base", ""))
         freshness_limit = max(
             self.REFRESH_SECONDS * 2,
@@ -1494,6 +1592,11 @@ class ProductDashboard:
                 )
             self._image_quality_window.append(quality_ok)
             del self._image_quality_window[:-20]
+            projection_warning = result.get("visual_projection_warning")
+            if quality_ok and projection_warning:
+                self._add_operating_log(
+                    "캘리브레이션", "경고", f"가시광 ROI 숨김 · {projection_warning}",
+                )
         elif is_new_capture:
             self._add_operating_log(
                 "분석", "실패",
@@ -1506,6 +1609,85 @@ class ProductDashboard:
                                 f"{result['base']} · {status.value} · Max {result['max_temp']:.1f}°C")
         self._update_values_with_result(result)
         self._finish_analysis(generation)
+
+    @staticmethod
+    def _should_show_critical_popup(previous: Status, current: Status) -> bool:
+        """위험 상태로 새로 진입할 때만 팝업을 허용한다."""
+        return previous != Status.CRITICAL and current == Status.CRITICAL
+
+    def _show_critical_popup(self, result: dict, captured_at: datetime) -> None:
+        """Show one non-blocking local popup for a new Critical transition."""
+        if self.lifecycle != "running":
+            return
+        try:
+            if self.critical_popup is not None and self.critical_popup.winfo_exists():
+                self.critical_popup.lift()
+                self.critical_popup.focus_force()
+                return
+        except tk.TclError:
+            self.critical_popup = None
+
+        current_temp = float(result.get("overall_max_temp", result.get("max_temp", 0.0)))
+        critical_temp = float(self.cfg.roi.baseline_temp + self.cfg.roi.critical_delta)
+        roi_name = result.get("overall_max_roi_name") or result.get("roi_name") or "ROI"
+
+        win = tk.Toplevel(self.root)
+        self.critical_popup = win
+        win.title("위험 온도 감지")
+        win.configure(bg="#2a1010")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.attributes("-topmost", True)
+
+        def close_popup():
+            self.critical_popup = None
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", close_popup)
+        container = tk.Frame(win, bg="#2a1010", padx=28, pady=24)
+        container.pack(fill="both", expand=True)
+        tk.Label(
+            container,
+            text="⚠  위험 온도 감지",
+            bg="#2a1010", fg="#ff5a5a",
+            font=("맑은 고딕", 18, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            container,
+            text=f"{roi_name}의 온도가 위험 수준에 도달했습니다.",
+            bg="#2a1010", fg="white",
+            font=("맑은 고딕", 12, "bold"),
+        ).pack(anchor="w", pady=(14, 12))
+        details = (
+            f"현재 최고온도   {current_temp:.1f}°C\n"
+            f"위험 기준온도   {critical_temp:.1f}°C\n"
+            f"감지 시각       {captured_at:%Y-%m-%d %H:%M:%S}"
+        )
+        tk.Label(
+            container,
+            text=details,
+            justify="left", anchor="w",
+            bg="#2a1010", fg="#f3dddd",
+            font=("맑은 고딕", 11),
+        ).pack(fill="x", pady=(0, 18))
+        ttk.Button(container, text="확인", command=close_popup).pack(fill="x")
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.lift()
+        win.focus_force()
+        try:
+            self.root.bell()
+        except tk.TclError:
+            pass
+        self._add_operating_log(
+            "위험 팝업", "표시", f"{roi_name} · {current_temp:.1f}°C",
+        )
 
     def _update_values_with_result(self, result: dict):
         s = result["status"]
@@ -1535,8 +1717,13 @@ class ProductDashboard:
             self.thermal_stamp.configure(text=stamp)
             if result.get("thermal_only_mode", False):
                 self.visual_stamp.configure(text="과열 모드 · 가시광 촬영 생략")
+            elif result.get("visual_projection_warning"):
+                self.visual_stamp.configure(
+                    text=f"ROI 숨김 · {result['visual_projection_warning']}",
+                    fg=COLORS["orange"],
+                )
             else:
-                self.visual_stamp.configure(text=stamp)
+                self.visual_stamp.configure(text=f"{stamp} · ROI 투영", fg=COLORS["muted"])
         else:
             issue = result.get("image_quality_reason", "영상 종류 확인 필요")
             hold_text = f"갱신 보류 · {issue}"
@@ -1736,6 +1923,25 @@ class ProductDashboard:
         self.operating_logs.insert(0, row)
         del self.operating_logs[1000:]
         _file_log.info("[%s] %s | %s", category, result, detail)
+        if self.cfg.backend.enabled:
+            payload = {
+                "category": category,
+                "action": category,
+                "result": result,
+                "detail": {"message": detail},
+            }
+
+            def persist_operation_log():
+                try:
+                    requests.post(
+                        f"{self.cfg.backend.url}/api/operation-logs",
+                        json=payload,
+                        timeout=self.cfg.backend.timeout_sec,
+                    )
+                except requests.RequestException:
+                    _file_log.debug("operation_logs API unavailable", exc_info=True)
+
+            threading.Thread(target=persist_operation_log, daemon=True).start()
 
     def _sync_temperature_history(self):
         """Load the selected period and join it to live in-memory readings."""
@@ -1957,6 +2163,7 @@ class ProductDashboard:
         self._set_system_state("종료 중", COLORS["orange"])
         if self.timer_id:
             self.root.after_cancel(self.timer_id); self.timer_id = None
+        self._stop_gige_probe()
         if self.capture:
             self.capture.request_stop()
         self.monitoring = False
@@ -2308,7 +2515,13 @@ class SettingsDialog:
         guard.title("작업 진행 중")
         guard.transient(self.win)
         guard.resizable(False, False)
-        guard.geometry("320x130")
+        # 실제 캘리브레이션 작업창과는 별도인 안내창이다. 고정 320×130은
+        # 고해상도·고DPI 화면에서 지나치게 작으므로 화면 비율 안에서 제한한다.
+        screen_width = self.win.winfo_screenwidth()
+        screen_height = self.win.winfo_screenheight()
+        guard_width = max(380, min(460, int(screen_width * 0.28)))
+        guard_height = max(160, min(190, int(screen_height * 0.18)))
+        guard.geometry(f"{guard_width}x{guard_height}")
         guard.protocol("WM_DELETE_WINDOW", lambda: None)
 
         body = ttk.Frame(guard, padding=18)
@@ -2424,8 +2637,8 @@ class SettingsDialog:
     def _latest_complete_image_pair(dataset: Path):
         """가장 최신의 Thermal/Visual 완성 쌍을 반환한다 (공용 pairs 모듈 위임)."""
         return pairs.latest_complete_pair(dataset)
-
     def open_roi_editor(self):
+
         dataset = Path(self.d.cfg.paths.dataset_dir)
         if not dataset.exists():
             messagebox.showwarning("ROI 설정", "데이터셋 폴더가 없습니다.", parent=self.win); return
@@ -2515,7 +2728,7 @@ class SettingsDialog:
         thermal, visual = pair
         if not self._begin_tool("캘리브레이션"):
             return
-        self.d._add_operating_log("설정", "시작", thermal.name)
+        self.d._add_operating_log("캘리브레이션", "시작", thermal.name)
         saved = False
         calibration_window_title = None
         try:
@@ -2523,19 +2736,36 @@ class SettingsDialog:
             calibration_window_title = CALIBRATION_WINDOW_TITLE
             self._tool_window_titles = (CALIBRATION_WINDOW_TITLE,)
             self._show_tool_guard()
+            def save_calibration_to_db(calibration_data):
+                if not self.d.cfg.backend.enabled:
+                    return
+                camera_id = self.d.cfg.identity.db_camera_id
+                if camera_id is None:
+                    raise RuntimeError("캘리브레이션을 저장할 DB camera_id가 없습니다.")
+                response = requests.post(
+                    f"{self.d.cfg.backend.url}/api/calibrations",
+                    json={"camera_id": camera_id, **calibration_data},
+                    timeout=self.d.cfg.backend.timeout_sec,
+                )
+                response.raise_for_status()
+                body = response.json()
+                if body.get("status") != "created":
+                    raise RuntimeError(body.get("error", "캘리브레이션 DB 저장 실패"))
+
             saved = bool(run_calibration(
                 str(thermal),
                 str(visual),
                 event_pump=self._pump_tool_events,
                 display_bounds=self._tool_display_bounds(),
+                result_callback=save_calibration_to_db,
             ))
             if saved:
-                self.d._add_operating_log("설정", "성공", self.d.cfg.paths.homography_path)
+                self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
             else:
-                self.d._add_operating_log("설정", "성공", "저장 없이 종료")
+                self.d._add_operating_log("캘리브레이션", "종료", "저장 없이 종료")
         except Exception as exc:
             self.d.metrics.exception_count += 1
-            self.d._add_operating_log("설정", "실패", str(exc))
+            self.d._add_operating_log("캘리브레이션", "예외 처리", str(exc))
             messagebox.showerror("캘리브레이션", str(exc), parent=self.win)
             saved = False
         finally:
@@ -2677,7 +2907,7 @@ class SettingsDialog:
         if not roi_ids:
             self.d._add_operating_log(
                 "DB",
-                "실패",
+                "보류",
                 "저장된 DB ROI ID가 없어 ROI 저장 후 생성합니다.",
             )
             from .threshold_api_client import ThresholdSyncResult
@@ -2710,7 +2940,7 @@ class SettingsDialog:
         )
         self.d._add_operating_log(
             "DB",
-            "성공",
+            "저장 완료",
             f"ROI {len(result.roi_ids)}개 · 생성 {result.created}개 · "
             f"갱신 {result.updated}개",
         )

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import threading
 import tempfile
 import time
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
 
 import cv2
 import requests
@@ -286,6 +288,31 @@ class TelegramDispatcher:
 
     # ── 백엔드 측정값 POST ───────────────────────────────────
 
+    @staticmethod
+    def _file_payload(file_type: str, path_value) -> dict | None:
+        if not path_value:
+            return None
+        path = Path(path_value)
+        if not path.is_file():
+            return None
+        width = height = None
+        if path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+            image = cv2.imread(str(path))
+            if image is not None:
+                height, width = image.shape[:2]
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {
+            "file_type": file_type,
+            "storage_path": str(path.resolve()),
+            "width": width,
+            "height": height,
+            "size_bytes": path.stat().st_size,
+            "checksum_sha256": digest.hexdigest(),
+        }
+
     def post_measurement(self, result: dict) -> None:
         """측정값을 POST /api/measurements 로 전송 (백그라운드 스레드)."""
         backend_event = result.get("_backend_posted_event")
@@ -294,6 +321,15 @@ class TelegramDispatcher:
             if not self._dash.cfg.backend.enabled:
                 return
 
+            measurement_status = result.get(
+                "measurement_status",
+                result.get("alarm_status", result["status"]),
+            )
+            status_value = (
+                measurement_status.value.lower()
+                if isinstance(measurement_status, Status)
+                else str(measurement_status).lower()
+            )
             camera_id = self._dash.cfg.identity.db_camera_id
             roi = result.get("measurement_roi")
             roi_id = getattr(roi, "db_roi_id", None) if roi is not None else None
@@ -308,16 +344,22 @@ class TelegramDispatcher:
                 )
                 return
 
-            measurement_status = result.get(
-                "measurement_status",
-                result.get("alarm_status", result["status"]),
-            )
-            status_value = (
-                measurement_status.value.lower()
-                if isinstance(measurement_status, Status)
-                else str(measurement_status).lower()
-            )
             do_alarm = bool(result.get("alarm", False))
+
+            files = []
+            for file_type, key in (
+                ("thermal_jpg", "thermal_path"),
+                ("visual_jpg", "visual_path"),
+                ("thermal_npy", "npy_path"),
+                ("overlay", "overlay_path"),
+            ):
+                item = self._file_payload(file_type, result.get(key))
+                if item is not None:
+                    files.append(item)
+
+            thermal_shape = getattr(result.get("thermal_img"), "shape", None)
+            visual_shape = getattr(result.get("visual_img"), "shape", None)
+            quality_ok = bool(result.get("image_quality_ok", False))
 
             self._trace(
                 "post_measurement: do_alarm=%s base=%s status=%s",
@@ -340,6 +382,36 @@ class TelegramDispatcher:
                     f"{result['max_temp']:.1f}°C · "
                     f"{status_value}"
                 ),
+                "captured_at": (
+                    result["captured_at"].isoformat()
+                    if result.get("captured_at") is not None else None
+                ),
+                "capture_mode": (
+                    "warning" if status_value in {"warning", "critical"} else "normal"
+                ),
+                "thermal_status": "success" if result.get("thermal_path") else "failed",
+                "visual_status": "success" if result.get("visual_path") else "skipped",
+                "pair_status": "complete" if quality_ok else "invalid",
+                "files": files,
+                "hotspots": [
+                    {
+                        "center_x": max(0, int(point[0])),
+                        "center_y": max(0, int(point[1])),
+                        "max_temp": float(point[2]),
+                        "area_pixels": None,
+                    }
+                    for point in result.get("hotspots", [])
+                ],
+                "image_quality": {
+                    "is_valid": quality_ok,
+                    "reason_code": "valid" if quality_ok else "invalid_pair",
+                    "reason_message": result.get("image_quality_reason"),
+                    "thermal_width": thermal_shape[1] if thermal_shape else None,
+                    "thermal_height": thermal_shape[0] if thermal_shape else None,
+                    "visual_width": visual_shape[1] if visual_shape else None,
+                    "visual_height": visual_shape[0] if visual_shape else None,
+                    "mean_difference": result.get("image_quality_mean_difference"),
+                },
             }
             measurement_url = (
                 f"{self._dash.cfg.backend.url}/api/measurements"
@@ -364,7 +436,7 @@ class TelegramDispatcher:
                 )
                 sync_result = self._ensure_threshold_profile(camera_id, roi_id)
                 self._op_log(
-                    "성공",
+                    "자동 복구",
                     f"ROI {roi_id} threshold 생성 {sync_result.created}개 · "
                     f"갱신 {sync_result.updated}개",
                 )

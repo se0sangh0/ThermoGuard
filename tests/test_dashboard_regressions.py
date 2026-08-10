@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -74,6 +75,33 @@ def test_dashboard_keeps_visual_grace_in_normal_both_mode(monkeypatch):
     dashboard._latest_pair()
 
     assert calls == [("/dataset", {"visual_mode": True})]
+
+
+def test_critical_popup_only_fires_when_entering_critical():
+    should_show = ProductDashboard._should_show_critical_popup
+
+    assert should_show(Status.NORMAL, Status.CRITICAL) is True
+    assert should_show(Status.WARNING, Status.CRITICAL) is True
+    assert should_show(Status.CRITICAL, Status.CRITICAL) is False
+    assert should_show(Status.NORMAL, Status.WARNING) is False
+    assert should_show(Status.WARNING, Status.NORMAL) is False
+
+
+def test_critical_popup_can_fire_again_after_recovery():
+    statuses = [
+        Status.NORMAL,
+        Status.CRITICAL,
+        Status.CRITICAL,
+        Status.WARNING,
+        Status.CRITICAL,
+    ]
+
+    transitions = [
+        ProductDashboard._should_show_critical_popup(previous, current)
+        for previous, current in zip(statuses, statuses[1:])
+    ]
+
+    assert transitions == [True, False, False, True]
 
 
 def test_roi_analysis_preserves_database_roi_id(tmp_path, monkeypatch):
@@ -329,7 +357,7 @@ def test_threshold_sync_waits_until_roi_has_database_id(monkeypatch):
     assert operating_logs[-1][1] == "보류"
 
 
-def test_measurement_uses_matching_roi_identity_and_status(monkeypatch):
+def test_measurement_uses_matching_roi_identity_and_abnormal_statuses(monkeypatch):
     posted = []
     dashboard = SimpleNamespace(
         lifecycle="running",
@@ -377,12 +405,83 @@ def test_measurement_uses_matching_roi_identity_and_status(monkeypatch):
     }
 
     dispatcher.post_measurement(result)
+    result["measurement_status"] = Status.CRITICAL
+    dispatcher.post_measurement(result)
 
     payload = posted[0][1]
     assert payload["camera_id"] == 7
     assert payload["roi_id"] == 12
     assert payload["max_temp"] == 61.0
-    assert payload["status"] == "warning"
+    assert [post_payload["status"] for _, post_payload in posted] == [
+        "warning",
+        "critical",
+    ]
+
+
+def test_normal_measurement_is_persisted_and_completes_backend_event(monkeypatch):
+    posted = []
+    backend_event = threading.Event()
+    dashboard = SimpleNamespace(
+        lifecycle="running",
+        cfg=SimpleNamespace(
+            backend=SimpleNamespace(
+                enabled=True,
+                url="http://backend",
+                timeout_sec=5,
+            ),
+            identity=SimpleNamespace(
+                db_camera_id=7,
+                robot_id="Robot-01",
+            ),
+        ),
+        metrics=SimpleNamespace(
+            api_successes=0,
+            api_timeouts=0,
+            api_connection_errors=0,
+            api_other_errors=0,
+        ),
+        _record_api_result=lambda *_args, **_kwargs: None,
+    )
+    dispatcher = TelegramDispatcher(dashboard)
+    monkeypatch.setattr(
+        "thermal_monitoring.tools.telegram_dispatcher.requests.post",
+        lambda *args, **kwargs: (
+            posted.append((args, kwargs))
+            or _Response({"status": "created", "capture_id": 1, "alert_id": None})
+        ),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_ensure_threshold_profile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Normal 측정은 threshold sync를 호출하면 안 됩니다.")
+        ),
+    )
+    result = {
+        "base": "capture",
+        "measurement_roi": SimpleNamespace(db_roi_id=12),
+        "roi_name": "ROI-2",
+        "max_temp": 31.0,
+        "min_temp": 25.0,
+        "mean_temp": 28.0,
+        "hot_temp_95": 30.0,
+        "status": Status.CRITICAL,
+        "measurement_status": Status.NORMAL,
+        "alarm": False,
+        "_backend_posted_event": backend_event,
+    }
+
+    dispatcher.post_measurement(result)
+
+    assert len(posted) == 1
+    assert posted[0][1]["json"]["status"] == "normal"
+    assert backend_event.is_set()
+    assert vars(dashboard.metrics) == {
+        "api_successes": 1,
+        "api_timeouts": 0,
+        "api_connection_errors": 0,
+        "api_other_errors": 0,
+    }
 
 
 def test_measurement_repairs_missing_threshold_and_retries_once(monkeypatch):
@@ -464,7 +563,7 @@ def test_measurement_repairs_missing_threshold_and_retries_once(monkeypatch):
         "hot_temp_95": 38.0,
         "over_temp_pixels": 0,
         "max_hotspot_size": 0,
-        "status": Status.NORMAL,
+        "status": Status.WARNING,
         "alarm": False,
     }
 

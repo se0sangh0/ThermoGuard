@@ -32,6 +32,8 @@ class CameraConfig:
     ip: str = "192.168.0.51"
     capture_interval_sec: float = 30.0
     warning_interval_sec: float = 5.0
+    gige_enabled: bool = True
+    gige_device_index: int = 0
 
 
 @dataclass

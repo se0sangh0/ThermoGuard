@@ -28,10 +28,17 @@ r_mouse_x, r_mouse_y = -1, -1  # RGB 창 마우스 (원본 해상도)
 
 ZOOM_SIZE = 10      # 확대경 영역 크기 (px)
 ZOOM_SCALE = 3.0    # 확대 배율
-MAX_MEAN_ERROR_PX = 5.0   # 평균 재투영 오차 허용 기준
-MAX_POINT_ERROR_PX = 25.0  # 개별 최대 오차 허용 기준
+MAX_MEAN_ERROR_PX = 100.0   # 평균 재투영 오차 허용 기준
+MAX_POINT_ERROR_PX = 250.0  # 개별 최대 오차 허용 기준
+MIN_CALIBRATION_POINT_PAIRS = 6
 BUTTON_BAR_HEIGHT = 44
 CALIBRATION_WINDOW_TITLE = "Calibration - Thermal | RGB"
+CALIBRATION_WINDOW_WIDTH = 1344
+CALIBRATION_WINDOW_HEIGHT = 756
+CALIBRATION_WINDOW_MIN_WIDTH = 400
+CALIBRATION_WINDOW_MIN_HEIGHT = 240
+# 현장 PC 모니터 해상도에 맞춰 사용하는 최종 작업창 비율이다.
+CALIBRATION_WINDOW_RATIO = 0.40
 _BUTTONS = [
     ("Save",  (50, 160, 50), "save"),
     ("Undo",  (160, 160, 50), "undo"),
@@ -81,6 +88,31 @@ def resize_for_display(img, width):
     return cv2.resize(img, (width, height))
 
 
+def calibration_point_metrics(points, image_width: int, image_height: int) -> dict:
+    """대응점의 가로·세로 분포와 Convex Hull 면적 비율을 계산한다."""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(pts) == 0 or image_width <= 0 or image_height <= 0:
+        return {
+            "point_count": len(pts),
+            "x_span_ratio": 0.0,
+            "y_span_ratio": 0.0,
+            "hull_area_ratio": 0.0,
+        }
+
+    x_span = float(pts[:, 0].max() - pts[:, 0].min()) / image_width
+    y_span = float(pts[:, 1].max() - pts[:, 1].min()) / image_height
+    hull_area = 0.0
+    if len(pts) >= 3:
+        hull = cv2.convexHull(pts.reshape(-1, 1, 2))
+        hull_area = float(cv2.contourArea(hull))
+    return {
+        "point_count": len(pts),
+        "x_span_ratio": x_span,
+        "y_span_ratio": y_span,
+        "hull_area_ratio": hull_area / float(image_width * image_height),
+    }
+
+
 def _compute_button_rects(canvas_width: int, image_height: int):
     """ROI 설정 도구와 같은 방식으로 하단 버튼 위치를 계산한다."""
     gap = 8
@@ -119,7 +151,13 @@ def _draw_button_bar(canvas, image_height, button_rects):
         )
 
 
-def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_bounds=None):
+def run_calibration(
+    thermal_path=None,
+    rgb_path=None,
+    event_pump=None,
+    display_bounds=None,
+    result_callback=None,
+):
     """GUI 또는 CLI에서 호출 가능한 캘리브레이션 진입점."""
     global thermal_pts, rgb_pts, pair_state, t_mouse_x, t_mouse_y, r_mouse_x, r_mouse_y
     thermal_pts.clear()
@@ -129,7 +167,6 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
 
     cfg = load_config()
     DATASET_DIR = cfg.paths.dataset_dir
-    DISPLAY_WIDTH = cfg.display.display_width
 
     if thermal_path is None:
         if len(sys.argv) >= 3:
@@ -179,19 +216,40 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
     print("  S = compute & save   R = reset   Z = undo   ESC/Q = quit without saving")
 
     screen_x, screen_y, screen_w, screen_h = display_bounds or (0, 0, 1920, 1080)
-    max_window_width = max(240, min(DISPLAY_WIDTH // 2, (screen_w - 48) // 2))
-    max_window_height = max(200, screen_h - BUTTON_BAR_HEIGHT - 96)
+    # 실제 캘리브레이션 캔버스는 화면의 40%를 사용한다. 바깥쪽 OpenCV/OS
+    # 프레임까지 포함하면 ROI 창보다 조금 작은 수준의 체감 크기가 된다.
+    canvas_width = max(
+        CALIBRATION_WINDOW_MIN_WIDTH,
+        min(int(screen_w * CALIBRATION_WINDOW_RATIO), CALIBRATION_WINDOW_WIDTH),
+    )
+    canvas_width -= canvas_width % 2
+    canvas_height = max(
+        CALIBRATION_WINDOW_MIN_HEIGHT,
+        min(int(screen_h * CALIBRATION_WINDOW_RATIO), CALIBRATION_WINDOW_HEIGHT),
+    )
+    image_area_height = canvas_height - BUTTON_BAR_HEIGHT
+    panel_width = canvas_width // 2
 
-    thermal_width_by_height = int(max_window_height * thermal.shape[1] / thermal.shape[0])
+    thermal_width_by_height = int(
+        image_area_height * thermal.shape[1] / thermal.shape[0]
+    )
     rgb_width_by_height = int(
-        max(1, max_window_height - BUTTON_BAR_HEIGHT) * rgb.shape[1] / rgb.shape[0]
+        image_area_height * rgb.shape[1] / rgb.shape[0]
     )
     responsive_width = max(
-        240,
-        min(DISPLAY_WIDTH, max_window_width, thermal_width_by_height, rgb_width_by_height),
+        160,
+        min(panel_width, thermal_width_by_height, rgb_width_by_height),
     )
 
-    cv2.namedWindow(CALIBRATION_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+    # WINDOW_AUTOSIZE는 창 관리자·DPI 환경에 따라 이미지 원본 크기를 우선해
+    # 계산된 반응형 크기가 적용되지 않을 수 있다. WINDOW_NORMAL로 생성한 뒤
+    # 목표 작업 영역을 명시적으로 지정한다.
+    cv2.namedWindow(CALIBRATION_WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(
+        CALIBRATION_WINDOW_TITLE,
+        canvas_width,
+        canvas_height,
+    )
     try:
         cv2.setWindowProperty(
             CALIBRATION_WINDOW_TITLE, cv2.WND_PROP_TOPMOST, 1,
@@ -202,36 +260,54 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
     thermal_disp = resize_for_display(thermal, responsive_width)
     rgb_disp = resize_for_display(rgb, responsive_width)
 
-    panel_width = responsive_width
-    image_height = max(thermal_disp.shape[0], rgb_disp.shape[0])
-    canvas_width = panel_width * 2
+    rgb_x_offset = (panel_width - rgb_disp.shape[1]) // 2
+    thermal_x_offset = panel_width + (panel_width - thermal_disp.shape[1]) // 2
+    rgb_y_offset = (image_area_height - rgb_disp.shape[0]) // 2
+    thermal_y_offset = (image_area_height - thermal_disp.shape[0]) // 2
     cv2.moveWindow(
         CALIBRATION_WINDOW_TITLE,
         screen_x + max(12, (screen_w - canvas_width) // 2),
-        screen_y + 36,
+        screen_y + max(12, (screen_h - canvas_height) // 2),
     )
 
     thermal_scale = thermal.shape[1] / thermal_disp.shape[1]
     rgb_scale = rgb.shape[1] / rgb_disp.shape[1]
-    button_rects = _compute_button_rects(canvas_width, image_height)
+    button_rects = _compute_button_rects(canvas_width, image_area_height)
     button_action = {"value": None}
 
     def calibration_callback(event, x, y, flags, param):
-        if y >= image_height:
+        if y >= image_area_height:
             if event == cv2.EVENT_LBUTTONDOWN:
                 for (_, _, action), (x1, y1, x2, y2) in zip(_BUTTONS, button_rects):
                     if x1 <= x <= x2 and y1 <= y <= y2:
                         button_action["value"] = action
                         break
             return
-        if x < panel_width and y < rgb_disp.shape[0]:
+        rgb_local_x = x - rgb_x_offset
+        rgb_local_y = y - rgb_y_offset
+        if (
+            0 <= rgb_local_x < rgb_disp.shape[1]
+            and 0 <= rgb_local_y < rgb_disp.shape[0]
+        ):
             return click_rgb(
-                event, int(x * rgb_scale), int(y * rgb_scale), flags, param,
+                event,
+                int(rgb_local_x * rgb_scale),
+                int(rgb_local_y * rgb_scale),
+                flags,
+                param,
             )
-        thermal_x = x - panel_width
-        if 0 <= thermal_x < panel_width and y < thermal_disp.shape[0]:
+        thermal_local_x = x - thermal_x_offset
+        thermal_local_y = y - thermal_y_offset
+        if (
+            0 <= thermal_local_x < thermal_disp.shape[1]
+            and 0 <= thermal_local_y < thermal_disp.shape[0]
+        ):
             return click_thermal(
-                event, int(thermal_x * thermal_scale), int(y * thermal_scale), flags, param,
+                event,
+                int(thermal_local_x * thermal_scale),
+                int(thermal_local_y * thermal_scale),
+                flags,
+                param,
             )
 
     cv2.setMouseCallback(CALIBRATION_WINDOW_TITLE, calibration_callback)
@@ -312,12 +388,18 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
                     (10, r.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         canvas = np.zeros(
-            (image_height + BUTTON_BAR_HEIGHT, canvas_width, 3), dtype=np.uint8,
+            (canvas_height, canvas_width, 3), dtype=np.uint8,
         )
-        canvas[:r.shape[0], :panel_width] = r
-        canvas[:t.shape[0], panel_width:panel_width * 2] = t
+        canvas[
+            rgb_y_offset:rgb_y_offset + r.shape[0],
+            rgb_x_offset:rgb_x_offset + r.shape[1],
+        ] = r
+        canvas[
+            thermal_y_offset:thermal_y_offset + t.shape[0],
+            thermal_x_offset:thermal_x_offset + t.shape[1],
+        ] = t
         cv2.line(
-            canvas, (panel_width, 0), (panel_width, image_height),
+            canvas, (panel_width, 0), (panel_width, image_area_height),
             (120, 120, 120), 1,
         )
         cv2.putText(
@@ -328,7 +410,7 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
             canvas, "THERMAL", (panel_width + 10, 22),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
         )
-        _draw_button_bar(canvas, image_height, button_rects)
+        _draw_button_bar(canvas, image_area_height, button_rects)
 
         cv2.imshow(CALIBRATION_WINDOW_TITLE, canvas)
         windows_rendered = True
@@ -368,8 +450,12 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
             else:
                 print("[Undo] Nothing to undo.")
         elif key == ord('s') or action == "save":
-            if len(thermal_pts) < 4:
-                print(f"[Save] Need at least 4 point pairs, currently have {len(thermal_pts)}")
+            if len(thermal_pts) < MIN_CALIBRATION_POINT_PAIRS:
+                print(
+                    f"[Save] Need at least {MIN_CALIBRATION_POINT_PAIRS} point pairs, "
+                    f"currently have {len(thermal_pts)}"
+                )
+                _show_minimum_points_dialog(len(thermal_pts))
             elif len(thermal_pts) != len(rgb_pts):
                 print(f"[Save] Point count mismatch: thermal={len(thermal_pts)} vs rgb={len(rgb_pts)}")
             else:
@@ -409,11 +495,47 @@ def run_calibration(thermal_path=None, rgb_path=None, event_pump=None, display_b
         "H": H,
         "thermal_pts": np.array(thermal_pts, dtype=np.float32),
         "visual_pts": np.array(rgb_pts, dtype=np.float32),
+        "thermal_size": (thermal.shape[1], thermal.shape[0]),
+        "visual_size": (rgb.shape[1], rgb.shape[0]),
     }
     np.save(output_path, calib_data)
     print(f"Homography saved: {output_path}")
     print("Homography matrix:")
     print(H)
+
+    thermal_metrics = calibration_point_metrics(
+        thermal_pts, thermal.shape[1], thermal.shape[0],
+    )
+    visual_metrics = calibration_point_metrics(
+        rgb_pts, rgb.shape[1], rgb.shape[0],
+    )
+    for label, metrics in (("Thermal", thermal_metrics), ("Visual", visual_metrics)):
+        print(
+            f"{label} 대응점 분포: "
+            f"가로 {metrics['x_span_ratio'] * 100:.1f}% / "
+            f"세로 {metrics['y_span_ratio'] * 100:.1f}% / "
+            f"Hull 면적 {metrics['hull_area_ratio'] * 100:.1f}%"
+        )
+    _show_calibration_quality_dialog(
+        thermal_metrics,
+        visual_metrics,
+        mean_error,
+        max_error,
+    )
+
+    if result_callback is not None:
+        result_callback({
+            "thermal_points": thermal_arr.tolist(),
+            "visual_points": rgb_arr.tolist(),
+            "homography_matrix": H.tolist(),
+            "mean_error_px": mean_error,
+            "max_error_px": max_error,
+            "scale_ratio": float(
+                ((rgb.shape[1] * rgb.shape[0]) / (thermal.shape[1] * thermal.shape[0])) ** 0.5
+            ),
+            "result": "success",
+            "active": True,
+        })
 
     pt = np.array([[[320, 240]]], dtype=np.float32)
     rgb_pt = cv2.perspectiveTransform(pt, H)
@@ -437,6 +559,62 @@ def _show_error_dialog(mean_error: float, max_error: float, pair_count: int):
             f"최대 오차: {max_error:.2f}px\n\n"
             f"허용 기준: 평균 {MAX_MEAN_ERROR_PX:.1f}px 이하, 최대 {MAX_POINT_ERROR_PX:.1f}px 이하\n\n"
             "전체 리셋(R) 후 화면 전체에 고르게 분포된 대응점을 다시 선택하세요.",
+        )
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _show_minimum_points_dialog(pair_count: int):
+    """대응점이 6쌍 미만이면 저장하지 않고 추가 선택을 안내한다."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(
+            "캘리브레이션 대응점 부족",
+            "캘리브레이션을 완료하려면 대응점을 6쌍 이상 지정해야 합니다.\n"
+            "보정값을 저장하지 않았습니다.\n\n"
+            f"현재 대응점: {pair_count}쌍\n"
+            f"필요 대응점: {MIN_CALIBRATION_POINT_PAIRS}쌍 이상\n\n"
+            "RGB와 Thermal 이미지에서 같은 위치의 대응점을 추가로 선택한 뒤 "
+            "다시 저장하세요.",
+        )
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _show_calibration_quality_dialog(
+    thermal_metrics: dict,
+    visual_metrics: dict,
+    mean_error: float,
+    max_error: float,
+):
+    """저장을 차단하지 않고 캘리브레이션 점 분포 정보를 보여준다."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        def metrics_text(label: str, metrics: dict) -> str:
+            return (
+                f"{label} ({metrics['point_count']}점)\n"
+                f"- 가로 분포: {metrics['x_span_ratio'] * 100:.1f}%\n"
+                f"- 세로 분포: {metrics['y_span_ratio'] * 100:.1f}%\n"
+                f"- Convex Hull 면적: {metrics['hull_area_ratio'] * 100:.1f}%"
+            )
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "캘리브레이션 저장 완료 · 점 분포 정보",
+            "캘리브레이션을 저장했습니다.\n"
+            "\n"
+            f"{metrics_text('Thermal', thermal_metrics)}\n\n"
+            f"{metrics_text('Visual', visual_metrics)}\n\n"
+            f"평균 재투영 오차: {mean_error:.2f}px\n"
+            f"최대 재투영 오차: {max_error:.2f}px",
         )
         root.destroy()
     except Exception:

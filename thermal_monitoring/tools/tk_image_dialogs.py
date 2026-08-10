@@ -67,6 +67,101 @@ def fit_image_rect(
     )
 
 
+def calibration_hull_canvas_points(
+    hull: np.ndarray | None,
+    image_rect: ImageRect,
+) -> list[int]:
+    """Convert the saved Visual calibration hull to Tk canvas coordinates."""
+    if hull is None:
+        return []
+    points = np.asarray(hull, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 3:
+        return []
+    canvas_points: list[int] = []
+    for x, y in points:
+        canvas_points.extend(image_rect.to_canvas(float(x), float(y)))
+    return canvas_points
+
+
+def roi_is_inside_calibration_hull(roi: dict, hull: np.ndarray | None) -> bool:
+    """ROI의 네 꼭짓점이 모두 캘리브레이션 Hull 내부인지 확인한다."""
+    if hull is None:
+        return True
+    return all(
+        cv2.pointPolygonTest(hull, (float(x), float(y)), False) >= 0
+        for x, y in (
+            (roi["x1"], roi["y1"]),
+            (roi["x2"], roi["y1"]),
+            (roi["x2"], roi["y2"]),
+            (roi["x1"], roi["y2"]),
+        )
+    )
+
+
+def roi_coordinate_text(roi: dict) -> str:
+    """환경설정 ROI 편집창에 표시할 좌표 문자열."""
+    x1, y1 = int(roi["x1"]), int(roi["y1"])
+    x2, y2 = int(roi["x2"]), int(roi["y2"])
+    return f"({x1}, {y1})-({x2}, {y2}) · {abs(x2 - x1)}×{abs(y2 - y1)} px"
+
+
+def transformed_roi_bounds(roi: dict, homography: np.ndarray) -> dict:
+    """ROI 사각형 네 꼭짓점을 변환하고 축 정렬 좌표 범위를 반환한다."""
+    corners = np.array([
+        [roi["x1"], roi["y1"]],
+        [roi["x2"], roi["y1"]],
+        [roi["x2"], roi["y2"]],
+        [roi["x1"], roi["y2"]],
+    ], dtype=np.float32).reshape(-1, 1, 2)
+    transformed = cv2.perspectiveTransform(corners, homography).reshape(-1, 2)
+    return {
+        "x1": int(round(transformed[:, 0].min())),
+        "y1": int(round(transformed[:, 1].min())),
+        "x2": int(round(transformed[:, 0].max())),
+        "y2": int(round(transformed[:, 1].max())),
+    }
+
+
+def thermal_bounds_for_roi(roi: dict, inverse_homography: np.ndarray) -> dict:
+    """기존 ROI는 저장 원본을, 편집된 ROI는 Visual 역변환값을 반환한다."""
+    original = roi.get("_thermal_bounds")
+    if original is not None:
+        return dict(original)
+    return transformed_roi_bounds(roi, inverse_homography)
+
+
+def thermal_roi_bounds_are_valid(
+    bounds: dict,
+    width: int = 640,
+    height: int = 480,
+) -> bool:
+    """끝 좌표 미포함 규칙으로 Thermal ROI 범위를 검사한다."""
+    return (
+        0 <= bounds["x1"] < bounds["x2"] <= width
+        and 0 <= bounds["y1"] < bounds["y2"] <= height
+    )
+
+
+def calibration_resolution_status(
+    saved_thermal_size,
+    saved_visual_size,
+    current_thermal_size,
+    current_visual_size,
+) -> str:
+    """캘리브레이션과 현재 원본 이미지 해상도의 비교 상태를 반환한다."""
+    if saved_thermal_size is None or saved_visual_size is None:
+        return "unknown"
+    saved_thermal = tuple(int(value) for value in saved_thermal_size)
+    saved_visual = tuple(int(value) for value in saved_visual_size)
+    current_thermal = tuple(int(value) for value in current_thermal_size)
+    current_visual = tuple(int(value) for value in current_visual_size)
+    return (
+        "match"
+        if saved_thermal == current_thermal and saved_visual == current_visual
+        else "mismatch"
+    )
+
+
 def recommended_window_size(
     screen_width: int,
     screen_height: int,
@@ -142,9 +237,13 @@ class RoiTkDialog:
         if isinstance(calib_data, dict):
             self.homography = calib_data["H"]
             self._calib_visual_pts = calib_data.get("visual_pts")
+            self._calib_thermal_size = calib_data.get("thermal_size")
+            self._calib_visual_size = calib_data.get("visual_size")
         else:
             self.homography = calib_data
             self._calib_visual_pts = None
+            self._calib_thermal_size = None
+            self._calib_visual_size = None
         if self.homography.shape != (3, 3):
             raise ValueError("캘리브레이션 행렬 형식이 올바르지 않습니다.")
         self.inverse_homography = np.linalg.inv(self.homography)
@@ -156,8 +255,17 @@ class RoiTkDialog:
                 self._calib_visual_pts.reshape(-1, 1, 2).astype(np.float32)
             )
         
+        with Image.open(thermal_path) as thermal_image:
+            self.current_thermal_size = thermal_image.size
         self.image = Image.open(visual_path).convert("RGB")
         self.source_width, self.source_height = self.image.size
+        self.current_visual_size = self.image.size
+        self._resolution_status = calibration_resolution_status(
+            self._calib_thermal_size,
+            self._calib_visual_size,
+            self.current_thermal_size,
+            self.current_visual_size,
+        )
         self._load_rois()
 
         self.win = tk.Toplevel(parent)
@@ -221,6 +329,43 @@ class RoiTkDialog:
             ("<Escape>", self.close),
         ):
             self.win.bind(key, lambda _event, fn=command: fn())
+        self.win.after_idle(self._show_resolution_status)
+
+    def _show_resolution_status(self):
+        current_text = (
+            f"현재 이미지: Thermal {self.current_thermal_size[0]}×{self.current_thermal_size[1]} / "
+            f"Visual {self.current_visual_size[0]}×{self.current_visual_size[1]}"
+        )
+        if self._resolution_status == "unknown":
+            messagebox.showinfo(
+                "캘리브레이션 해상도 검사 불가",
+                "기존 캘리브레이션 파일에 원본 이미지 해상도 정보가 없습니다.\n\n"
+                f"{current_text}\n\n"
+                "ROI 작업은 계속할 수 있습니다. 다음 캘리브레이션부터 해상도가 저장됩니다.",
+                parent=self.win,
+            )
+            return
+
+        saved_thermal = tuple(int(value) for value in self._calib_thermal_size)
+        saved_visual = tuple(int(value) for value in self._calib_visual_size)
+        saved_text = (
+            f"캘리브레이션: Thermal {saved_thermal[0]}×{saved_thermal[1]} / "
+            f"Visual {saved_visual[0]}×{saved_visual[1]}"
+        )
+        if self._resolution_status == "match":
+            messagebox.showinfo(
+                "캘리브레이션 해상도 일치",
+                f"{saved_text}\n{current_text}\n\n원본 이미지 해상도가 일치합니다.",
+                parent=self.win,
+            )
+        else:
+            messagebox.showwarning(
+                "캘리브레이션 해상도 불일치",
+                f"{saved_text}\n{current_text}\n\n"
+                "원본 이미지 해상도가 다르므로 ROI 좌표가 어긋날 수 있습니다.\n"
+                "검사 결과만 안내하며 ROI 작업은 차단하지 않습니다.",
+                parent=self.win,
+            )
 
     def _load_rois(self):
         entries = self.cfg.roi.rois or []
@@ -245,6 +390,11 @@ class RoiTkDialog:
                 "y1": int(round(visual[:, 1].min())),
                 "x2": int(round(visual[:, 0].max())),
                 "y2": int(round(visual[:, 1].max())),
+                # 화면 표시용 Visual AABB와 별도로 기존 Thermal ROI를 보존한다.
+                # 사용자가 이 ROI를 다시 그리면 새 dict로 교체되어 이 값이 제거된다.
+                "_thermal_bounds": {
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                },
             })
         self.selected = 0 if self.rois else -1
 
@@ -281,6 +431,29 @@ class RoiTkDialog:
             image=self.photo,
             anchor="nw",
         )
+        hull_points = calibration_hull_canvas_points(
+            self._calib_hull,
+            self.image_rect,
+        )
+        if hull_points:
+            # 저장 시 pointPolygonTest에 사용하는 것과 동일한 영역을 먼저 그린다.
+            self.canvas.create_polygon(
+                *hull_points,
+                fill="#e2a93b",
+                stipple="gray25",
+                outline="#ffd166",
+                width=2,
+                dash=(6, 4),
+            )
+            label_x, label_y = hull_points[0], hull_points[1]
+            self.canvas.create_text(
+                label_x + 6,
+                max(self.image_rect.y + 12, label_y - 12),
+                text="캘리브레이션 ROI 설정 가능 영역",
+                fill="#ffd166",
+                anchor="w",
+                font=("맑은 고딕", 9, "bold"),
+            )
         for index, roi in enumerate(self.rois):
             x1, y1 = self.image_rect.to_canvas(roi["x1"], roi["y1"])
             x2, y2 = self.image_rect.to_canvas(roi["x2"], roi["y2"])
@@ -297,9 +470,45 @@ class RoiTkDialog:
         if self.drag_start and self.drag_end:
             x1, y1 = self.image_rect.to_canvas(*self.drag_start)
             x2, y2 = self.image_rect.to_canvas(*self.drag_end)
-            self.canvas.create_rectangle(x1, y1, x2, y2, outline="#ffff00", width=2)
-        selected_name = self.rois[self.selected]["name"] if 0 <= self.selected < len(self.rois) else "없음"
-        self.status.configure(text=f"선택: {selected_name} · 전체 {len(self.rois)}개")
+            drag_roi = {
+                "x1": min(self.drag_start[0], self.drag_end[0]),
+                "y1": min(self.drag_start[1], self.drag_end[1]),
+                "x2": max(self.drag_start[0], self.drag_end[0]),
+                "y2": max(self.drag_start[1], self.drag_end[1]),
+            }
+            inside_hull = roi_is_inside_calibration_hull(
+                drag_roi, self._calib_hull,
+            )
+            drag_color = "#ffff00" if inside_hull else "#ff3b30"
+            self.canvas.create_rectangle(
+                x1, y1, x2, y2, outline=drag_color, width=3,
+            )
+            state_text = "" if inside_hull else " · ⚠ 캘리브레이션 가능 영역 밖"
+            self.status.configure(
+                text=(
+                    "설정 중(Thermal 640×480 좌표): "
+                    f"{roi_coordinate_text(transformed_roi_bounds(drag_roi, self.inverse_homography))}"
+                    f"{state_text}"
+                ),
+                foreground=drag_color,
+            )
+        elif 0 <= self.selected < len(self.rois):
+            selected = self.rois[self.selected]
+            thermal_bounds = thermal_bounds_for_roi(
+                selected, self.inverse_homography,
+            )
+            self.status.configure(
+                text=(
+                    f"선택: {selected['name']} · Thermal 640×480 좌표: "
+                    f"{roi_coordinate_text(thermal_bounds)} · 전체 {len(self.rois)}개"
+                ),
+                foreground="",
+            )
+        else:
+            self.status.configure(
+                text=f"선택: 없음 · 전체 {len(self.rois)}개",
+                foreground="",
+            )
 
     def _source_point(self, event) -> tuple[int, int] | None:
         if not self.image_rect or not self.image_rect.contains(event.x, event.y):
@@ -331,6 +540,18 @@ class RoiTkDialog:
         x1, x2 = sorted((self.drag_start[0], self.drag_end[0]))
         y1, y2 = sorted((self.drag_start[1], self.drag_end[1]))
         if x2 - x1 > 5 and y2 - y1 > 5:
+            candidate = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+            if not roi_is_inside_calibration_hull(candidate, self._calib_hull):
+                self.drag_start = self.drag_end = None
+                self.redraw()
+                messagebox.showwarning(
+                    "ROI 범위 초과",
+                    "선택한 ROI가 캘리브레이션 가능 영역을 벗어났습니다.\n\n"
+                    "노란색 캘리브레이션 영역 안에서 다시 지정하세요.\n"
+                    "기존 ROI 좌표는 변경하지 않았습니다.",
+                    parent=self.win,
+                )
+                return
             self._snapshot()
             if 0 <= self.selected < len(self.rois):
                 name = self.rois[self.selected]["name"]
@@ -397,66 +618,44 @@ class RoiTkDialog:
         entries = []
         for roi in self.rois:
             # hull boundary check: 네 꼭짓점이 모두 hull 안에 있어야 통과
-            if self._calib_hull is not None:
-                for corner in (
-                    (roi["x1"], roi["y1"]), (roi["x2"], roi["y1"]),
-                    (roi["x2"], roi["y2"]), (roi["x1"], roi["y2"]),
-                ):
-                    if cv2.pointPolygonTest(self._calib_hull, corner, False) < 0:
-                        messagebox.showwarning(
-                            "ROI 범위 초과",
-                            f"'{roi['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
-                            f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
-                            f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
-                            parent=self.win,
-                        )
-                        return False
-
-            # 사각형 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스 사용.
-            visual = np.array([
-                [roi["x1"], roi["y1"]],  # top-left
-                [roi["x2"], roi["y1"]],  # top-right
-                [roi["x2"], roi["y2"]],  # bottom-right
-                [roi["x1"], roi["y2"]],  # bottom-left
-            ], dtype=np.float32).reshape(-1, 1, 2)
-            thermal = cv2.perspectiveTransform(
-                visual, self.inverse_homography,
-            ).reshape(-1, 2)
-            raw_x1 = int(round(thermal[:, 0].min()))
-            raw_y1 = int(round(thermal[:, 1].min()))
-            raw_x2 = int(round(thermal[:, 0].max()))
-            raw_y2 = int(round(thermal[:, 1].max()))
-
-            # 클램핑 → 원하지 않은 위치로 바뀌므로 저장 거부
-            x1 = max(0, min(raw_x1, 639))
-            y1 = max(0, min(raw_y1, 479))
-            x2 = max(0, min(raw_x2, 639))
-            y2 = max(0, min(raw_y2, 479))
-
-            if raw_x1 != x1 or raw_y1 != y1 or raw_x2 != x2 or raw_y2 != y2:
+            if not roi_is_inside_calibration_hull(roi, self._calib_hull):
                 messagebox.showwarning(
                     "ROI 범위 초과",
-                    f"'{roi['name']}' ROI가 열화상 카메라 시야를 벗어납니다.\n\n"
+                    f"'{roi['name']}' ROI가 캘리브레이션 영역 밖에 있습니다.\n\n"
+                    f"호모그래피 변환이 정확하지 않은 영역입니다.\n"
+                    f"ROI를 캘리브레이션 대응점 범위 안으로 옮기세요.",
+                    parent=self.win,
+                )
+                return False
+
+            # 사각형 네 꼭짓점을 모두 변환한 후 축 정렬 바운딩 박스 사용.
+            thermal_bounds = thermal_bounds_for_roi(
+                roi, self.inverse_homography,
+            )
+            raw_x1 = thermal_bounds["x1"]
+            raw_y1 = thermal_bounds["y1"]
+            raw_x2 = thermal_bounds["x2"]
+            raw_y2 = thermal_bounds["y2"]
+
+            # Thermal ROI는 640×480 표준 좌표계의 끝 좌표 미포함 규칙을 사용한다.
+            # 좌표를 임의로 클램핑하지 않고 유효한 변환값만 그대로 저장한다.
+            if not thermal_roi_bounds_are_valid(thermal_bounds):
+                messagebox.showwarning(
+                    "ROI 범위 초과",
+                    f"'{roi['name']}' ROI의 열화상 좌표가 유효하지 않습니다.\n\n"
                     f"변환 좌표: ({raw_x1},{raw_y1})-({raw_x2},{raw_y2})\n"
-                    f"열화상 범위: 0~639 × 0~479\n\n"
+                    "허용 범위: 0 ≤ x1 < x2 ≤ 640\n"
+                    "           0 ≤ y1 < y2 ≤ 480\n\n"
+                    "오른쪽·아래쪽 끝 좌표 640/480은 영역에 포함되지 않는 경계입니다.\n\n"
                     f"ROI를 카메라 중앙 쪽으로 옮기거나\n"
                     f"캘리브레이션 대응점을 카메라 전체에 고르게 다시 지정하세요.",
                     parent=self.win,
                 )
                 return False
 
-            if x1 >= x2 or y1 >= y2:
-                messagebox.showwarning(
-                    "ROI 설정",
-                    f"'{roi['name']}' 영역이 유효하지 않습니다.\n"
-                    f"좌표: ({x1},{y1})-({x2},{y2})\n"
-                    "ROI 박스가 너무 작거나 화면 밖으로 벗어났습니다.",
-                    parent=self.win,
-                )
-                return False
             entries.append(RoiEntry(
                 name=roi["name"],
-                x1=x1, y1=y1, x2=x2, y2=y2,
+                x1=raw_x1, y1=raw_y1, x2=raw_x2, y2=raw_y2,
             ))
         if not entries:
             return False

@@ -90,3 +90,15 @@ def test_dashboard_summary_uses_exact_then_camera_wide_threshold():
 
     assert "AND (roi_id = :roi_id OR roi_id IS NULL)" in summary_source
     assert "CASE WHEN roi_id = :roi_id THEN 0 ELSE 1 END" in summary_source
+
+
+def test_measurement_persists_files_hotspots_quality_and_overlay_link():
+    source = BACKEND_APP.read_text(encoding="utf-8")
+    measurement_start = source.index("def create_measurement")
+    measurement_source = source[measurement_start:]
+
+    assert "INSERT INTO capture_files" in measurement_source
+    assert "INSERT INTO hotspots" in measurement_source
+    assert "INSERT INTO image_quality_results" in measurement_source
+    assert "overlay_file_id" in measurement_source
+    assert "INSERT INTO api_request_logs" in measurement_source

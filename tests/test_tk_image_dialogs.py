@@ -1,6 +1,15 @@
+import numpy as np
+
 from thermal_monitoring.tools.tk_image_dialogs import (
+    calibration_resolution_status,
+    calibration_hull_canvas_points,
     fit_image_rect,
     recommended_window_size,
+    roi_is_inside_calibration_hull,
+    roi_coordinate_text,
+    thermal_bounds_for_roi,
+    thermal_roi_bounds_are_valid,
+    transformed_roi_bounds,
 )
 from thermal_monitoring.tools.product_dashboard import SettingsDialog
 
@@ -11,6 +20,21 @@ def test_fit_image_rect_preserves_aspect_ratio_and_centers_image():
     assert (rect.width, rect.height) == (666, 500)
     assert rect.x == 167
     assert rect.y == 0
+
+
+def test_calibration_resolution_status_reports_match_and_mismatch():
+    assert calibration_resolution_status(
+        (640, 480), (2592, 1944), (640, 480), (2592, 1944),
+    ) == "match"
+    assert calibration_resolution_status(
+        (640, 480), (2592, 1944), (640, 480), (1920, 1080),
+    ) == "mismatch"
+
+
+def test_calibration_resolution_status_supports_legacy_files():
+    assert calibration_resolution_status(
+        None, None, (640, 480), (2592, 1944),
+    ) == "unknown"
 
 
 def test_image_rect_coordinate_round_trip_after_resize():
@@ -28,6 +52,106 @@ def test_image_rect_rejects_letterbox_area():
 
     assert not rect.contains(20, 250)
     assert rect.contains(rect.x, rect.y)
+
+
+def test_calibration_hull_uses_roi_image_coordinate_transform():
+    rect = fit_image_rect(1920, 1080, 0, 0, 1000, 500)
+    hull = np.array([[[100, 100]], [[500, 100]], [[500, 400]], [[100, 400]]])
+
+    assert calibration_hull_canvas_points(hull, rect) == [
+        *rect.to_canvas(100, 100),
+        *rect.to_canvas(500, 100),
+        *rect.to_canvas(500, 400),
+        *rect.to_canvas(100, 400),
+    ]
+
+
+def test_legacy_calibration_without_points_has_no_visible_hull():
+    rect = fit_image_rect(640, 480, 0, 0, 640, 480)
+
+    assert calibration_hull_canvas_points(None, rect) == []
+
+
+def test_roi_hull_check_accepts_inside_and_boundary_but_rejects_outside():
+    hull = np.array([[[10, 10]], [[100, 10]], [[100, 100]], [[10, 100]]], dtype=np.float32)
+
+    assert roi_is_inside_calibration_hull(
+        {"x1": 20, "y1": 20, "x2": 90, "y2": 90}, hull,
+    )
+    assert roi_is_inside_calibration_hull(
+        {"x1": 10, "y1": 10, "x2": 100, "y2": 100}, hull,
+    )
+    assert not roi_is_inside_calibration_hull(
+        {"x1": 5, "y1": 20, "x2": 90, "y2": 90}, hull,
+    )
+
+
+def test_roi_hull_check_allows_legacy_calibration_without_hull():
+    assert roi_is_inside_calibration_hull(
+        {"x1": 0, "y1": 0, "x2": 100, "y2": 100}, None,
+    )
+
+
+def test_roi_coordinate_text_formats_bounds_and_size():
+    assert roi_coordinate_text({
+        "x1": 120, "y1": 80, "x2": 420, "y2": 260,
+    }) == "(120, 80)-(420, 260) · 300×180 px"
+
+
+def test_transformed_roi_bounds_uses_inverse_calibration_coordinates():
+    visual_to_thermal = np.array([
+        [0.25, 0.0, 0.0],
+        [0.0, 0.25, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+
+    assert transformed_roi_bounds({
+        "x1": 1000, "y1": 400, "x2": 1800, "y2": 1200,
+    }, visual_to_thermal) == {
+        "x1": 250, "y1": 100, "x2": 450, "y2": 300,
+    }
+
+
+def test_existing_roi_keeps_saved_thermal_bounds_until_edited():
+    inverse = np.diag([0.25, 0.25, 1.0]).astype(np.float32)
+    roi = {
+        "x1": 1000, "y1": 400, "x2": 1800, "y2": 1200,
+        "_thermal_bounds": {"x1": 125, "y1": 117, "x2": 566, "y2": 371},
+    }
+
+    assert thermal_bounds_for_roi(roi, inverse) == {
+        "x1": 125, "y1": 117, "x2": 566, "y2": 371,
+    }
+
+
+def test_edited_roi_uses_inverse_calibration_bounds():
+    inverse = np.diag([0.25, 0.25, 1.0]).astype(np.float32)
+    roi = {"x1": 1000, "y1": 400, "x2": 1800, "y2": 1200}
+
+    assert thermal_bounds_for_roi(roi, inverse) == {
+        "x1": 250, "y1": 100, "x2": 450, "y2": 300,
+    }
+
+
+def test_thermal_roi_bounds_use_exclusive_end_coordinates():
+    assert thermal_roi_bounds_are_valid(
+        {"x1": 0, "y1": 0, "x2": 640, "y2": 480},
+    )
+    assert thermal_roi_bounds_are_valid(
+        {"x1": 639, "y1": 479, "x2": 640, "y2": 480},
+    )
+
+
+def test_thermal_roi_bounds_reject_outside_or_empty_coordinates():
+    assert not thermal_roi_bounds_are_valid(
+        {"x1": -1, "y1": 0, "x2": 640, "y2": 480},
+    )
+    assert not thermal_roi_bounds_are_valid(
+        {"x1": 0, "y1": 0, "x2": 641, "y2": 480},
+    )
+    assert not thermal_roi_bounds_are_valid(
+        {"x1": 100, "y1": 50, "x2": 100, "y2": 200},
+    )
 
 
 def test_resolution_aware_popup_sizes_for_1920_by_1200():
