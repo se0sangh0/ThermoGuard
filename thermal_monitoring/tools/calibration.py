@@ -176,9 +176,9 @@ def run_calibration(
             thermal_path = sys.argv[1]
             rgb_path = os.path.splitext(thermal_path)[0] + "_visual.jpg"
         else:
-            jpg_files = sorted(glob.glob(os.path.join(DATASET_DIR, "*.jpg")))
-            visual_files = [f for f in jpg_files if "_visual" in f]
-            thermal_files = [f for f in jpg_files if "_visual" not in f]
+            jpg_files = sorted(glob.glob(os.path.join(DATASET_DIR, "**", "*.jpg"), recursive=True))
+            visual_files = [f for f in jpg_files if os.path.basename(f).find("_visual") != -1]
+            thermal_files = [f for f in jpg_files if os.path.basename(f).find("_visual") == -1 and os.path.basename(f).find("_overlay") == -1]
             if thermal_files:
                 thermal_path = thermal_files[-1]
                 matching_visual = os.path.splitext(thermal_path)[0] + "_visual.jpg"

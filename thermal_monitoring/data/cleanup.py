@@ -12,8 +12,12 @@ monitor.py 실시간 감시나 tools.py GUI에서 백그라운드로 동작합�
     from cleanup import run_cleanup_if_due
     run_cleanup_if_due(save_dir=..., retention_days=7)
 
+    # 12시간 Normal 쌍 제거 프로브 (monitor.py 전용):
+    from cleanup import remove_normal_pairs_if_due
+    remove_normal_pairs_if_due(save_dir=...)
+
 설정:
-    config.json의 monitoring.cleanup_retention_days (기본 7일)
+    config.json의 monitoring.cleanup_retention_days (기본 2일)
 """
 
 import csv
@@ -100,6 +104,29 @@ def _get_file_size(path: str) -> int:
         return 0
 
 
+def _scan_recursive(save_dir: str):
+    """재귀적으로 데이터셋 디렉토리를 스캔. dict 값은 전체 경로."""
+    thermal_jpgs: dict[str, str] = {}
+    npys: dict[str, str] = {}
+    visual_jpgs: dict[str, str] = {}
+    overlays: list[str] = []
+    try:
+        for root, _dirs, files in os.walk(save_dir):
+            for name in files:
+                full = os.path.join(root, name)
+                if name.endswith("_thermal.npy"):
+                    npys[name.replace("_thermal.npy", "")] = full
+                elif name.endswith("_visual.jpg"):
+                    visual_jpgs[name.replace("_visual.jpg", "")] = full
+                elif name.endswith("_overlay.jpg"):
+                    overlays.append(full)
+                elif name.endswith(".jpg"):
+                    thermal_jpgs[name.replace(".jpg", "")] = full
+    except OSError:
+        pass
+    return thermal_jpgs, npys, visual_jpgs, overlays
+
+
 def run_cleanup(
     save_dir: str | None = None,
     retention_days: int = _DEFAULT_RETENTION_DAYS,
@@ -134,26 +161,7 @@ def run_cleanup(
          log_callback, result.messages)
     _log(f"[cleanup] Scanning: {save_dir}", log_callback, result.messages)
 
-    thermal_jpgs: dict[str, str] = {}
-    npys: dict[str, str] = {}
-    visual_jpgs: dict[str, str] = {}
-    overlays: list[str] = []
-    try:
-        with os.scandir(save_dir) as entries:
-            for entry in entries:
-                if not entry.is_file():
-                    continue
-                name = entry.name
-                if name.endswith("_thermal.npy"):
-                    npys[name.replace("_thermal.npy", "")] = name
-                elif name.endswith("_visual.jpg"):
-                    visual_jpgs[name.replace("_visual.jpg", "")] = name
-                elif name.endswith("_overlay.jpg"):
-                    overlays.append(name)
-                elif name.endswith(".jpg"):
-                    thermal_jpgs[name.replace(".jpg", "")] = name
-    except OSError:
-        return result
+    thermal_jpgs, npys, visual_jpgs, overlays = _scan_recursive(save_dir)
 
     # 1. 오래된 Normal 쌍만 삭제 (Warning/Critical 이력 보존)
     alarm_bases = _load_alarm_bases(save_dir)
@@ -180,11 +188,11 @@ def run_cleanup(
         _log(f"[cleanup] Removing {len(old_normal)} expired Normal pair(s)...", log_callback, result.messages)
         for base in old_normal:
             paths = [
-                os.path.join(save_dir, thermal_jpgs[base]),
-                os.path.join(save_dir, npys[base]),
+                thermal_jpgs[base],
+                npys[base],
             ]
             if base in visual_jpgs:
-                paths.append(os.path.join(save_dir, visual_jpgs[base]))
+                paths.append(visual_jpgs[base])
             for p in paths:
                 try:
                     result.freed_bytes += _get_file_size(p)
@@ -197,7 +205,7 @@ def run_cleanup(
     # 2. 고아 NPY (JPG 없는)
     orphan_npy = set(npys.keys()) - set(thermal_jpgs.keys())
     for base in orphan_npy:
-        p = os.path.join(save_dir, npys[base])
+        p = npys[base]
         try:
             result.freed_bytes += _get_file_size(p)
             os.remove(p)
@@ -210,7 +218,7 @@ def run_cleanup(
     # 3. 고아 JPG (NPY 없는)
     orphan_jpg = set(thermal_jpgs.keys()) - set(npys.keys())
     for base in orphan_jpg:
-        p = os.path.join(save_dir, thermal_jpgs[base])
+        p = thermal_jpgs[base]
         try:
             result.freed_bytes += _get_file_size(p)
             os.remove(p)
@@ -221,29 +229,20 @@ def run_cleanup(
         _log(f"[cleanup] Removed {len(orphan_jpg)} orphan JPG(s)", log_callback, result.messages)
 
     # 4. 대응 쌍 없는 오버레이
-    overlay_dir = os.path.join(save_dir, "overlay")
-    if os.path.isdir(overlay_dir):
-        try:
-            with os.scandir(overlay_dir) as entries:
-                for entry in entries:
-                    if not entry.is_file():
-                        continue
-                    f = entry.name
-                    if not f.endswith("_overlay.jpg"):
-                        continue
-                    base = f.replace("_overlay.jpg", "")
-                    if base not in paired and base not in thermal_jpgs:
-                        p = os.path.join(overlay_dir, f)
-                        try:
-                            result.freed_bytes += _get_file_size(p)
-                            os.remove(p)
-                            result.removed_overlay += 1
-                        except OSError as e:
-                            result.errors.append(f"Failed to remove overlay {p}: {e}")
-        except OSError:
-            pass
-        if result.removed_overlay > 0:
-            _log(f"[cleanup] Removed {result.removed_overlay} orphan overlay(s)", log_callback, result.messages)
+    for p in overlays:
+        base = os.path.basename(p).replace("_overlay.jpg", "")
+        if base not in paired and base not in thermal_jpgs:
+            try:
+                result.freed_bytes += _get_file_size(p)
+                os.remove(p)
+                result.removed_overlay += 1
+            except OSError as e:
+                result.errors.append(f"Failed to remove overlay {p}: {e}")
+    if result.removed_overlay > 0:
+        _log(f"[cleanup] Removed {result.removed_overlay} orphan overlay(s)", log_callback, result.messages)
+
+    # 빈 서브디렉토리 정리 (날짜/블록 폴더)
+    _remove_empty_subdirs(save_dir, log_callback, result.messages)
 
     # 오류 로그
     for err in result.errors:
@@ -261,6 +260,117 @@ def run_cleanup(
     _log(summary, log_callback, result.messages)
 
     return result
+
+
+# ════════════════════════════════════════════════════════════
+# 12시간 Normal 쌍 제거 프로브
+# ════════════════════════════════════════════════════════════
+
+_last_normal_removal_time: float = 0.0
+_NORMAL_REMOVAL_INTERVAL_SEC = 12 * 3600  # 12시간
+
+
+def run_remove_normal_pairs(
+    save_dir: str | None = None,
+    log_callback=None,
+) -> CleanupResult:
+    """Normal 상태인 모든 쌍(thermal JPG + NPY + visual JPG)을 삭제.
+    
+    Warning/Critical 이력이 있는 image_id만 보존하고,
+    나머지 Normal 쌍은 모두 제거한다.
+    """
+    result = CleanupResult()
+
+    if save_dir is None:
+        try:
+            from ..config import load_config
+            save_dir = load_config().paths.dataset_dir
+        except Exception:
+            save_dir = _RELATIVE_SAVE_DIR
+
+    if not os.path.isdir(save_dir):
+        _logger.info("Skip normal-pair removal: '%s' not found", save_dir)
+        return result
+
+    alarm_bases = _load_alarm_bases(save_dir)
+    thermal_jpgs, npys, visual_jpgs, _overlays = _scan_recursive(save_dir)
+    paired = set(thermal_jpgs.keys()) & set(npys.keys())
+
+    normal_bases = sorted(paired - alarm_bases)
+    if not normal_bases:
+        _log("[cleanup] No Normal pairs to remove.", log_callback, result.messages)
+        return result
+
+    _log(f"[cleanup] Normal-pair cleanup: removing {len(normal_bases)} Normal pair(s), "
+         f"preserving {len(alarm_bases & paired)} alarm pair(s).",
+         log_callback, result.messages)
+    _logger.info("normal-pair cleanup: %d Normal pairs to remove, %d alarm pairs preserved",
+                 len(normal_bases), len(alarm_bases & paired))
+
+    for base in normal_bases:
+        paths = [
+            thermal_jpgs[base],
+            npys[base],
+        ]
+        if base in visual_jpgs:
+            paths.append(visual_jpgs[base])
+        for p in paths:
+            try:
+                result.freed_bytes += _get_file_size(p)
+                os.remove(p)
+                result.removed_pairs += 1
+            except OSError as e:
+                result.errors.append(f"Failed to remove {p}: {e}")
+
+    for err in result.errors:
+        _log(f"[cleanup] ERROR: {err}", log_callback, result.messages)
+
+    # 빈 서브디렉토리 정리
+    _remove_empty_subdirs(save_dir, log_callback, result.messages)
+
+    freed_mb = result.freed_bytes / (1024 * 1024)
+    _log(f"[cleanup] Normal-pair removal done — {len(normal_bases)} pairs, "
+         f"freed: {freed_mb:.1f} MB",
+         log_callback, result.messages)
+
+    return result
+
+
+def remove_normal_pairs_if_due(
+    save_dir: str | None = None,
+    log_callback=None,
+) -> CleanupResult | None:
+    """마지막 Normal 쌍 제거로부터 12시간 이상 지났으면 실행. 그렇지 않으면 None."""
+    global _last_normal_removal_time
+    now = time.time()
+    if (now - _last_normal_removal_time) < _NORMAL_REMOVAL_INTERVAL_SEC:
+        return None
+    _last_normal_removal_time = now
+    return run_remove_normal_pairs(save_dir=save_dir, log_callback=log_callback)
+
+
+# ════════════════════════════════════════════════════════════
+# 빈 서브디렉토리 정리 헬퍼
+# ════════════════════════════════════════════════════════════
+
+def _remove_empty_subdirs(save_dir: str, log_callback=None, messages: list[str] | None = None):
+    """날짜/블록 서브디렉토리 중 빈 폴더를 삭제 (root save_dir과 overlay 제외)."""
+    try:
+        removed = 0
+        for root, dirs, files in os.walk(save_dir, topdown=False):
+            if root == save_dir or os.path.basename(root) == "overlay":
+                continue
+            if not files and not dirs:
+                try:
+                    os.rmdir(root)
+                    removed += 1
+                except OSError:
+                    pass
+        if removed > 0:
+            _log(f"[cleanup] Removed {removed} empty subdirector{'y' if removed == 1 else 'ies'}",
+                 log_callback, messages)
+    except OSError:
+        pass
 
 
 # ════════════════════════════════════════════════════════════

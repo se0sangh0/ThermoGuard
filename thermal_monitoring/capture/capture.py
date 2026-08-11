@@ -24,6 +24,7 @@ from typing import Optional
 import requests
 
 from ..config import load_config
+from ..data.pairs import capture_subdir
 from ..logger import get_logger
 from .thermal_utils import probe_thermal_from_url
 
@@ -157,7 +158,10 @@ class CaptureSession:
             return (None, None)
 
         do_visual = self.mode == "both"
-        filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
+        now = datetime.now()
+        filenametime = now.strftime("%Y%m%d%H%M%S_%f")
+        save_subdir = capture_subdir(self.save_dir, now)
+        os.makedirs(save_subdir, exist_ok=True)
 
         results: dict[str, str | None] = {"thermal": None, "visual": None}
         img_types = ["thermal", "visual"] if do_visual else ["thermal"]
@@ -171,7 +175,7 @@ class CaptureSession:
                         _log.warning("capture_both_once: %s failed, aborting", img_type)
                         return (None, None)
                     suffix = "_visual" if img_type == "visual" else ""
-                    jpg_path = os.path.join(self.save_dir, f"{filenametime}{suffix}.jpg")
+                    jpg_path = os.path.join(save_subdir, f"{filenametime}{suffix}.jpg")
                     with open(jpg_path, "wb") as f:
                         f.write(content)
                     results[img_type] = jpg_path
@@ -180,7 +184,7 @@ class CaptureSession:
             _, content, error = self._fetch_image("thermal")
             if error or content is None:
                 return (None, None)
-            jpg_path = os.path.join(self.save_dir, f"{filenametime}.jpg")
+            jpg_path = os.path.join(save_subdir, f"{filenametime}.jpg")
             with open(jpg_path, "wb") as f:
                 f.write(content)
             results["thermal"] = jpg_path
@@ -266,7 +270,10 @@ class CaptureSession:
                 is_normal_cycle = self.interval == self._normal_interval
             img_types = ["thermal", "visual"] if (self.mode == "both" and is_normal_cycle) else ["thermal"]
             try:
-                filenametime = datetime.now().strftime("%Y%m%d%H%M%S_%f")
+                now = datetime.now()
+                filenametime = now.strftime("%Y%m%d%H%M%S_%f")
+                save_subdir = capture_subdir(self.save_dir, now)
+                os.makedirs(save_subdir, exist_ok=True)
                 saved_thermal: str | None = None
                 saved_visual: str | None = None
 
@@ -287,7 +294,7 @@ class CaptureSession:
                                 all_ok = False
                                 continue
                             suffix = "_visual" if img_type == "visual" else ""
-                            jpg_path = os.path.join(self.save_dir, f"{filenametime}{suffix}.jpg")
+                            jpg_path = os.path.join(save_subdir, f"{filenametime}{suffix}.jpg")
                             with open(jpg_path, "wb") as f:
                                 f.write(content)
                             if img_type == "visual":
@@ -308,7 +315,7 @@ class CaptureSession:
                         if content is None:
                             all_ok = False
                             continue
-                        jpg_path = os.path.join(self.save_dir, f"{filenametime}.jpg")
+                        jpg_path = os.path.join(save_subdir, f"{filenametime}.jpg")
                         with open(jpg_path, "wb") as f:
                             f.write(content)
                         saved_thermal = jpg_path

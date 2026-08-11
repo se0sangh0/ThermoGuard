@@ -445,8 +445,8 @@ def main(event_pump=None, display_bounds=None):
     elif len(sys.argv) == 2:
         thermal_path = sys.argv[1]
     else:
-        jpg_files = sorted(glob.glob(os.path.join(DATASET_DIR, "*.jpg")))
-        thermal_files = [f for f in jpg_files if "_visual" not in f]
+        jpg_files = sorted(glob.glob(os.path.join(DATASET_DIR, "**", "*.jpg"), recursive=True))
+        thermal_files = [f for f in jpg_files if "_visual" not in os.path.basename(f) and "_overlay" not in os.path.basename(f)]
         if thermal_files:
             thermal_path = thermal_files[-1]
             v = os.path.splitext(thermal_path)[0] + "_visual.jpg"

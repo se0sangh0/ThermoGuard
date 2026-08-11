@@ -42,15 +42,13 @@ def _scan(save_dir: str):
     jpgs: dict[str, str] = {}
     npys: dict[str, str] = {}
     try:
-        with os.scandir(save_dir) as entries:
-            for entry in entries:
-                if not entry.is_file():
-                    continue
-                name = entry.name
+        for root, _dirs, files in os.walk(save_dir):
+            for name in files:
+                full = os.path.join(root, name)
                 if name.endswith("_thermal.npy"):
-                    npys[name.replace("_thermal.npy", "")] = name
+                    npys[name.replace("_thermal.npy", "")] = full
                 elif name.endswith(".jpg") and "_visual" not in name and "_overlay" not in name:
-                    jpgs[name.replace(".jpg", "")] = name
+                    jpgs[name.replace(".jpg", "")] = full
     except OSError:
         pass
     return jpgs, npys
@@ -98,8 +96,8 @@ def run_check(
         sorted_missing = sorted(missing)
 
         def _recover_one(base: str) -> tuple[str, bool, str]:
-            jpg_path = os.path.join(save_dir, jpg_bases[base])
-            npy_path = os.path.join(save_dir, base + "_thermal.npy")
+            jpg_path = jpg_bases[base]
+            npy_path = os.path.join(os.path.dirname(jpg_path), base + "_thermal.npy")
             try:
                 thermal, _ = extract_from_jpeg(jpg_path)
                 np.save(npy_path, thermal)
@@ -121,7 +119,7 @@ def run_check(
     if orphan:
         _log(f"\n[Removing {len(orphan)} orphan NPY files...]", log_callback, result.messages)
         for base in sorted(orphan):
-            npy_path = os.path.join(save_dir, npy_bases[base])
+            npy_path = npy_bases[base]
             os.remove(npy_path)
             _log(f"  REMOVED {npy_path}", log_callback, result.messages)
             result.removed += 1

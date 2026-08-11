@@ -29,7 +29,7 @@ from ..config import load_config
 from ..capture.capture import CaptureSession
 from ..data.checking import run_check
 from ..data.metadata import run_metadata
-from ..data.cleanup import run_cleanup_if_due
+from ..data.cleanup import run_cleanup_if_due, remove_normal_pairs_if_due
 from ..analysis.roi import (
     load_roi_config,
     extract_all_rois_from_npy,
@@ -107,11 +107,8 @@ class MonitorSequencer:
             return set()
         bases: set = set()
         try:
-            with os.scandir(DATASET_DIR) as entries:
-                for entry in entries:
-                    if not entry.is_file():
-                        continue
-                    name = entry.name
+            for root, _dirs, files in os.walk(DATASET_DIR):
+                for name in files:
                     if (name.endswith(".jpg")
                             and "_visual" not in name
                             and "_overlay" not in name):
@@ -136,17 +133,15 @@ class MonitorSequencer:
         npys: dict[str, str] = {}
         visual_jpgs: dict[str, str] = {}
         try:
-            with os.scandir(DATASET_DIR) as entries:
-                for entry in entries:
-                    if not entry.is_file():
-                        continue
-                    name = entry.name
+            for root, _dirs, files in os.walk(DATASET_DIR):
+                for name in files:
+                    full = os.path.join(root, name)
                     if name.endswith("_thermal.npy"):
-                        npys[name.replace("_thermal.npy", "")] = name
+                        npys[name.replace("_thermal.npy", "")] = full
                     elif name.endswith("_visual.jpg"):
-                        visual_jpgs[name.replace("_visual.jpg", "")] = name
+                        visual_jpgs[name.replace("_visual.jpg", "")] = full
                     elif name.endswith(".jpg") and "_overlay" not in name:
-                        thermal_jpgs[name.replace(".jpg", "")] = name
+                        thermal_jpgs[name.replace(".jpg", "")] = full
         except OSError:
             return []
 
@@ -158,23 +153,24 @@ class MonitorSequencer:
         for base in bases:
             if base in self.processed_bases:
                 continue
-            npy_path = os.path.join(DATASET_DIR, base + "_thermal.npy")
             # NPY가 없으면 JPEG에서 즉시 추출
             if base not in npys:
                 try:
                     from ..capture.thermal_utils import extract_from_jpeg
-                    jpg_path = os.path.join(DATASET_DIR, thermal_jpgs[base])
+                    jpg_path = thermal_jpgs[base]
+                    npy_path = os.path.join(os.path.dirname(jpg_path), base + "_thermal.npy")
                     thermal, _ = extract_from_jpeg(jpg_path)
                     np.save(npy_path, thermal)
+                    npys[base] = npy_path
                 except Exception as e:
                     self._log(f"  Failed to extract NPY for {base}: {e}")
                     continue
             visual_jpg = visual_jpgs.get(base)
             new_pairs.append({
                 "base": base,
-                "thermal_jpg": os.path.join(DATASET_DIR, thermal_jpgs[base]),
-                "visual_jpg": os.path.join(DATASET_DIR, visual_jpg) if visual_jpg else "",
-                "npy": npy_path,
+                "thermal_jpg": thermal_jpgs[base],
+                "visual_jpg": visual_jpg if visual_jpg else "",
+                "npy": npys[base],
             })
 
         return new_pairs
@@ -223,6 +219,20 @@ class MonitorSequencer:
                           f"{result.freed_bytes / (1024 * 1024):.1f} MB freed")
         except Exception as e:
             self._log(f"Cleanup error (recovering): {e}")
+
+    def _run_normal_removal(self):
+        """Normal 쌍 제거 프로브 (12시간마다 자동 실행)"""
+        try:
+            result = remove_normal_pairs_if_due(
+                save_dir=DATASET_DIR,
+                log_callback=self._log,
+            )
+            if result is not None:
+                freed_mb = result.freed_bytes / (1024 * 1024)
+                self._log(f"Normal-pair cleanup: {result.removed_pairs} pairs removed, "
+                          f"{freed_mb:.1f} MB freed")
+        except Exception as e:
+            self._log(f"Normal-pair cleanup error (recovering): {e}")
 
     # ── 단일 쌍 분석 (순수/스레드 안전, 상태 변경 없음) ──────────
     def _analyze_pair(self, pair: dict) -> Optional[dict]:
@@ -456,6 +466,7 @@ class MonitorSequencer:
                 # 주기적 오래된 데이터 정리 (1시간마다)
                 if now - cleanup_timer >= 3600:
                     self._run_cleanup()
+                    self._run_normal_removal()
                     cleanup_timer = now
 
                 # 신규 쌍 스캔

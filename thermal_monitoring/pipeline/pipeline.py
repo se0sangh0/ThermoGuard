@@ -44,18 +44,24 @@ MAX_WORKERS = os.cpu_count() or 4
 def scan_pairs() -> list[dict]:
     """
     thermal_dataset에서 JPG + NPY + Visual JPG 파일쌍을 타임스탬프 순으로 반환.
+    날짜/6시간 블록 서브디렉토리도 재귀적으로 스캔.
     """
     if not os.path.isdir(DATASET_DIR):
         print(f"[pipeline] '{DATASET_DIR}' not found")
         return []
 
-    files = os.listdir(DATASET_DIR)
-    thermal_jpgs = {f.replace(".jpg", ""): f
-                    for f in files if f.endswith(".jpg") and "_visual" not in f}
-    npys = {f.replace("_thermal.npy", ""): f
-            for f in files if f.endswith("_thermal.npy")}
-    visual_jpgs = {f.replace("_visual.jpg", ""): f
-                   for f in files if f.endswith("_visual.jpg")}
+    thermal_jpgs = {}
+    npys = {}
+    visual_jpgs = {}
+    for root, _dirs, files in os.walk(DATASET_DIR):
+        for name in files:
+            full = os.path.join(root, name)
+            if name.endswith("_thermal.npy"):
+                npys[name.replace("_thermal.npy", "")] = full
+            elif name.endswith("_visual.jpg"):
+                visual_jpgs[name.replace("_visual.jpg", "")] = full
+            elif name.endswith(".jpg") and "_overlay" not in name:
+                thermal_jpgs[name.replace(".jpg", "")] = full
 
     bases = sorted(
         set(thermal_jpgs.keys()) & set(npys.keys()) & set(visual_jpgs.keys())
@@ -65,9 +71,9 @@ def scan_pairs() -> list[dict]:
     for base in bases:
         pairs.append({
             "base": base,
-            "thermal_jpg": os.path.join(DATASET_DIR, thermal_jpgs[base]),
-            "visual_jpg": os.path.join(DATASET_DIR, visual_jpgs[base]),
-            "npy": os.path.join(DATASET_DIR, npys[base]),
+            "thermal_jpg": thermal_jpgs[base],
+            "visual_jpg": visual_jpgs[base],
+            "npy": npys[base],
         })
     return pairs
 

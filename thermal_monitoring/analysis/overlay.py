@@ -481,7 +481,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     files = os.listdir(DATASET_DIR)
-    thermal_jpgs = sorted([f for f in files if f.endswith(".jpg") and "_visual" not in f])
+    thermal_jpgs = sorted([f for f in files if f.endswith(".jpg") and "_visual" not in f and "_overlay" not in f])
 
     if not thermal_jpgs:
         print("No thermal images found")

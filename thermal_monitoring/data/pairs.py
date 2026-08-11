@@ -5,8 +5,18 @@
     {base}.jpg            → thermal
     {base}_visual.jpg     → visual (정상 모드에서만 저장; 과열 모드는 thermal-only)
     {base}_thermal.npy    → 온도 행렬 (JPEG에서 지연 추출)
+
+디렉토리 구조 (YYYY-MM-DD / 6시간 블록):
+    thermal_dataset/
+    ├── 2026-08-11/
+    │   ├── 00-06/   ← 00:00 ~ 05:59
+    │   ├── 06-12/   ← 06:00 ~ 11:59
+    │   ├── 12-18/   ← 12:00 ~ 17:59
+    │   └── 18-24/   ← 18:00 ~ 23:59
+    └── ...
 """
 
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -17,13 +27,33 @@ import numpy as np
 from ..capture.thermal_utils import extract_from_jpeg
 
 
+def capture_subdir(dataset_dir, dt: Optional[datetime] = None) -> Path:
+    """캡처 시각 기준 6시간 블록 서브디렉토리 경로를 반환.
+
+    예: thermal_dataset/2026-08-11/06-12/
+    """
+    if dt is None:
+        dt = datetime.now()
+    date_str = dt.strftime("%Y-%m-%d")
+    hour = dt.hour
+    if hour < 6:
+        block = "00-06"
+    elif hour < 12:
+        block = "06-12"
+    elif hour < 18:
+        block = "12-18"
+    else:
+        block = "18-24"
+    return Path(dataset_dir) / date_str / block
+
+
 def thermal_jpgs(dataset_dir) -> list[Path]:
-    """정렬된 thermal JPG 경로 목록 (visual·overlay 제외). 폴더 없으면 빈 목록."""
+    """정렬된 thermal JPG 경로 목록 (visual·overlay 제외). 재귀 검색. 폴더 없으면 빈 목록."""
     d = Path(dataset_dir)
     if not d.is_dir():
         return []
     return sorted(
-        p for p in d.glob("*.jpg")
+        p for p in d.rglob("*.jpg")
         if "_visual" not in p.name and "_overlay" not in p.name
     )
 

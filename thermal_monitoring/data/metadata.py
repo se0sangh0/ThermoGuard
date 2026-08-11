@@ -106,17 +106,15 @@ def run_metadata(
 
     jpgs: dict[str, str] = {}
     npys: dict[str, str] = {}
-    with os.scandir(save_dir) as entries:
-        for entry in entries:
-            if not entry.is_file():
-                continue
-            name = entry.name
+    for root, _dirs, files in os.walk(save_dir):
+        for name in files:
+            full = os.path.join(root, name)
             if name.endswith("_thermal.npy"):
-                npys[name.replace("_thermal.npy", "")] = name
+                npys[name.replace("_thermal.npy", "")] = full
             elif (name.endswith(".jpg")
                     and "_visual" not in name
                     and "_overlay" not in name):
-                jpgs[name.replace(".jpg", "")] = name
+                jpgs[name.replace(".jpg", "")] = full
     paired = sorted(set(jpgs.keys()) & set(npys.keys()))
 
     csv_path = os.path.join(save_dir, "metadata.csv")
@@ -144,8 +142,8 @@ def run_metadata(
 
         count = 0
         for base in new_ids:
-            jpg_path = os.path.join(save_dir, jpgs[base])
-            npy_path = os.path.join(save_dir, npys[base])
+            jpg_path = jpgs[base]
+            npy_path = npys[base]
             thermal = np.load(npy_path)
 
             # ROI 분석 + Threshold 판정
@@ -175,8 +173,8 @@ def run_metadata(
                 base[:14],
                 cfg.identity.camera_id,
                 cfg.identity.robot_id,
-                jpgs[base],
-                npys[base],
+                os.path.relpath(jpgs[base], save_dir),
+                os.path.relpath(npys[base], save_dir),
                 round(float(np.nanmin(roi_result.roi_thermal)), 2),
                 round(float(roi_result.max_temp), 2),                # ROI max
                 round(float(roi_result.mean_temp), 2),               # ROI mean

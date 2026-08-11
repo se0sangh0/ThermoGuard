@@ -37,7 +37,7 @@ from ..capture.capture import CaptureSession, camera_image_url
 from ..capture.gige_backend import GigeTemperatureReader
 from ..data import pairs
 from ..data.checking import run_check
-from ..data.cleanup import run_cleanup_if_due
+from ..data.cleanup import run_cleanup_if_due, remove_normal_pairs_if_due
 from ..data.metadata import run_metadata
 from ..data.pairs import capture_time_from_file, latest_analysis_pair
 from ..data.quality import assess_image_quality
@@ -1199,6 +1199,7 @@ class ProductDashboard:
             self._last_cleanup_check = now
             retention = self.cfg.monitoring.cleanup_retention_days
             self._analysis_executor.submit(self._run_cleanup, save_dir, retention)
+            self._analysis_executor.submit(self._run_normal_removal, save_dir)
 
         if now - self._last_backend_sync >= 30 and self.cfg.backend.enabled:
             self._last_backend_sync = now
@@ -1242,6 +1243,22 @@ class ProductDashboard:
                 )
         except Exception as exc:
             _file_log.warning("dashboard cleanup error: %s", exc)
+
+    @staticmethod
+    def _run_normal_removal(save_dir: str):
+        try:
+            result = remove_normal_pairs_if_due(
+                save_dir=save_dir,
+                log_callback=None,
+            )
+            if result is not None:
+                _file_log.info(
+                    "dashboard normal-pair removal: %d pairs removed, %.1f MB freed",
+                    result.removed_pairs,
+                    result.freed_bytes / (1024 * 1024),
+                )
+        except Exception as exc:
+            _file_log.warning("dashboard normal-pair removal error: %s", exc)
 
     def capture_and_refresh(self):
         """버튼 클릭 시 새 Thermal/Visual을 촬영하고 그 결과로 화면을 갱신한다."""
