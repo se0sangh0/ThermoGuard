@@ -1,4 +1,8 @@
-from fastapi import FastAPI
+import logging
+import math
+import os
+
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
@@ -12,6 +16,23 @@ app = FastAPI(
     description="Jetson AGX Orin Local Backend Server",
     version="1.0.0",
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _diagnostic_endpoints_enabled() -> bool:
+    """Keep development-only database inspection off in factory runtime."""
+
+    return os.environ.get("THERMOGUARD_DIAGNOSTIC_ENDPOINTS", "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _require_diagnostic_endpoints() -> None:
+    if not _diagnostic_endpoints_enabled():
+        # Do not advertise database topology or expose driver exceptions on a
+        # LAN-facing legacy service.  Readiness is the supported health gate.
+        raise HTTPException(status_code=404, detail="Not found")
 
 # =============================
 # POST 요청 데이터 형식 정의
@@ -44,8 +65,8 @@ class CameraCreate(BaseModel):
     ip_address: str
     model_name: str | None = None
     capture_mode: str = "both"
-    normal_interval_sec: float = 30.0
-    warning_interval_sec: float = 5.0
+    normal_interval_sec: float = Field(default=30.0, gt=0, allow_inf_nan=False)
+    warning_interval_sec: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     enabled: bool = True
 
 class ROICreate(BaseModel):
@@ -57,6 +78,27 @@ class ROICreate(BaseModel):
     y2: int
     version: int = 1
     enabled: bool = True
+
+
+def _validate_roi_definition(roi: ROICreate) -> None:
+    """Validate coordinate/version invariants before locking or writing rows."""
+
+    if roi.camera_id <= 0:
+        reason = "camera_id must be positive"
+    elif not roi.roi_name.strip():
+        reason = "roi_name must not be empty"
+    elif roi.version <= 0:
+        reason = "version must be positive"
+    elif roi.x1 < 0 or roi.y1 < 0:
+        reason = "ROI coordinates must be nonnegative"
+    elif roi.x1 >= roi.x2 or roi.y1 >= roi.y2:
+        reason = "ROI must satisfy x1 < x2 and y1 < y2"
+    else:
+        return
+    raise HTTPException(
+        status_code=422,
+        detail={"status": "invalid_roi_definition", "reason": reason},
+    )
 
 class ThresholdCreate(BaseModel):
     camera_id: int
@@ -165,6 +207,41 @@ class ThresholdUpdate(BaseModel):
     min_hotspot_size_max: int | None = None
     alarm_cooldown_sec: int | None = None
 
+
+def _validate_threshold_policy(
+    *,
+    baseline_temp: float,
+    warning_delta: float,
+    critical_delta: float,
+    min_hotspot_size: int,
+    min_hotspot_size_max: int,
+    alarm_cooldown_sec: int,
+) -> None:
+    """Reject unsafe threshold profiles before any database write.
+
+    Dashboard validation is not a database boundary: maintenance clients or a
+    future integration can call these endpoints directly.  Keep the server's
+    accepted policy identical to the dashboard's operational invariants.
+    """
+
+    numeric_values = (baseline_temp, warning_delta, critical_delta)
+    if not all(math.isfinite(float(value)) for value in numeric_values):
+        reason = "temperature values must be finite"
+    elif not 0 < float(warning_delta) < float(critical_delta):
+        reason = "thresholds must satisfy 0 < warning_delta < critical_delta"
+    elif int(min_hotspot_size) <= 0 or int(min_hotspot_size_max) <= 0:
+        reason = "hotspot sizes must be positive"
+    elif int(min_hotspot_size) > int(min_hotspot_size_max):
+        reason = "min_hotspot_size must not exceed min_hotspot_size_max"
+    elif int(alarm_cooldown_sec) < 0:
+        reason = "alarm_cooldown_sec must be nonnegative"
+    else:
+        return
+    raise HTTPException(
+        status_code=422,
+        detail={"status": "invalid_threshold_policy", "reason": reason},
+    )
+
 class AlertUpdate(BaseModel):
     event_status: str
 
@@ -194,8 +271,33 @@ def health():
         "device": "Jetson AGX Orin"
     }
 
+
+@app.get("/api/ready")
+def readiness():
+    """Return readiness only when the configured database accepts a read query.
+
+    ``/api/health`` remains a lightweight liveness endpoint so existing
+    monitoring integrations keep their current behaviour.  Deployment checks
+    that require a usable persistence layer should call this endpoint instead.
+    """
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as exc:
+        # Do not expose a database URL or driver exception to callers or
+        # ordinary service logs.  Database driver messages can contain DSNs.
+        logger.warning("Database readiness check failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not_ready", "database": "unavailable"},
+        )
+
+    return {"status": "ready", "database": "connected"}
+
+
 @app.get("/api/db-test")
 def db_test():
+    _require_diagnostic_endpoints()
     try:
         with engine.connect() as connection:
             result = connection.execute(
@@ -208,15 +310,17 @@ def db_test():
             "database_time": str(result[1])
         }
 
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+    except Exception as exc:
+        logger.warning("Database diagnostic failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not_ready", "database": "unavailable"},
+        )
 
 
 @app.get("/api/tables")
 def get_tables():
+    _require_diagnostic_endpoints()
     try:
         with engine.connect() as connection:
             result = connection.execute(
@@ -231,11 +335,12 @@ def get_tables():
             "tables": tables
         }
 
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+    except Exception as exc:
+        logger.warning("Table diagnostic failed (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not_ready", "database": "unavailable"},
+        )
 
 @app.get("/api/cameras")
 def get_cameras():
@@ -1083,17 +1188,51 @@ def create_camera(camera: CameraCreate):
                     SELECT camera_id FROM cameras
                     WHERE robot_id = :robot_id
                       AND (camera_code = :camera_code OR ip_address = :ip_address)
-                    ORDER BY camera_id LIMIT 1
+                    ORDER BY camera_id
+                    FOR UPDATE
                 """),
                 {
                     "robot_id": camera.robot_id,
                     "camera_code": camera.camera_code,
                     "ip_address": camera.ip_address,
                 },
-            ).fetchone()
-            if existing is not None:
+            ).fetchall()
+            existing_ids = {int(row[0]) for row in existing}
+            if len(existing_ids) > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "status": "camera_identity_conflict",
+                        "reason": "camera_code and ip_address match different cameras",
+                    },
+                )
+            if existing_ids:
+                camera_id = existing_ids.pop()
+                connection.execute(
+                    text("""
+                        UPDATE cameras
+                        SET camera_code = :camera_code,
+                            ip_address = :ip_address,
+                            model_name = :model_name,
+                            capture_mode = :capture_mode,
+                            normal_interval_sec = :normal_interval_sec,
+                            warning_interval_sec = :warning_interval_sec,
+                            enabled = :enabled
+                        WHERE camera_id = :camera_id
+                    """),
+                    {
+                        "camera_id": camera_id,
+                        "camera_code": camera.camera_code,
+                        "ip_address": camera.ip_address,
+                        "model_name": camera.model_name,
+                        "capture_mode": camera.capture_mode,
+                        "normal_interval_sec": camera.normal_interval_sec,
+                        "warning_interval_sec": camera.warning_interval_sec,
+                        "enabled": 1 if camera.enabled else 0,
+                    },
+                )
                 return {
-                    "status": "created", "camera_id": existing[0],
+                    "status": "created", "camera_id": camera_id,
                     "camera_code": camera.camera_code, "existing": True,
                 }
             result = connection.execute(
@@ -1139,6 +1278,8 @@ def create_camera(camera: CameraCreate):
             "camera_code": camera.camera_code
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",
@@ -1148,7 +1289,45 @@ def create_camera(camera: CameraCreate):
 @app.post("/api/rois")
 def create_roi(roi: ROICreate):
     try:
+        _validate_roi_definition(roi)
         with engine.begin() as connection:
+            # Serialize versions for one camera on the parent row.  Merely
+            # updating old ROI rows is insufficient when two requests create a
+            # previously unseen name concurrently: neither transaction would
+            # have an existing child row to lock.
+            camera = connection.execute(
+                text("""
+                    SELECT camera_id
+                    FROM cameras
+                    WHERE camera_id = :camera_id
+                    FOR UPDATE
+                """),
+                {"camera_id": roi.camera_id},
+            ).fetchone()
+            if camera is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"status": "not_found", "resource": "camera"},
+                )
+
+            if roi.enabled:
+                # A new enabled version atomically supersedes every prior
+                # enabled row for the same logical camera/name key.  Historical
+                # rows remain for audit but cannot simultaneously drive policy.
+                connection.execute(
+                    text("""
+                        UPDATE roi_definitions
+                        SET enabled = 0,
+                            updated_at = NOW(6)
+                        WHERE camera_id = :camera_id
+                          AND roi_name = :roi_name
+                          AND enabled = 1
+                    """),
+                    {
+                        "camera_id": roi.camera_id,
+                        "roi_name": roi.roi_name,
+                    },
+                )
             result = connection.execute(
                 text("""
                     INSERT INTO roi_definitions (
@@ -1191,6 +1370,8 @@ def create_roi(roi: ROICreate):
             "roi_id": roi_id
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",
@@ -1200,7 +1381,47 @@ def create_roi(roi: ROICreate):
 @app.post("/api/thresholds")
 def create_threshold(threshold: ThresholdCreate):
     try:
+        _validate_threshold_policy(
+            baseline_temp=threshold.baseline_temp,
+            warning_delta=threshold.warning_delta,
+            critical_delta=threshold.critical_delta,
+            min_hotspot_size=threshold.min_hotspot_size,
+            min_hotspot_size_max=threshold.min_hotspot_size_max,
+            alarm_cooldown_sec=threshold.alarm_cooldown_sec,
+        )
         with engine.begin() as connection:
+            if threshold.roi_id is None:
+                target = connection.execute(
+                    text("""
+                        SELECT camera_id
+                        FROM cameras
+                        WHERE camera_id = :camera_id
+                        FOR UPDATE
+                    """),
+                    {"camera_id": threshold.camera_id},
+                ).fetchone()
+            else:
+                target = connection.execute(
+                    text("""
+                        SELECT roi_id
+                        FROM roi_definitions
+                        WHERE roi_id = :roi_id
+                          AND camera_id = :camera_id
+                        FOR UPDATE
+                    """),
+                    {
+                        "camera_id": threshold.camera_id,
+                        "roi_id": threshold.roi_id,
+                    },
+                ).fetchone()
+            if target is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "status": "invalid_threshold_scope",
+                        "reason": "ROI does not belong to the selected camera",
+                    },
+                )
             result = connection.execute(
                 text("""
                     INSERT INTO threshold_profiles (
@@ -1243,6 +1464,8 @@ def create_threshold(threshold: ThresholdCreate):
             "threshold_id": threshold_id
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",
@@ -1717,21 +1940,50 @@ def update_threshold(
             "alarm_cooldown_sec"
         }
 
-        updates = []
-        params = {"threshold_id": threshold_id}
-
-        for key, value in fields.items():
-            if key in allowed:
-                updates.append(f"{key} = :{key}")
-                params[key] = value
-
-        sql = f"""
-            UPDATE threshold_profiles
-            SET {", ".join(updates)}
-            WHERE threshold_id = :threshold_id
-        """
-
         with engine.begin() as connection:
+            existing = connection.execute(
+                text("""
+                    SELECT
+                        baseline_temp,
+                        warning_delta,
+                        critical_delta,
+                        min_hotspot_size,
+                        min_hotspot_size_max,
+                        alarm_cooldown_sec
+                    FROM threshold_profiles
+                    WHERE threshold_id = :threshold_id
+                    FOR UPDATE
+                """),
+                {"threshold_id": threshold_id},
+            ).mappings().fetchone()
+            if existing is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"status": "not_found", "resource": "threshold"},
+                )
+
+            merged = dict(existing)
+            merged.update(fields)
+            _validate_threshold_policy(
+                baseline_temp=merged["baseline_temp"],
+                warning_delta=merged["warning_delta"],
+                critical_delta=merged["critical_delta"],
+                min_hotspot_size=merged["min_hotspot_size"],
+                min_hotspot_size_max=merged["min_hotspot_size_max"],
+                alarm_cooldown_sec=merged["alarm_cooldown_sec"],
+            )
+
+            updates = []
+            params = {"threshold_id": threshold_id}
+            for key, value in fields.items():
+                if key in allowed:
+                    updates.append(f"{key} = :{key}")
+                    params[key] = value
+            sql = f"""
+                UPDATE threshold_profiles
+                SET {", ".join(updates)}
+                WHERE threshold_id = :threshold_id
+            """
             result = connection.execute(
                 text(sql),
                 params
@@ -1743,6 +1995,8 @@ def update_threshold(
             "updated_rows": result.rowcount
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         return {
             "status": "error",

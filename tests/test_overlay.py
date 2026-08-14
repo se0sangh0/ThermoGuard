@@ -109,5 +109,40 @@ def test_visual_roi_overlay_hides_roi_on_resolution_mismatch(tmp_path):
     assert np.array_equal(projected, visual)
 
 
+def test_visual_roi_overlay_resolves_explicit_relative_calibration_from_config(
+    tmp_path, monkeypatch
+):
+    config_dir = tmp_path / "home" / "operator" / ".config" / "thermoguard"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    calibration = config_dir / "thermal_to_rgb.npy"
+    np.save(
+        calibration,
+        {
+            "H": np.eye(3),
+            "thermal_size": (640, 480),
+            "visual_size": (640, 480),
+        },
+    )
+    service_cwd = tmp_path / "service-cwd"
+    service_cwd.mkdir()
+    monkeypatch.chdir(service_cwd)
+    monkeypatch.setenv("THERMOGUARD_CONFIG", str(config_path))
+    visual = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    projected, warning = create_visual_roi_overlay(
+        visual,
+        [(10, 20, 100, 120)],
+        ["ROI-1"],
+        ["Normal"],
+        calibration_path="thermal_to_rgb.npy",
+        thermal_size=(640, 480),
+    )
+
+    assert warning is None
+    assert np.any(projected != visual)
+
+
 if __name__ == "__main__":
     unittest.main()

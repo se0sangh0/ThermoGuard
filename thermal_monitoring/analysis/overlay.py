@@ -14,17 +14,29 @@ import sys
 import cv2
 import numpy as np
 
-from ..config import load_config
+from ..config import load_config, resolve_runtime_path
 from ..logger import get_logger
 
 _log = get_logger("analysis.overlay")
 
-cfg = load_config()
-DATASET_DIR = cfg.paths.dataset_dir
-HOMOGRAPHY_PATH = cfg.paths.homography_path
-OVERLAY_DIR = cfg.paths.overlay_dir
-DISPLAY_W = cfg.display.roi_display_width
-DISPLAY_H = cfg.display.roi_display_height
+# Module imports happen before the dashboard's strict configuration gate.  Keep
+# import-time values inert; operational calls resolve the already-validated
+# settings only when they actually process an image.
+DATASET_DIR = "thermal_dataset"
+HOMOGRAPHY_PATH = "thermal_to_rgb.npy"
+OVERLAY_DIR = "thermal_dataset/overlay"
+DISPLAY_W = 640
+DISPLAY_H = 480
+
+
+def _runtime_paths() -> tuple[str, str, int, int]:
+    cfg = load_config()
+    return (
+        str(resolve_runtime_path(cfg.paths.homography_path)),
+        str(resolve_runtime_path(cfg.paths.overlay_dir)),
+        int(cfg.display.roi_display_width),
+        int(cfg.display.roi_display_height),
+    )
 
 # 시각화 스타일
 ROI_COLOR_NORMAL = (0, 255, 0)    # 초록
@@ -47,14 +59,15 @@ def _status_color(status: str) -> tuple:
     return ROI_COLOR_NORMAL
 
 
-def _load_homography() -> np.ndarray | None:
+def _load_homography(homography_path: str | None = None) -> np.ndarray | None:
     """Homography 행렬 로드 (구/신 포맷 호환), 없으면 None.
     
     구 포맷: np.save("thermal_to_rgb.npy", H)           → shape (3,3)
     신 포맷: np.save("thermal_to_rgb.npy", {"H": ..., ...}) → 0-d array wrapping dict
     """
-    if os.path.isfile(HOMOGRAPHY_PATH):
-        data = np.load(HOMOGRAPHY_PATH, allow_pickle=True)
+    homography_path = homography_path or _runtime_paths()[0]
+    if os.path.isfile(homography_path):
+        data = np.load(homography_path, allow_pickle=True)
         if isinstance(data, np.ndarray) and data.ndim == 0:
             data = data.item()  # unwrap 0-d array (dict case)
         if isinstance(data, dict):
@@ -64,11 +77,14 @@ def _load_homography() -> np.ndarray | None:
     return None
 
 
-def _load_calibration() -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+def _load_calibration(
+    homography_path: str | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """(H, thermal_pts, visual_pts) 반환. 대응점 없으면 (H, None, None)."""
-    if not os.path.isfile(HOMOGRAPHY_PATH):
+    homography_path = homography_path or _runtime_paths()[0]
+    if not os.path.isfile(homography_path):
         return None, None, None
-    data = np.load(HOMOGRAPHY_PATH, allow_pickle=True)
+    data = np.load(homography_path, allow_pickle=True)
     if isinstance(data, np.ndarray) and data.ndim == 0:
         data = data.item()
     if isinstance(data, dict):
@@ -86,6 +102,8 @@ def _prepare_canvas(
     visual_jpg_path: str,
     roi_bounds: tuple,
     homography: np.ndarray | None = None,
+    display_width: int = DISPLAY_W,
+    display_height: int = DISPLAY_H,
 ) -> tuple[np.ndarray, tuple, float, float]:
     """
     오버레이 대상 이미지와 ROI 박스 좌표를 준비.
@@ -113,7 +131,7 @@ def _prepare_canvas(
         if canvas is None:
             raise FileNotFoundError(f"Cannot read thermal image: {thermal_jpg_path}")
         thermal_h, thermal_w = canvas.shape[:2]
-        return canvas, roi_bounds, thermal_w / DISPLAY_W, thermal_h / DISPLAY_H
+        return canvas, roi_bounds, thermal_w / display_width, thermal_h / display_height
 
     # Homography 적용: thermal 좌표 -> visual 좌표
     vis_h, vis_w = canvas.shape[:2]
@@ -269,10 +287,11 @@ def create_overlay(
     roi_bounds_list가 제공되면 모든 ROI 박스를 그립니다.
     roi_names가 제공되면 각 박스에 이름 라벨을 표시합니다.
     """
+    homography_path, _overlay_dir, display_width, display_height = _runtime_paths()
     if homography is None:
-        homography = _load_homography()
+        homography = _load_homography(homography_path)
         if homography is not None:
-            _log.info("Homography loaded from %s", HOMOGRAPHY_PATH)
+            _log.info("Homography loaded from %s", homography_path)
     # GUI-UPDATE: Visual 파일이 없으면 Homography를 적용하지 않고 Thermal에 표시한다.
     if homography is not None and (
         not visual_jpg_path or not os.path.isfile(visual_jpg_path)
@@ -281,7 +300,12 @@ def create_overlay(
         homography = None
 
     canvas, canvas_roi, sx, sy = _prepare_canvas(
-        thermal_jpg_path, visual_jpg_path, roi_bounds, homography
+        thermal_jpg_path,
+        visual_jpg_path,
+        roi_bounds,
+        homography,
+        display_width,
+        display_height,
     )
 
     # 호모그래피 사용 시 핫스팟 좌표도 visual 좌표계로 변환
@@ -311,7 +335,7 @@ def create_visual_roi_overlay(
     roi_names: list[str] | None,
     roi_statuses: list | None,
     *,
-    calibration_path: str = HOMOGRAPHY_PATH,
+    calibration_path: str | None = None,
     thermal_size: tuple[int, int] | None = None,
 ) -> tuple[np.ndarray, str | None]:
     """Project thermal ROI polygons onto the visual image.
@@ -321,6 +345,11 @@ def create_visual_roi_overlay(
     """
     if visual_img is None or visual_img.size == 0:
         return visual_img, "가시광 이미지 없음"
+    calibration_path = str(
+        resolve_runtime_path(calibration_path)
+        if calibration_path
+        else _runtime_paths()[0]
+    )
     raw = visual_img.copy()
     if not os.path.isfile(calibration_path):
         return raw, "캘리브레이션 정보 없음"
@@ -440,9 +469,10 @@ def _draw_multi_roi_boxes(
 def save_overlay(
     base_filename: str,
     overlay_img: np.ndarray,
-    overlay_dir: str = OVERLAY_DIR,
+    overlay_dir: str | None = None,
 ) -> str:
     """오버레이 이미지를 overlay/ 디렉토리에 저장하고 경로를 반환"""
+    overlay_dir = overlay_dir or _runtime_paths()[1]
     os.makedirs(overlay_dir, exist_ok=True)
     out_path = os.path.join(overlay_dir, f"{base_filename}_overlay.jpg")
     cv2.imwrite(out_path, overlay_img)

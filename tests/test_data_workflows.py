@@ -11,6 +11,7 @@ from thermal_monitoring.analysis.overlay import create_overlay
 from thermal_monitoring.capture.capture import CaptureSession
 from thermal_monitoring.data.checking import run_check
 from thermal_monitoring.data.metadata import run_metadata
+from thermal_monitoring.data import pairs
 
 
 class DataWorkflowTests(unittest.TestCase):
@@ -69,6 +70,62 @@ class DataWorkflowTests(unittest.TestCase):
                 rows = list(csv.reader(stream))
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[1][0], base)
+
+    def test_latest_analysis_pair_orders_by_capture_timestamp_across_layouts(self):
+        """A newer nested capture must outrank a legacy JPG at dataset root."""
+        with tempfile.TemporaryDirectory() as dataset_dir:
+            root = os.path.join(dataset_dir, "20260813085603_414398.jpg")
+            nested_dir = os.path.join(dataset_dir, "2026-08-13", "12-18")
+            os.makedirs(nested_dir)
+            nested = os.path.join(nested_dir, "20260813161700_123456.jpg")
+            nested_visual = os.path.join(
+                nested_dir, "20260813161700_123456_visual.jpg"
+            )
+            for path in (root, nested, nested_visual):
+                with open(path, "wb") as stream:
+                    stream.write(b"test-jpg")
+            # The legacy root image is old enough to be outside visual grace;
+            # selection therefore depends only on capture-time ordering.
+            os.utime(root, (1, 1))
+
+            matrix = np.full((2, 2), 31.5, dtype=np.float32)
+            with patch(
+                "thermal_monitoring.data.pairs.extract_from_jpeg",
+                return_value=(matrix, {}),
+            ) as extract:
+                pair = pairs.latest_analysis_pair(dataset_dir)
+
+            self.assertEqual(pair["base"], "20260813161700_123456")
+            self.assertEqual(pair["thermal"], pairs.Path(nested))
+            self.assertTrue(pair["npy"].is_file())
+            extract.assert_called_once_with(nested)
+
+    def test_latest_complete_pair_orders_nested_and_legacy_by_capture_time(self):
+        with tempfile.TemporaryDirectory() as dataset_dir:
+            legacy = pairs.Path(dataset_dir) / "20260813085603_414398.jpg"
+            legacy_visual = legacy.with_name(f"{legacy.stem}_visual.jpg")
+            nested_dir = pairs.Path(dataset_dir) / "2026-08-13" / "12-18"
+            nested_dir.mkdir(parents=True)
+            nested = nested_dir / "20260813161700_123456.jpg"
+            nested_visual = nested.with_name(f"{nested.stem}_visual.jpg")
+            for path in (legacy, legacy_visual, nested, nested_visual):
+                path.write_bytes(b"test-jpg")
+
+            self.assertEqual(
+                pairs.latest_complete_pair(dataset_dir),
+                (nested, nested_visual),
+            )
+
+    def test_thermal_jpgs_falls_back_to_mtime_for_unknown_names(self):
+        with tempfile.TemporaryDirectory() as dataset_dir:
+            older = pairs.Path(dataset_dir) / "external-old.jpg"
+            newer = pairs.Path(dataset_dir) / "external-new.jpg"
+            older.write_bytes(b"test-jpg")
+            newer.write_bytes(b"test-jpg")
+            os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+
+            self.assertEqual(pairs.thermal_jpgs(dataset_dir), [older, newer])
 
     def test_overlay_falls_back_to_thermal_without_visual_image(self):
         with tempfile.TemporaryDirectory() as dataset_dir:

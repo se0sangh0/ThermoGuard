@@ -17,9 +17,16 @@ from ..logger import get_logger
 
 _log = get_logger("analysis.roi")
 
-# Thermal 이미지 vs .npy 해상도 차이 보정
-DISPLAY_W = load_config().display.roi_display_width
-DISPLAY_H = load_config().display.roi_display_height
+# Thermal 이미지 vs .npy 해상도 차이 보정.  Import-time config loading would
+# bypass the dashboard's strict startup gate, so use safe defaults until an
+# actual analysis asks for the validated active settings.
+DISPLAY_W = 640
+DISPLAY_H = 480
+
+
+def _display_dimensions() -> tuple[int, int]:
+    cfg = load_config()
+    return int(cfg.display.roi_display_width), int(cfg.display.roi_display_height)
 
 # 하위 호환을 위한 wrapper
 RoiConfig = AppRoiConfig
@@ -77,8 +84,9 @@ def _scale_roi_to_npy(
     .npy shape = (H, W) 이므로 (height, width) 순서에 주의.
     """
     npy_h, npy_w = npy_shape
-    scale_x = npy_w / DISPLAY_W
-    scale_y = npy_h / DISPLAY_H
+    display_w, display_h = _display_dimensions()
+    scale_x = npy_w / display_w
+    scale_y = npy_h / display_h
 
     nx1 = int(roi.x1 * scale_x)
     ny1 = int(roi.y1 * scale_y)
@@ -153,8 +161,9 @@ def extract_roi_from_npy(npy_path: str, config: Optional[RoiConfig] = None) -> R
             max_cluster = int(stats[1:, cv2.CC_STAT_AREA].max())
 
         # ROI 내부 좌표 -> thermal 이미지(640x480) 좌표로 변환
-        scale_back_x = DISPLAY_W / thermal.shape[1]
-        scale_back_y = DISPLAY_H / thermal.shape[0]
+        display_w, display_h = _display_dimensions()
+        scale_back_x = display_w / thermal.shape[1]
+        scale_back_y = display_h / thermal.shape[0]
 
         for label_id in range(1, num_labels):
             area = int(stats[label_id, cv2.CC_STAT_AREA])

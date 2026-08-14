@@ -124,3 +124,64 @@ def test_sync_threshold_profiles_surfaces_backend_error(monkeypatch):
         assert "rejected" in str(exc)
     else:
         raise AssertionError("Backend status=error must raise ThresholdApiError")
+
+
+def test_invalid_threshold_order_is_rejected_before_network(monkeypatch):
+    monkeypatch.setattr(
+        threshold_api_client.requests,
+        "request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid policy must not reach FastAPI")
+        ),
+    )
+
+    try:
+        threshold_api_client.sync_threshold_profiles(
+            base_url="http://127.0.0.1:8000",
+            timeout=5.0,
+            camera_id=7,
+            roi_ids=[12],
+            baseline_temp=35.0,
+            warning_delta=25.0,
+            critical_delta=20.0,
+            min_hotspot_size=3,
+            min_hotspot_size_max=10,
+            alarm_cooldown_sec=600.0,
+        )
+    except threshold_api_client.ThresholdApiError as exc:
+        assert "warning_delta" in str(exc)
+    else:
+        raise AssertionError("invalid threshold ordering must be rejected")
+
+
+def test_sync_threshold_profiles_creates_camera_wide_fallback_without_roi_ids(
+    monkeypatch,
+):
+    calls = []
+    responses = iter([
+        {"thresholds": []},
+        {"status": "created", "threshold_id": 41},
+    ])
+
+    def fake_request(method, url, timeout, **kwargs):
+        calls.append((method, url, kwargs.get("json")))
+        return FakeResponse(next(responses))
+
+    monkeypatch.setattr(threshold_api_client.requests, "request", fake_request)
+    result = threshold_api_client.sync_threshold_profiles(
+        base_url="http://127.0.0.1:8000",
+        timeout=5.0,
+        camera_id=7,
+        roi_ids=[],
+        baseline_temp=35.0,
+        warning_delta=15.0,
+        critical_delta=25.0,
+        min_hotspot_size=3,
+        min_hotspot_size_max=10,
+        alarm_cooldown_sec=600.0,
+    )
+
+    assert result.roi_ids == ()
+    assert result.created == 1
+    assert calls[1][2]["camera_id"] == 7
+    assert calls[1][2]["roi_id"] is None

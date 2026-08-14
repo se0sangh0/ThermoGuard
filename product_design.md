@@ -1,5 +1,11 @@
 
 ---
+# Historical product-design reference
+
+> 이 문서는 과거 `monitor.py` 중심 설계를 보존한 참고 자료입니다. 현재 운영은
+> `python dashboard.py` 한 경로만 사용하며, `monitor.py`, `pipeline.py`, 구형
+> FLIR collector는 실행 차단되어 있습니다.
+
 # 1. 프로젝트 목적
 
 본 시스템은 산업용 다관절 로봇(3축~5축)의 이상 발열을 조기에 감지하여 예방 정비(Predictive Maintenance)를 지원하는 것을 목적으로 한다.
@@ -151,7 +157,9 @@ Single Camera MVP
 ---
 # 3. 감시 시퀀스 전체 흐름
 
-`python monitor.py` 실행 시점부터 정상 복귀까지의 전체 흐름입니다.
+**과거 설계 참고:** 아래는 `python monitor.py`가 사용되던 시점의 흐름입니다.
+현재 운영에서는 이 경로를 실행하지 않고 Product Dashboard가 같은 책임을
+통합해서 수행합니다.
 
 ## 3-1. 기동 (0~2초)
 

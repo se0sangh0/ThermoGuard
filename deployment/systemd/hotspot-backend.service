@@ -1,0 +1,52 @@
+[Unit]
+Description=ThermoGuard Hotspot Guard FastAPI backend
+Documentation=file:/opt/thermoguard/current/deployment/FACTORY_RUNBOOK.ko.md
+Wants=network-online.target
+After=network-online.target mariadb.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=thermoguard-backend
+Group=thermoguard-backend
+WorkingDirectory=/opt/thermoguard/current/Project_hotspot/backend
+EnvironmentFile=/etc/thermoguard/hotspot-backend.env
+# PID 1 reads this root-only file before the process drops to thermoguard-backend.
+Environment=THERMOGUARD_BACKEND_ENV=/etc/thermoguard/hotspot-backend.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Fail before starting when the protected environment file is absent.
+ExecStartPre=+/usr/bin/test -r /etc/thermoguard/hotspot-backend.env
+# One worker is intentional: it keeps the local service lifecycle deterministic.
+ExecStart=/opt/thermoguard/venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+# Conservative hardening compatible with a local TCP database connection.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 
 from thermal_monitoring.analysis import notifier
 from thermal_monitoring.analysis.threshold import Status
@@ -299,3 +300,51 @@ def test_dispatch_passes_none_when_backend_attr_absent(monkeypatch):
 
     assert len(captured_calls) == 1
     assert captured_calls[0]["backend_url"] is None
+
+
+def test_dispatch_sends_before_backend_link_then_records_delivery_audit(monkeypatch):
+    """A delayed database POST must not delay the Critical Telegram send."""
+    dispatcher = _make_dispatcher()
+    dispatcher._dash.cfg.backend = SimpleNamespace(url="http://backend.local:8000")
+    backend_event = threading.Event()
+    result = {
+        "max_temp": 80.0,
+        "status": Status.CRITICAL,
+        "base": "cap-delayed-link",
+        "_backend_posted_event": backend_event,
+    }
+    sequence = []
+    sent_calls = []
+    audit_calls = []
+
+    def fake_send_alarm(*_args, **kwargs):
+        sequence.append("send")
+        sent_calls.append(kwargs)
+        assert not backend_event.is_set()
+        # Simulate the independently running measurement POST finishing only
+        # after the alarm sender has begun.
+        result["alert_id"] = 73
+        backend_event.set()
+        return True
+
+    def fake_save_delivery_result(*_args, **kwargs):
+        sequence.append("audit")
+        audit_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(notifier, "send_alarm", fake_send_alarm)
+    monkeypatch.setattr(notifier, "save_delivery_result", fake_save_delivery_result)
+    monkeypatch.setattr(telegram_dispatcher.threading, "Thread", _ImmediateThread)
+
+    dispatcher._dispatch(result, "capture-1")
+
+    assert sequence == ["send", "audit"]
+    assert sent_calls[0]["alert_id"] is None
+    assert audit_calls == [{
+        "alert_id": 73,
+        "success": True,
+        "http_status": None,
+        "error_message": None,
+        "retry_count": 0,
+        "backend_url": "http://backend.local:8000",
+    }]

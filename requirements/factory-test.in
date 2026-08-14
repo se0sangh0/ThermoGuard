@@ -1,0 +1,4 @@
+# Factory candidate verification dependencies.  This is for an isolated,
+# candidate virtual environment only; never install into a running service.
+-r factory-runtime.in
+pytest

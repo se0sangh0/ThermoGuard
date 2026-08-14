@@ -48,13 +48,40 @@ def capture_subdir(dataset_dir, dt: Optional[datetime] = None) -> Path:
 
 
 def thermal_jpgs(dataset_dir) -> list[Path]:
-    """정렬된 thermal JPG 경로 목록 (visual·overlay 제외). 재귀 검색. 폴더 없으면 빈 목록."""
+    """캡처 시각순 thermal JPG 목록 (visual·overlay 제외).
+
+    구형 데이터는 dataset 루트에, 새 데이터는 ``YYYY-MM-DD/HH-HH`` 아래에
+    저장된다. 전체 경로 문자열로 정렬하면 루트의 ``202608...``가 새 하위
+    경로 ``2026-08.../202608...``보다 항상 뒤로 가므로 파일명에 기록된 실제
+    캡처 시각을 우선한다.
+    """
     d = Path(dataset_dir)
     if not d.is_dir():
         return []
+
+    def capture_sort_key(path: Path):
+        for timestamp_format in ("%Y%m%d%H%M%S_%f", "%Y%m%d%H%M%S"):
+            try:
+                captured_at = datetime.strptime(path.stem, timestamp_format)
+                return captured_at, 0, str(path)
+            except ValueError:
+                continue
+        try:
+            modified_ns = path.stat().st_mtime_ns
+        except OSError:
+            modified_ns = 0
+        captured_at = (
+            datetime.fromtimestamp(modified_ns / 1_000_000_000)
+            if modified_ns else datetime.min
+        )
+        return captured_at, modified_ns, str(path)
+
     return sorted(
-        p for p in d.rglob("*.jpg")
-        if "_visual" not in p.name and "_overlay" not in p.name
+        (
+            p for p in d.rglob("*.jpg")
+            if "_visual" not in p.name and "_overlay" not in p.name
+        ),
+        key=capture_sort_key,
     )
 
 

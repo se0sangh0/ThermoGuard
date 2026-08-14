@@ -17,7 +17,7 @@ logger.py - 중앙 로깅 모듈 (Daily Rotating File Logger)
         ...
 
 설정:
-    config.json에 monitoring.log_dir로 로그 디렉토리 지정 가능 (기본: logs/)
+    THERMOGUARD_LOG_DIR 환경변수로 지정 가능 (기본: 프로젝트 루트 logs/)
 """
 
 import logging
@@ -28,6 +28,8 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
+from .config import PROJECT_ROOT
+
 _log_dir = "logs"
 _lock = threading.Lock()
 _loggers: dict[str, logging.Logger] = {}
@@ -35,12 +37,18 @@ _initialized = False
 
 
 def _get_log_dir() -> str:
-    try:
-        from .config import load_config
-        cfg_dir = load_config().monitoring.log_dir if hasattr(load_config().monitoring, 'log_dir') else ""
-        return cfg_dir or "logs"
-    except Exception:
-        return "logs"
+    """Return a stable log directory without loading or repairing config.
+
+    Logging is imported before the dashboard's strict config gate.  Calling the
+    historic ``load_config()`` here could silently create or overwrite an
+    invalid factory config before that gate had a chance to reject it.
+    """
+    configured = os.environ.get("THERMOGUARD_LOG_DIR", "").strip()
+    if configured:
+        return os.path.expanduser(os.path.expandvars(configured))
+    if getattr(sys, "frozen", False):
+        return "/var/log/thermoguard"
+    return str(PROJECT_ROOT / "logs")
 
 
 def _init_root_logger():

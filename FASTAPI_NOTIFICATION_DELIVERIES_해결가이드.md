@@ -1,3 +1,9 @@
+# Historical incident guide
+
+> 이 문서는 이전 FastAPI 서비스 경로 문제를 해결하기 위해 작성된 기록입니다.
+> 현재 ThermoGuard 운영은 `python dashboard.py`와 현 워크스페이스의
+> `hotspot-backend.service`를 사용합니다. 구형 collector를 함께 실행하지 마세요.
+
 # FastAPI `notification_deliveries` 기록 문제 해결 가이드
 
 ## 1. 문제 원인
@@ -304,4 +310,3 @@ sudo systemctl status hotspot-backend.service --no-pager -l
 - [ ] `notification_deliveries` 테이블에 테스트 행이 생성된다.
 - [ ] Critical 알람 시 텔레그램이 도착한다.
 - [ ] 같은 `alert_id`의 Telegram 전송 결과가 DB에 기록된다.
-

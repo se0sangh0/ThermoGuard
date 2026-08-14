@@ -1,5 +1,8 @@
 """
-pipeline.py - 통합 분석 파이프라인
+Retired batch-analysis implementation.
+
+운영 데이터셋을 이 경로로 재처리하면 상태 머신과 알림이 대시보드와 분리된다.
+따라서 ``run_pipeline()`` 및 모듈 실행은 의도적으로 차단된다.
 
 thermal_dataset의 모든 파일쌍을 순회하며:
   1. roi.py 로 ROI 온도 통계 추출
@@ -7,7 +10,7 @@ thermal_dataset의 모든 파일쌍을 순회하며:
   3. overlay.py 로 오버레이 이미지 생성
   4. notifier.py 로 Telegram 알림 전송 (상태 변화 시)
 
-사용법:
+과거 실행 명령(현재 차단됨):
     python pipeline.py
 """
 
@@ -19,7 +22,6 @@ from threading import Lock
 
 import numpy as np
 
-from ..config import load_config
 from ..analysis.roi import (
     load_roi_config,
     extract_all_rois_from_npy,
@@ -34,10 +36,14 @@ from ..analysis.threshold import (
 )
 from ..analysis.overlay import create_overlay, save_overlay
 from ..analysis.notifier import send_alarm as send_telegram
+from ..operational_mode import exit_legacy_operation, reject_legacy_operation
 
-_cfg = load_config()
-DATASET_DIR = _cfg.paths.dataset_dir
-OVERLAY_DIR = _cfg.paths.overlay_dir
+# This archived module must remain import-inert.  Loading configuration here
+# used to create a default config before the retired entrypoint displayed its
+# safe exit message.  These values are documentation-only because every public
+# execution path is rejected by ``reject_legacy_operation`` first.
+DATASET_DIR = "thermal_dataset"
+OVERLAY_DIR = "thermal_dataset/overlay"
 MAX_WORKERS = os.cpu_count() or 4
 
 
@@ -161,6 +167,7 @@ def _process_single_pair(
 
 def run_pipeline():
     """전체 파이프라인 실행 (병렬 처리)"""
+    reject_legacy_operation("run_pipeline()")
     from .._encoding import setup_encoding
     setup_encoding()
 
@@ -227,7 +234,7 @@ def run_pipeline():
 
 
 def main():
-    run_pipeline()
+    exit_legacy_operation("python -m thermal_monitoring.pipeline.pipeline")
 
 
 if __name__ == "__main__":

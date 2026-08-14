@@ -1,5 +1,9 @@
 """
-monitor.py - 실시간 열화상 감시 시퀀서 (Real-time Thermal Monitoring Sequencer)
+Retired CLI monitoring implementation.
+
+이 모듈은 과거 구현을 확인하기 위해 남아 있다. 운영 수집·분석은 Product
+Dashboard만 수행하며, ``MonitorSequencer.start()``와 모듈 실행은 의도적으로
+차단된다.
 
 캡처는 백그라운드 스레드에서 논스톱으로 돌아가고, 메인 루프에서는:
   1. 데이터 무결성 검사 (누락 NPY 복구, 고아 NPY 제거)
@@ -12,7 +16,7 @@ monitor.py - 실시간 열화상 감시 시퀀서 (Real-time Thermal Monitoring 
 
 모든 단계에서 예외가 발생해도 로그만 남기고 시퀀스는 계속 동작합니다.
 
-사용법:
+과거 실행 명령(현재 차단됨):
     python monitor.py
 """
 
@@ -25,7 +29,6 @@ from typing import Optional
 
 import numpy as np
 
-from ..config import load_config
 from ..capture.capture import CaptureSession
 from ..data.checking import run_check
 from ..data.metadata import run_metadata
@@ -47,21 +50,26 @@ from ..analysis.threshold import (
 from ..analysis.overlay import create_overlay, save_overlay
 from ..analysis.notifier import send_alarm
 from ..logger import get_logger
+from ..operational_mode import exit_legacy_operation, reject_legacy_operation
 
-_cfg = load_config()
-DATASET_DIR = _cfg.paths.dataset_dir
-OVERLAY_DIR = _cfg.paths.overlay_dir
+# This retained source is never an operational path.  Keep imports inert so
+# ``python -m thermal_monitoring.pipeline.monitor`` cannot create or migrate a
+# config before it exits with the dashboard-only policy message.
+DATASET_DIR = "thermal_dataset"
+OVERLAY_DIR = "thermal_dataset/overlay"
 MAX_PARALLEL_PAIRS = max(2, (os.cpu_count() or 4) // 2)
 _log_monitor = get_logger("pipeline.monitor")
 
 # 처리 루프가 새 파일을 확인하는 주기 (초)
-PROCESS_INTERVAL = _cfg.monitoring.process_interval_sec
+PROCESS_INTERVAL = 10.0
 # 무결성 검사 주기 (초)
-INTEGRITY_INTERVAL = _cfg.monitoring.integrity_interval_sec
+INTEGRITY_INTERVAL = 60.0
 # 메타데이터 업데이트 주기 (초)
-METADATA_INTERVAL = _cfg.monitoring.metadata_interval_sec
+METADATA_INTERVAL = 120.0
 # 처리 완료된 파일 캐시 최대 개수 (메모리 관리)
-MAX_PROCESSED_CACHE = _cfg.monitoring.max_processed_cache
+MAX_PROCESSED_CACHE = 10_000
+WARNING_INTERVAL = 5.0
+CAPTURE_INTERVAL = 30.0
 
 # 전송 실패한 CRITICAL 알람의 재시도 최소 간격 (초). CRITICAL이 지속되는 동안
 # 성공할 때까지 재시도하되, 네트워크 장애 시 과도한 요청을 막기 위한 백오프.
@@ -324,12 +332,12 @@ class MonitorSequencer:
                 if self.capture:
                     self.capture.set_warning_mode(True)
                 _log_monitor.info("Capture interval switched to warning mode (%.1fs) — status: %s",
-                                  _cfg.camera.warning_interval_sec, new_status.value)
+                                  WARNING_INTERVAL, new_status.value)
             elif prev_status != Status.NORMAL and new_status == Status.NORMAL:
                 if self.capture:
                     self.capture.set_warning_mode(False)
                 _log_monitor.info("Capture interval restored to normal (%.1fs) — status: Normal",
-                                  _cfg.camera.capture_interval_sec)
+                                  CAPTURE_INTERVAL)
 
             self._status_counts[new_status.value] += 1
 
@@ -507,6 +515,7 @@ class MonitorSequencer:
     # ── 공개 API ─────────────────────────────────────────────
     def start(self):
         """캡처 시작 + 감시 루프 진입"""
+        reject_legacy_operation("MonitorSequencer.start()")
         if self._running:
             _log_monitor.warning("start() called but already running")
             self._log("Already running.")
@@ -587,17 +596,7 @@ class MonitorSequencer:
 
 # ── 진입점 ──────────────────────────────────────────────────
 def main():
-    from .._encoding import setup_encoding
-    setup_encoding()
-
-    cfg = load_config()
-
-    monitor = MonitorSequencer(
-        cam_ip=os.environ.get("CAM_IP", cfg.camera.ip),
-        capture_interval=float(os.environ.get("CAPTURE_INTERVAL", str(cfg.camera.capture_interval_sec))),
-    )
-
-    monitor.start()
+    exit_legacy_operation("python -m thermal_monitoring.pipeline.monitor")
 
 
 if __name__ == "__main__":

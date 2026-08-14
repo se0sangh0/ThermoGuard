@@ -2,17 +2,18 @@
 cleanup.py - 불필요 데이터셋 정리 모듈
 
 오래된 JPG/NPY 파일쌍, 고아 오버레이 이미지, 실패 복구 흔적을 삭제합니다.
-monitor.py 실시간 감시나 tools.py GUI에서 백그라운드로 동작합니다.
+공장 대시보드의 자동 타이머에서는 호출하지 않습니다. 백업 확인과 명시적인
+dataset marker 생성 뒤 승인된 유지보수 절차에서만 사용합니다.
 
 사용법 (import):
     from cleanup import run_cleanup, CleanupResult
     result = run_cleanup(retention_days=7, log_callback=print)
 
-    # 백그라운드 모드 (monitor.py / tools.py):
+    # 승인된 유지보수에서 주기 판단이 필요한 경우:
     from cleanup import run_cleanup_if_due
     run_cleanup_if_due(save_dir=..., retention_days=7)
 
-    # 12시간 Normal 쌍 제거 프로브 (monitor.py 전용):
+    # 승인된 유지보수에서 Normal 쌍 제거가 필요한 경우:
     from cleanup import remove_normal_pairs_if_due
     remove_normal_pairs_if_due(save_dir=...)
 
@@ -23,7 +24,8 @@ monitor.py 실시간 감시나 tools.py GUI에서 백그라운드로 동작합�
 import csv
 import os
 import time
-import glob
+import stat
+import tempfile
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 
@@ -33,6 +35,114 @@ _logger = get_logger("data.cleanup")
 
 _RELATIVE_SAVE_DIR = "thermal_dataset"
 _DEFAULT_RETENTION_DAYS = 2
+_DATASET_MARKER = ".thermoguard-dataset"
+_REPOSITORY_ROOT = os.path.realpath(
+    os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
+)
+_HOME_DIRECTORY = os.path.realpath(os.path.expanduser("~"))
+
+
+class DatasetSafetyError(ValueError):
+    """Raised when a directory is not safe to mark as a ThermoGuard dataset."""
+
+
+def _resolve_dataset_path(path: str | os.PathLike[str]) -> str:
+    """Resolve a user-supplied dataset path without following it during scans."""
+    try:
+        raw_path = os.fspath(path)
+        if not isinstance(raw_path, str):
+            raise TypeError("dataset path must be text")
+        if not raw_path:
+            raise ValueError("empty dataset path")
+        return os.path.realpath(os.path.abspath(os.path.expanduser(raw_path)))
+    except (TypeError, ValueError) as exc:
+        raise DatasetSafetyError("dataset path must be a non-empty filesystem path") from exc
+
+
+def _unsafe_dataset_reason(path: str) -> str | None:
+    """Return the reason ``path`` must never be used as a cleanup target."""
+    if path == os.path.sep:
+        return "filesystem root is never a valid dataset directory"
+    if path == _HOME_DIRECTORY:
+        return "the current user's home directory is never a valid dataset directory"
+    if path == _REPOSITORY_ROOT:
+        return "the ThermoGuard repository root is never a valid dataset directory"
+    if os.path.ismount(path):
+        return "a filesystem mount root is never a valid dataset directory"
+    if not os.path.isdir(path):
+        return "target directory does not exist"
+    return None
+
+
+def _marker_reason(path: str) -> str | None:
+    """Return a refusal reason unless ``path`` has a regular dataset marker file."""
+    marker_path = os.path.join(path, _DATASET_MARKER)
+    try:
+        marker_stat = os.lstat(marker_path)
+    except FileNotFoundError:
+        return f"missing explicit dataset marker '{_DATASET_MARKER}'"
+    except OSError as exc:
+        return f"cannot verify dataset marker '{_DATASET_MARKER}': {exc}"
+
+    if not stat.S_ISREG(marker_stat.st_mode):
+        return f"dataset marker '{_DATASET_MARKER}' must be a regular file"
+    return None
+
+
+def _approved_dataset_dir(save_dir: str | os.PathLike[str]) -> tuple[str | None, str | None]:
+    """Resolve and validate a directory before any destructive dataset operation."""
+    try:
+        resolved = _resolve_dataset_path(save_dir)
+    except DatasetSafetyError as exc:
+        return None, str(exc)
+
+    reason = _unsafe_dataset_reason(resolved)
+    if reason:
+        return None, reason
+    reason = _marker_reason(resolved)
+    if reason:
+        return None, reason
+    return resolved, None
+
+
+def initialize_dataset_marker(path: str | os.PathLike[str]) -> str:
+    """Explicitly mark an existing safe directory as eligible for dataset cleanup.
+
+    This helper is deliberately never called by normal capture or cleanup flows.
+    An operator must run it for the intended dataset directory before destructive
+    retention jobs are allowed to remove files.
+    """
+    resolved = _resolve_dataset_path(path)
+    reason = _unsafe_dataset_reason(resolved)
+    if reason:
+        raise DatasetSafetyError(f"Refused to mark '{resolved}': {reason}")
+
+    marker_path = os.path.join(resolved, _DATASET_MARKER)
+    marker_reason = _marker_reason(resolved)
+    if marker_reason is None:
+        return marker_path
+    if not marker_reason.startswith("missing explicit dataset marker"):
+        raise DatasetSafetyError(f"Refused to mark '{resolved}': {marker_reason}")
+
+    fd, temporary_marker = tempfile.mkstemp(
+        prefix=f".{_DATASET_MARKER}.",
+        dir=resolved,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write("ThermoGuard dataset cleanup marker\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        # os.replace makes the completed marker visible atomically.
+        os.replace(temporary_marker, marker_path)
+    except Exception:
+        try:
+            os.unlink(temporary_marker)
+        except FileNotFoundError:
+            pass
+        raise
+    return marker_path
 
 
 @dataclass
@@ -45,6 +155,7 @@ class CleanupResult:
     freed_bytes: int = 0            # 확보된 디스크 공간
     errors: list[str] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+    refused: bool = False           # 안전 대상 검증 실패로 작업 자체를 거부했는지
 
 
 def _log(msg: str, log_callback=None, messages: list[str] | None = None):
@@ -54,6 +165,26 @@ def _log(msg: str, log_callback=None, messages: list[str] | None = None):
         print(msg)
     if messages is not None:
         messages.append(msg)
+
+
+def _refuse_cleanup(
+    result: CleanupResult,
+    operation: str,
+    save_dir: str | os.PathLike[str],
+    reason: str,
+    log_callback=None,
+) -> CleanupResult:
+    """Report a refusal before a cleanup operation can scan or remove files."""
+    message = (
+        f"[cleanup] REFUSED {operation} for '{save_dir}': {reason}. "
+        f"Initialize the intended dataset explicitly with "
+        f"initialize_dataset_marker(path) before enabling destructive cleanup."
+    )
+    result.refused = True
+    result.errors.append(message)
+    _logger.error("%s", message)
+    _log(message, log_callback, result.messages)
+    return result
 
 
 def _parse_timestamp_from_filename(filename: str) -> datetime | None:
@@ -149,6 +280,11 @@ def run_cleanup(
             save_dir = load_config().paths.dataset_dir
         except Exception:
             save_dir = _RELATIVE_SAVE_DIR
+
+    approved_save_dir, refusal_reason = _approved_dataset_dir(save_dir)
+    if refusal_reason:
+        return _refuse_cleanup(result, "retention cleanup", save_dir, refusal_reason, log_callback)
+    save_dir = approved_save_dir
 
     if not os.path.isdir(save_dir):
         _logger.info("Skip cleanup: '%s' not found", save_dir)
@@ -288,6 +424,11 @@ def run_remove_normal_pairs(
         except Exception:
             save_dir = _RELATIVE_SAVE_DIR
 
+    approved_save_dir, refusal_reason = _approved_dataset_dir(save_dir)
+    if refusal_reason:
+        return _refuse_cleanup(result, "Normal-pair cleanup", save_dir, refusal_reason, log_callback)
+    save_dir = approved_save_dir
+
     if not os.path.isdir(save_dir):
         _logger.info("Skip normal-pair removal: '%s' not found", save_dir)
         return result
@@ -345,8 +486,10 @@ def remove_normal_pairs_if_due(
     now = time.time()
     if (now - _last_normal_removal_time) < _NORMAL_REMOVAL_INTERVAL_SEC:
         return None
-    _last_normal_removal_time = now
-    return run_remove_normal_pairs(save_dir=save_dir, log_callback=log_callback)
+    result = run_remove_normal_pairs(save_dir=save_dir, log_callback=log_callback)
+    if not result.refused:
+        _last_normal_removal_time = now
+    return result
 
 
 # ════════════════════════════════════════════════════════════
@@ -394,5 +537,7 @@ def run_cleanup_if_due(
     now = time.time()
     if (now - _last_cleanup_time) < _CLEANUP_INTERVAL_SEC:
         return None
-    _last_cleanup_time = now
-    return run_cleanup(save_dir=save_dir, retention_days=retention_days, log_callback=log_callback)
+    result = run_cleanup(save_dir=save_dir, retention_days=retention_days, log_callback=log_callback)
+    if not result.refused:
+        _last_cleanup_time = now
+    return result

@@ -29,7 +29,9 @@ def _get_default_exiftool() -> str:
         return bundled
     return "exiftool"
 
-EXIFTOOL = _get_default_exiftool()
+# Compatibility constant only.  Actual extraction resolves the configured
+# executable lazily, after dashboard strict configuration has succeeded.
+EXIFTOOL = "exiftool"
 
 ABSOLUTE_ZERO = 273.15
 

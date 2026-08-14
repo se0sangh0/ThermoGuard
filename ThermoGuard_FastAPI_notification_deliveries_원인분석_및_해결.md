@@ -1,3 +1,10 @@
+# Historical incident report
+
+> 이 문서는 2026-07-30의 구버전 서비스 경로 문제를 기록한 자료입니다. 현재
+> 운영 경로는 `python dashboard.py`와 현 워크스페이스의 `hotspot-backend.service`
+> 조합입니다. 아래의 구형 collector 또는 이전 작업 경로 지침을 운영 절차로
+> 사용하지 마세요.
+
 # ThermoGuard FastAPI `notification_deliveries` 원인 분석 및 해결
 
 작성 기준일: 2026-07-30

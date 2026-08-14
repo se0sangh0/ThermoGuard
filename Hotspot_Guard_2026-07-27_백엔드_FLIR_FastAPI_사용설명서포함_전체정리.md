@@ -1,3 +1,10 @@
+# Historical deployment reference
+
+> 이 문서는 구형 Aravis collector와 과거 배포 절차를 보존한 자료입니다. 현재
+> ThermoGuard의 카메라 수집·분석·알림은 `python dashboard.py`만 사용합니다.
+> `hotspot-flir-collector.service`를 활성화하거나 이 문서의 collector 명령을
+> 실행하지 마세요. FastAPI 백엔드 서비스만 대시보드 지원용으로 유지합니다.
+
 # Hotspot_Guard 시스템 사용 설명서
 
 > 이 문서는 현재 구축된 **Jetson AGX Orin + FLIR A50 + FastAPI + MariaDB 기반 Hotspot_Guard 시스템을 실제로 어떻게 실행하고 확인하는지**를 처음 사용하는 사람도 따라 할 수 있도록 정리한 사용 설명서이다.  

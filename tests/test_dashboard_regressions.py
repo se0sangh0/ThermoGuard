@@ -1,4 +1,5 @@
 import threading
+import queue
 from types import SimpleNamespace
 
 import numpy as np
@@ -6,7 +7,11 @@ import numpy as np
 from thermal_monitoring import config
 from thermal_monitoring.analysis import roi
 from thermal_monitoring.analysis.threshold import Status
-from thermal_monitoring.tools import product_dashboard, threshold_api_client
+from thermal_monitoring.tools import (
+    asset_api_client,
+    product_dashboard,
+    threshold_api_client,
+)
 from thermal_monitoring.tools.product_dashboard import ProductDashboard, SettingsDialog
 from thermal_monitoring.tools.telegram_dispatcher import TelegramDispatcher
 
@@ -53,6 +58,190 @@ def test_dashboard_selects_newest_thermal_during_warning_mode(monkeypatch):
 
     assert pair == {"base": "latest"}
     assert calls == [("/dataset", {"visual_mode": False})]
+
+
+def test_worker_ui_post_uses_queue_not_tk_from_worker_thread():
+    dashboard = ProductDashboard.__new__(ProductDashboard)
+    scheduled = []
+    dashboard.lifecycle = "running"
+    dashboard._ui_queue = queue.Queue()
+    dashboard._ui_dispatch_timer = None
+    dashboard.root = SimpleNamespace(after=lambda delay, callback: scheduled.append((delay, callback)) or "timer")
+    applied = []
+
+    thread = threading.Thread(
+        target=lambda: dashboard._post_to_ui(lambda: applied.append("applied")),
+    )
+    thread.start()
+    thread.join(timeout=1)
+
+    assert scheduled == []
+    dashboard._drain_ui_queue()
+    assert applied == ["applied"]
+    assert scheduled and scheduled[-1][0] == 50
+
+
+def test_worker_ui_post_is_ignored_after_shutdown():
+    dashboard = ProductDashboard.__new__(ProductDashboard)
+    dashboard.lifecycle = "closed"
+    dashboard._ui_queue = queue.Queue()
+
+    assert dashboard._post_to_ui(lambda: None) is False
+    assert dashboard._ui_queue.empty()
+
+
+def test_dashboard_has_no_automatic_destructive_maintenance_entrypoints():
+    """Retention deletion and broad dataset repair stay outside the GUI."""
+    assert not hasattr(ProductDashboard, "_run_integrity")
+    assert not hasattr(ProductDashboard, "_run_cleanup")
+    assert not hasattr(ProductDashboard, "_run_normal_removal")
+
+
+def test_dashboard_queues_metadata_after_a_new_analysis(monkeypatch):
+    dashboard = ProductDashboard.__new__(ProductDashboard)
+    submitted = []
+    dashboard._maintenance_executor = SimpleNamespace(
+        submit=lambda function, *args: submitted.append((function, args))
+    )
+    dashboard.cfg = SimpleNamespace(paths=SimpleNamespace(dataset_dir="/dataset"))
+
+    dashboard._queue_metadata_update()
+
+    assert submitted == [(dashboard._run_metadata_update, ("/dataset",))]
+
+
+def test_collection_dashboard_does_not_require_backend_commissioning(monkeypatch):
+
+    dashboard = ProductDashboard.__new__(ProductDashboard)
+    dashboard.lifecycle = "running"
+    dashboard.monitoring = False
+    dashboard.capture_paused_by_user = False
+    dashboard._commissioning_block_announced = False
+    dashboard.cfg = SimpleNamespace(
+        backend=SimpleNamespace(enabled=False),
+        identity=SimpleNamespace(db_camera_id=None),
+    )
+    starts = []
+    dashboard._stopping_capture = None
+    dashboard._restart_after_capture_stop = False
+    dashboard._cancel_connection_retry = lambda: None
+    dashboard._start_capture_session = lambda: starts.append("started")
+    monkeypatch.setattr(product_dashboard, "factory_mode_enabled", lambda: True)
+
+    dashboard.start_monitoring()
+
+    assert dashboard.capture_paused_by_user is False
+    assert starts == ["started"]
+
+
+def test_dashboard_does_not_probe_camera_outside_running_capture(monkeypatch):
+    dashboard = ProductDashboard.__new__(ProductDashboard)
+    dashboard.lifecycle = "running"
+    dashboard.capture = SimpleNamespace(running=True)
+    dashboard._connection_check_running = False
+    dashboard._resume_after_connection_check = False
+    dashboard.metrics = SimpleNamespace(connection_attempts=0)
+    monkeypatch.setattr(
+        product_dashboard.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("running CaptureSession must own camera HTTP")
+        ),
+    )
+
+    dashboard._check_connection_async()
+
+    assert dashboard._connection_check_running is False
+    assert dashboard.metrics.connection_attempts == 0
+
+
+def test_capture_error_log_does_not_start_independent_connection_probe():
+    dashboard = ProductDashboard.__new__(ProductDashboard)
+    dashboard.lifecycle = "running"
+    dashboard.metrics = SimpleNamespace(
+        capture_attempts=0,
+        capture_successes=0,
+        exception_count=0,
+    )
+    dashboard._add_operating_log = lambda *_args: None
+    dashboard._record_api_message = lambda *_args: None
+    dashboard._update_connection_stability_display = lambda: None
+    dashboard._update_metric_text = lambda: None
+    dashboard._check_connection_async = lambda: (_ for _ in ()).throw(
+        AssertionError("capture error must not create a second camera request")
+    )
+
+    dashboard._handle_capture_log("[thermal] HTTP 503")
+
+    assert dashboard.metrics.capture_attempts == 1
+    assert dashboard.metrics.exception_count == 1
+
+
+def test_invalid_pair_is_not_persisted_as_a_backend_alarm(monkeypatch):
+    """Invalid imagery cannot create a DB-only Critical event."""
+    dashboard = ProductDashboard.__new__(ProductDashboard)
+    dashboard.lifecycle = "running"
+    dashboard._analysis_generation = 1
+    dashboard.latest_status = Status.NORMAL
+    dashboard.latest_alarm_status = Status.NORMAL
+    dashboard.state = SimpleNamespace(status=Status.NORMAL)
+    dashboard._last_quality_capture_id = None
+    dashboard._last_alert_capture = None
+    dashboard._latest_pair_fresh = False
+    dashboard._latest_pair_quality_ok = False
+    dashboard.capture = None
+    dashboard.cfg = SimpleNamespace(
+        camera=SimpleNamespace(capture_interval_sec=30),
+        backend=SimpleNamespace(enabled=True),
+    )
+    dashboard.metrics = SimpleNamespace(
+        anomaly_today=0,
+        analysis_ok=0,
+        image_quality_checks=0,
+        image_quality_successes=0,
+    )
+    dashboard._image_quality_window = []
+    metadata_updates = []
+    dashboard._queue_metadata_update = lambda: metadata_updates.append(True)
+    dashboard._add_operating_log = lambda *_args: None
+    dashboard._update_values_with_result = lambda *_args: None
+    dashboard._finish_analysis = lambda *_args: None
+    dashboard._draw_status_gauge = lambda: None
+    dashboard._draw_temperature_trend = lambda: None
+    dashboard._show_image = lambda *_args: None
+    dashboard._render_alert_cards = lambda: None
+    dashboard.visual_photo = None
+    dashboard.thermal_photo = None
+    dashboard.visual_label = object()
+    dashboard.thermal_label = object()
+    dashboard.telegram = SimpleNamespace(
+        post_measurement=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("invalid pair must not be posted")
+        ),
+        maybe_dispatch=lambda *_args: None,
+    )
+
+    result = {
+        "base": "invalid-capture",
+        "status": Status.CRITICAL,
+        "alarm_status": Status.CRITICAL,
+        "alarm": True,
+        "max_temp": 80.0,
+        "mean_temp": 70.0,
+        "overall_max_temp": 80.0,
+        "overall_max_roi_name": "ROI-1",
+        "captured_at": product_dashboard.datetime.now(),
+        "image_quality_ok": False,
+        "image_quality_reason": "visual missing",
+        "visual_img": None,
+        "overlay": None,
+    }
+
+    dashboard._apply_analysis_result(result, 1)
+
+    # Radiometric capture inventory is independent of visual quality, while
+    # the mocked post_measurement above proves no invalid DB measurement runs.
+    assert metadata_updates == [True]
 
 
 def test_dashboard_keeps_visual_grace_in_normal_both_mode(monkeypatch):
@@ -316,7 +505,7 @@ def test_threshold_sync_updates_saved_roi_profiles(monkeypatch):
     assert operating_logs[-1][1] == "저장 완료"
 
 
-def test_threshold_sync_waits_until_roi_has_database_id(monkeypatch):
+def test_threshold_sync_uses_camera_wide_profile_until_roi_has_database_id(monkeypatch):
     settings = SettingsDialog.__new__(SettingsDialog)
     operating_logs = []
     settings.d = SimpleNamespace(
@@ -342,19 +531,296 @@ def test_threshold_sync_waits_until_roi_has_database_id(monkeypatch):
         lifecycle="running",
         _add_operating_log=lambda *args: operating_logs.append(args),
     )
+    calls = []
     monkeypatch.setattr(
         threshold_api_client,
         "sync_threshold_profiles",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("ROI DB ID가 없으면 threshold API를 호출하면 안 됩니다.")
+        lambda **kwargs: calls.append(kwargs)
+        or threshold_api_client.ThresholdSyncResult(
+            camera_id=7,
+            roi_ids=(),
+            created=1,
+            updated=0,
         ),
     )
 
     result = settings._sync_thresholds_to_backend()
 
     assert result.roi_ids == ()
-    assert result.created == 0
-    assert operating_logs[-1][1] == "보류"
+    assert result.created == 1
+    assert calls[0]["roi_ids"] == []
+    assert operating_logs[-1][1] == "저장 완료"
+
+
+def _settings_save_dialog(tmp_path, cfg):
+    """Build a Tk-free SettingsDialog fixture for save transaction tests."""
+
+    dialog = SettingsDialog.__new__(SettingsDialog)
+    dialog.d = SimpleNamespace(
+        cfg=cfg,
+        capture=None,
+        monitoring=False,
+        _stopping_capture=None,
+        _gige_reader=None,
+        _stopping_gige_reader=None,
+        capture_paused_by_user=False,
+        _commissioning_block_announced=True,
+        _add_operating_log=lambda *_args: None,
+        _stop_gige_probe=lambda: None,
+        _wait_for_capture_stop=lambda *_args, **_kwargs: None,
+        apply_saved_settings_immediately=lambda: None,
+    )
+    dialog.win = object()
+    dialog.ip = SimpleNamespace(get=lambda: "127.0.0.1")
+    dialog.dataset_dir = SimpleNamespace(get=lambda: str(tmp_path / "dataset"))
+    dialog.baseline = SimpleNamespace(get=lambda: "35")
+    dialog.warning = SimpleNamespace(get=lambda: "15")
+    dialog.critical = SimpleNamespace(get=lambda: "25")
+    dialog.close = lambda: None
+    return dialog
+
+
+def test_settings_bootstrap_requires_explicit_confirmation_and_persists_ids(
+    tmp_path, monkeypatch
+):
+    cfg = config.AppConfig()
+    cfg.backend.enabled = False
+    cfg.identity.db_camera_id = None
+    dialog = _settings_save_dialog(tmp_path, cfg)
+    saved = []
+    confirmations = []
+    sequence = []
+    monkeypatch.setattr(product_dashboard, "factory_mode_enabled", lambda: True)
+    monkeypatch.setattr(
+        product_dashboard.messagebox,
+        "askyesno",
+        lambda *_args, **_kwargs: confirmations.append(True) or True,
+    )
+    monkeypatch.setattr(product_dashboard.messagebox, "showerror", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        asset_api_client,
+        "register_asset_hierarchy",
+        lambda **kwargs: (
+            sequence.append("register")
+            or asset_api_client.AssetRegistration(1, 2, 3, 4)
+        ),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_sync_thresholds_to_backend",
+        lambda **kwargs: sequence.append("threshold"),
+    )
+    monkeypatch.setattr(
+        product_dashboard,
+        "save_collection_config",
+        lambda candidate: sequence.append("save") or saved.append(candidate),
+    )
+
+    dialog.save()
+
+    assert confirmations == [True]
+    assert sequence == ["register", "threshold", "save"]
+    assert saved and saved[0].backend.enabled is True
+    assert saved[0].identity.db_camera_id == 4
+    assert dialog.d.cfg.backend.enabled is True
+    assert dialog.d.capture_paused_by_user is False
+    assert dialog.d._commissioning_block_announced is False
+
+
+def test_factory_settings_save_requires_quiescent_capture_before_db_changes(
+    tmp_path, monkeypatch
+):
+    cfg = config.AppConfig()
+    dialog = _settings_save_dialog(tmp_path, cfg)
+    dialog.d.monitoring = True
+    dialog.d.capture = object()
+    errors = []
+    monkeypatch.setattr(product_dashboard, "factory_mode_enabled", lambda: True)
+    monkeypatch.setattr(
+        product_dashboard.messagebox,
+        "showerror",
+        lambda *args, **_kwargs: errors.append(args),
+    )
+    monkeypatch.setattr(
+        asset_api_client,
+        "register_asset_hierarchy",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("capture must stop before backend registration")
+        ),
+    )
+    monkeypatch.setattr(
+        product_dashboard,
+        "save_collection_config",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("capture must stop before local persistence")
+        ),
+    )
+
+    dialog.save()
+
+    assert errors and errors[-1][0] == "촬영 정지 필요"
+    assert dialog.d.cfg is cfg
+
+
+def test_factory_settings_save_waits_for_pending_gige_cleanup(tmp_path, monkeypatch):
+    cfg = config.AppConfig()
+    dialog = _settings_save_dialog(tmp_path, cfg)
+    dialog.d._stopping_gige_reader = object()
+    errors = []
+    monkeypatch.setattr(product_dashboard, "factory_mode_enabled", lambda: True)
+    monkeypatch.setattr(
+        product_dashboard.messagebox,
+        "showerror",
+        lambda *args, **_kwargs: errors.append(args),
+    )
+    monkeypatch.setattr(
+        product_dashboard,
+        "save_collection_config",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("pending GigE cleanup must block settings save")
+        ),
+    )
+
+    dialog.save()
+
+    assert errors and errors[-1][0] == "촬영 정지 필요"
+    assert dialog.d.cfg is cfg
+
+
+def test_factory_roi_change_requires_quiescent_capture(tmp_path, monkeypatch):
+    cfg = config.AppConfig()
+    dialog = _settings_save_dialog(tmp_path, cfg)
+    dialog.d.monitoring = True
+    errors = []
+    monkeypatch.setattr(product_dashboard, "factory_mode_enabled", lambda: True)
+    monkeypatch.setattr(
+        product_dashboard.messagebox,
+        "showerror",
+        lambda *args, **_kwargs: errors.append(args),
+    )
+
+    dialog.open_roi_editor()
+
+    assert errors and errors[-1][0] == "촬영 정지 필요"
+
+
+def test_settings_threshold_failure_keeps_prior_runtime_config(tmp_path, monkeypatch):
+    cfg = config.AppConfig()
+    cfg.backend.enabled = True
+    cfg.identity.factory_id = 1
+    cfg.identity.line_id = 2
+    cfg.identity.db_robot_id = 3
+    cfg.identity.db_camera_id = 4
+    cfg.paths.dataset_dir = str(tmp_path / "old-dataset")
+    cfg.paths.overlay_dir = str(tmp_path / "old-dataset" / "overlay")
+    dialog = _settings_save_dialog(tmp_path, cfg)
+    errors = []
+    sequence = []
+    monkeypatch.setattr(product_dashboard.messagebox, "showerror", lambda *args, **_kwargs: errors.append(args))
+    monkeypatch.setattr(
+        asset_api_client,
+        "register_asset_hierarchy",
+        lambda **kwargs: (
+            sequence.append("register")
+            or asset_api_client.AssetRegistration(1, 2, 3, 4)
+        ),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_sync_thresholds_to_backend",
+        lambda **_kwargs: (
+            sequence.append("threshold")
+            or (_ for _ in ()).throw(RuntimeError("threshold unavailable"))
+        ),
+    )
+    monkeypatch.setattr(
+        product_dashboard,
+        "save_collection_config",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not save before threshold sync")),
+    )
+
+    dialog.save()
+
+    assert dialog.d.cfg is cfg
+    assert cfg.paths.dataset_dir == str(tmp_path / "old-dataset")
+    assert cfg.roi.warning_delta == 15.0
+    assert cfg.roi.critical_delta == 25.0
+    assert dialog.d.monitoring is False
+    assert dialog.d.capture is None
+    assert sequence == ["register", "threshold"]
+    assert errors and errors[-1][0] == "카메라 정보 DB 저장 실패"
+
+
+def test_settings_rejects_invalid_threshold_order_before_backend_or_local_write(
+    tmp_path, monkeypatch
+):
+    cfg = config.AppConfig()
+    cfg.backend.enabled = True
+    cfg.identity.factory_id = 1
+    cfg.identity.line_id = 2
+    cfg.identity.db_robot_id = 3
+    cfg.identity.db_camera_id = 4
+    dialog = _settings_save_dialog(tmp_path, cfg)
+    dialog.warning = SimpleNamespace(get=lambda: "25")
+    dialog.critical = SimpleNamespace(get=lambda: "20")
+    errors = []
+    monkeypatch.setattr(product_dashboard, "factory_mode_enabled", lambda: True)
+    monkeypatch.setattr(
+        product_dashboard.messagebox,
+        "showerror",
+        lambda *args, **_kwargs: errors.append(args),
+    )
+    monkeypatch.setattr(
+        asset_api_client,
+        "register_asset_hierarchy",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid thresholds must not reach asset API")
+        ),
+    )
+    monkeypatch.setattr(
+        product_dashboard,
+        "save_collection_config",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("invalid thresholds must not be persisted")
+        ),
+    )
+
+    dialog.save()
+
+    assert dialog.d.cfg is cfg
+    assert cfg.roi.warning_delta == 15.0
+    assert cfg.roi.critical_delta == 25.0
+    assert errors and errors[-1][0] == "안전 검증 실패"
+
+
+def test_threshold_sync_caps_settings_backend_timeout(monkeypatch):
+    settings = SettingsDialog.__new__(SettingsDialog)
+    settings.d = SimpleNamespace(
+        cfg=SimpleNamespace(
+            backend=SimpleNamespace(enabled=True, url="http://backend", timeout_sec=600),
+            identity=SimpleNamespace(db_camera_id=7),
+            roi=SimpleNamespace(
+                rois=[SimpleNamespace(db_roi_id=12)],
+                baseline_temp=35.0,
+                warning_delta=15.0,
+                critical_delta=25.0,
+            ),
+            hotspot=SimpleNamespace(min_size=3, min_size_max=10),
+            monitoring=SimpleNamespace(alarm_cooldown_sec=600.0),
+        ),
+        _add_operating_log=lambda *_args: None,
+    )
+    calls = []
+    monkeypatch.setattr(
+        threshold_api_client,
+        "sync_threshold_profiles",
+        lambda **kwargs: calls.append(kwargs)
+        or threshold_api_client.ThresholdSyncResult(7, (12,), 0, 1),
+    )
+
+    settings._sync_thresholds_to_backend()
+
+    assert calls[0]["timeout"] == config.BACKEND_IO_TIMEOUT_MAX_SEC
 
 
 def test_measurement_uses_matching_roi_identity_and_abnormal_statuses(monkeypatch):

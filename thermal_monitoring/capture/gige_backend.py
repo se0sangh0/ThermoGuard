@@ -15,7 +15,12 @@ import time
 
 import numpy as np
 
+from ..config import factory_mode_enabled
 from ..logger import get_logger
+from ..runtime_lock import (
+    DashboardRuntimeAuthorizationError,
+    dashboard_runtime_authorized,
+)
 
 _log = get_logger("capture.gige")
 
@@ -47,9 +52,16 @@ class GigeTemperatureReader:
         self._device_index = device_index
         self._latest_temp: float | None = None
         self._temp_lock = threading.Lock()
+        # SDK objects must have one clear owner while acquisition is active.
+        # In particular, ``System.ReleaseInstance`` must never race a worker
+        # blocked in GetNextImage().
+        self._lifecycle_lock = threading.RLock()
         self._last_frame_time: float = 0.0
         self._running = False
         self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._stopped_event = threading.Event()
+        self._stopped_event.set()
         self._system = None
         self._cam = None
         self._cam_list = None
@@ -65,32 +77,105 @@ class GigeTemperatureReader:
         with self._temp_lock:
             return self._latest_temp
 
+    @property
+    def stopped(self) -> bool:
+        """Whether the acquisition worker has exited and released its SDK objects."""
+        return self._stopped_event.is_set()
+
+    @property
+    def running(self) -> bool:
+        """Whether acquisition has not yet received a stop request."""
+        return self._running and not self._stop_event.is_set()
+
     def start(self) -> bool:
+        if factory_mode_enabled() and not dashboard_runtime_authorized():
+            raise DashboardRuntimeAuthorizationError(
+                "Factory GigE acquisition is authorized only through the active "
+                "ThermoGuard dashboard runtime."
+            )
         if not _PYSPIN_AVAILABLE:
             _log.warning("PySpin not available - GigE temperature reader disabled")
             return False
-        self._running = True
-        if not self._connect():
-            self._running = False
-            return False
-        self._thread = threading.Thread(
-            target=self._acquisition_loop,
-            name="gige-temperature-reader",
-            daemon=True,
-        )
-        self._thread.start()
+
+        with self._lifecycle_lock:
+            # Do not replace an SDK session until its worker has fully exited.
+            # A stop timeout is intentionally a pending state, not permission
+            # to start a second reader for the same camera.
+            if not self._stopped_event.is_set():
+                _log.warning("GigE reader is still stopping; start request ignored")
+                return False
+
+            self._running = True
+            self._stop_event.clear()
+            self._stopped_event.clear()
+            if not self._connect():
+                self._running = False
+                self._stop_event.set()
+                self._stopped_event.set()
+                return False
+
+            self._thread = threading.Thread(
+                target=self._run_worker,
+                name="gige-temperature-reader",
+                daemon=True,
+            )
+            try:
+                self._thread.start()
+            except Exception:
+                # The thread has not started, so this is the one case where
+                # the caller may release the just-created SDK objects.
+                self._running = False
+                self._stop_event.set()
+                self._cleanup()
+                self._thread = None
+                self._stopped_event.set()
+                _log.exception("GigE acquisition worker could not start")
+                return False
         _log.info("GigE temperature reader started (device=%d)", self._device_index)
         return True
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def request_stop(self) -> None:
+        """Request a stop without releasing SDK resources from the caller.
+
+        The acquisition worker owns cleanup after it leaves camera I/O.  This
+        makes a stuck SDK call observable as a pending stop instead of turning
+        it into a use-after-release race.
+        """
+        with self._lifecycle_lock:
+            if self._stopped_event.is_set():
+                return
+            self._running = False
+            self._stop_event.set()
         _log.info("GigE temperature reader stop requested")
-        self._running = False
+
+    def wait_stopped(self, timeout: float | None = None) -> bool:
+        """Wait until the worker has exited *and* released its SDK objects."""
         thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
-        self._thread = None
-        self._cleanup()
-        _log.info("GigE temperature reader stopped")
+        if thread is threading.current_thread():
+            # A worker cannot wait for its own finally/cleanup block.
+            return False
+        if not self._stopped_event.wait(timeout):
+            return False
+        if thread is not None:
+            thread.join(timeout=0)
+        return True
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        """Request shutdown and return whether it completed within ``timeout``.
+
+        False means cleanup is still owned by the live acquisition worker.  A
+        caller must retain this reader and wait again rather than releasing or
+        replacing the SDK session.
+        """
+        self.request_stop()
+        if self.wait_stopped(timeout=timeout):
+            _log.info("GigE temperature reader stopped")
+            return True
+        _log.error(
+            "GigE reader stop is still pending after %.1fs; SDK resources remain owned by the worker",
+            timeout,
+        )
+        return False
 
     def _connect(self) -> bool:
         try:
@@ -135,8 +220,7 @@ class GigeTemperatureReader:
         self._cleanup()
         for attempt in range(1, _MAX_RECONNECT_ATTEMPTS + 1):
             _log.info("Reconnect attempt %d/%d", attempt, _MAX_RECONNECT_ATTEMPTS)
-            time.sleep(_RECONNECT_DELAY_SEC)
-            if not self._running:
+            if self._stop_event.wait(_RECONNECT_DELAY_SEC):
                 return False
             if self._connect():
                 _log.info("GigE reconnected successfully")
@@ -144,35 +228,68 @@ class GigeTemperatureReader:
         _log.error("GigE reconnect failed after %d attempts", _MAX_RECONNECT_ATTEMPTS)
         return False
 
-    def _cleanup(self) -> None:
-        cam, self._cam = self._cam, None
-        if cam is not None:
+    def _cleanup(self) -> bool:
+        """Release SDK objects only from a safe owner context.
+
+        The normal callers are the acquisition worker (reconnect/finally) and
+        ``start`` before any worker exists.  The guard is deliberately kept
+        here as a defence against a future caller reintroducing cleanup from a
+        UI or shutdown thread.
+        """
+        with self._lifecycle_lock:
+            worker = self._thread
+            if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+                _log.error("Refusing GigE SDK cleanup while acquisition worker is alive")
+                return False
+
+            cam, self._cam = self._cam, None
+            if cam is not None:
+                try:
+                    cam.EndAcquisition()
+                except Exception:
+                    pass
+                try:
+                    cam.DeInit()
+                except Exception:
+                    pass
+                del cam
+            cam_list, self._cam_list = self._cam_list, None
+            if cam_list is not None:
+                try:
+                    cam_list.Clear()
+                except Exception:
+                    pass
+                del cam_list
+            system, self._system = self._system, None
+            if system is not None:
+                try:
+                    system.ReleaseInstance()
+                except Exception:
+                    pass
+                del system
+        return True
+
+    def _run_worker(self) -> None:
+        """Own the worker lifecycle so cleanup follows the final camera call."""
+        try:
+            self._acquisition_loop()
+        except Exception:
+            _log.exception("GigE acquisition worker crashed")
+        finally:
+            with self._lifecycle_lock:
+                self._running = False
+                self._stop_event.set()
             try:
-                cam.EndAcquisition()
-            except Exception:
-                pass
-            try:
-                cam.DeInit()
-            except Exception:
-                pass
-            del cam
-        cam_list, self._cam_list = self._cam_list, None
-        if cam_list is not None:
-            try:
-                cam_list.Clear()
-            except Exception:
-                pass
-            del cam_list
-        system, self._system = self._system, None
-        if system is not None:
-            try:
-                system.ReleaseInstance()
-            except Exception:
-                pass
-            del system
+                self._cleanup()
+            finally:
+                with self._lifecycle_lock:
+                    if self._thread is threading.current_thread():
+                        self._thread = None
+                    self._stopped_event.set()
+            _log.info("GigE acquisition worker fully stopped")
 
     def _acquisition_loop(self) -> None:
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             cam = self._cam
             if cam is None:
                 _log.warning("GigE camera reference lost - exiting acquisition loop")
@@ -185,33 +302,45 @@ class GigeTemperatureReader:
                 if self._running and self._reconnect():
                     continue
                 break
-            if img is None or img.IsIncomplete():
-                status = "timeout" if img is None else img.GetImageStatus()
-                _log.warning("GigE frame incomplete: %s - attempting reconnect", status)
-                if img is not None:
-                    try:
-                        img.Release()
-                    except Exception:
-                        pass
+
+            if img is None:
+                _log.warning("GigE frame incomplete: timeout - attempting reconnect")
                 if self._running and self._reconnect():
                     continue
                 break
+
+            reconnect_needed = False
             try:
-                data = img.GetData()
-                raw = np.frombuffer(data, dtype=np.uint16).reshape(img.GetHeight(), img.GetWidth())
-                temp_image = raw.astype(np.float32) * _TEMP_SCALE - _KELVIN_OFFSET
-                max_temp = float(np.max(temp_image))
-                with self._temp_lock:
-                    self._latest_temp = max_temp
-                self._last_frame_time = time.monotonic()
+                if img.IsIncomplete():
+                    _log.warning(
+                        "GigE frame incomplete: %s - attempting reconnect",
+                        img.GetImageStatus(),
+                    )
+                    reconnect_needed = True
+                else:
+                    data = img.GetData()
+                    raw = np.frombuffer(data, dtype=np.uint16).reshape(
+                        img.GetHeight(), img.GetWidth()
+                    )
+                    temp_image = raw.astype(np.float32) * _TEMP_SCALE - _KELVIN_OFFSET
+                    max_temp = float(np.max(temp_image))
+                    with self._temp_lock:
+                        self._latest_temp = max_temp
+                    self._last_frame_time = time.monotonic()
             except Exception as exc:
                 _log.error("GigE frame processing error: %s", exc, exc_info=True)
-                if self._running and self._reconnect():
-                    continue
-                break
+                reconnect_needed = True
             finally:
                 try:
                     img.Release()
                 except Exception:
                     pass
+
+            # A PySpin image handle must be released before EndAcquisition /
+            # DeInit in _reconnect.  This ordering matters even though both
+            # operations run in the same acquisition worker.
+            if reconnect_needed:
+                if self._running and self._reconnect():
+                    continue
+                break
         _log.info("GigE acquisition loop exited")

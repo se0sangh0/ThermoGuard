@@ -20,7 +20,6 @@ from ..logger import get_logger
 
 _logger = get_logger("data.checking")
 
-SAVE_DIR = load_config().paths.dataset_dir
 MAX_RECOVERY_WORKERS = max(2, (os.cpu_count() or 4) // 2)
 
 
@@ -64,10 +63,13 @@ def _log(msg: str, log_callback=None, messages: list[str] | None = None):
 
 
 def run_check(
-    save_dir: str = SAVE_DIR,
+    save_dir: str | None = None,
     log_callback=None,
 ) -> CheckResult:
     result = CheckResult()
+
+    if save_dir is None:
+        save_dir = load_config().paths.dataset_dir
 
     if not os.path.isdir(save_dir):
         _log(f"'{save_dir}' folder not found.", log_callback, result.messages)
