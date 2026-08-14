@@ -19,3 +19,4 @@ tests/
 config.example.json
 packaging/
 dist-packaging/
+Project_hotspot/backend/venv/
