@@ -77,20 +77,21 @@ python -m thermal_monitoring.pipeline.monitor
 │       ├── _prime_processed_cache()
 │       ├── CaptureSession.start() → 데몬 스레드
 │       └── _monitoring_loop()       ← 메인 스레드가 여기서 블로킹
-│           ┌─ _scan_new_pairs()
-│           │  → thermal_dataset/에서 새 JPG 쌍 스캔
+│           ┌─ _scan_new_pairs()  (os.walk로 서브디렉토리 재귀 스캔)
+│           │  → thermal_dataset/의 날짜/블록 서브디렉토리에서 새 JPG 쌍 찾기
 │           │  → extract_from_jpeg()로 누락 NPY 추출
-│           │  → ThreadPoolExecutor: _process_one() 병렬 처리
+│           │  → ThreadPoolExecutor: _analyze_pair() 병렬 처리
 │           ├─ 무결성 검사 (INTEGRITY_INTERVAL 초마다)
 │           ├─ 메타데이터 갱신 (METADATA_INTERVAL 초마다)
+│           ├─ 오래된 데이터 정리 (1시간마다)
 │           └─ sleep(process_interval) → 1초 단위 분할
 │
 ├── CaptureSession 데몬 스레드:
 │   └── _run() — 4절 참조
 │
 └── ThreadPoolExecutor 워커 (임시):
-    └── _process_one() per pair
-        → ROI 분석 → Threshold → 오버레이 → 알림
+    └── _analyze_pair() per pair (순수 ROI 추출)
+        → _evaluate_and_act() per pair (메인 스레드에서 순차 상태 판정)
 ```
 
 ### 2B. GUI 모드 — ProductDashboard
@@ -187,9 +188,10 @@ CaptureSession._run()  [데몬 스레드]
     │  아니면:                                                   │
     │    thermal만 순차 요청                                      │
     │                                                             │
-    │  성공 시 → thermal_dataset/에 JPG 저장                      │
-    │  파일명: YYYYMMDDHHMMSS_FFFFFF.jpg                          │
-    │          YYYYMMDDHHMMSS_FFFFFF_visual.jpg  (visual 있는 경우)│
+    │  성공 시 → thermal_dataset/<날짜>/<블록>/에 JPG 저장                     │
+    │  파일명: YYYYMMDDHHMMSS_FFFFFF.jpg                                          │
+    │          YYYYMMDDHHMMSS_FFFFFF_visual.jpg  (visual 있는 경우)                │
+    │  서브디렉토리: YYYY-MM-DD / HH-HH  (6시간 블록: 00-06/06-12/12-18/18-24)    │
     │                                                             │
     │  _fetch_image()는 일시적 HTTP 오류(502/503/504/429) 발생 시  │
     │  0.5초/1.0초 백오프로 재시도 (최대 2회, 상한 2초).           │
@@ -290,13 +292,38 @@ Thermal JPG (디스크) + Visual JPG (디스크, 선택)
 
 ```
 thermal_dataset/
-├── 20260721120000_123456.jpg          ← thermal 캡처
-├── 20260721120000_123456_visual.jpg   ← visual 캡처 (정상 모드만)
-├── 20260721120000_123456_thermal.npy  ← JPEG에서 추출 (지연/캐시)
+├── 2026-08-11/
+│   ├── 00-06/
+│   ├── 06-12/
+│   ├── 12-18/
+│   └── 18-24/
+│       ├── 20260811183015_123456.jpg              ← thermal 캡처
+│       ├── 20260811183015_123456_visual.jpg       ← visual 캡처 (정상 모드만)
+│       └── 20260811183015_123456_thermal.npy      ← JPEG에서 추출 (지연/캐시)
 ├── overlay/
-│   └── 20260721120000_123456_overlay.jpg  ← 알람 오버레이
-├── snapshots/ (선택, 디버깅용)
-└── metadata.csv                          ← 주기적 배치 갱신
+│   └── 20260811183015_123456_overlay.jpg           ← 알람 오버레이
+└── metadata.csv                                    ← 주기적 배치 갱신
+
+    이미지는 `capture_subdir()`가 결정하는 6시간 블록 서브디렉토리에 저장된다.
+    디렉토리명은 캡처 시각의 `YYYY-MM-DD/HH-HH` 형식이며 블록 경계는
+    00-06 / 06-12 / 12-18 / 18-24 이다. 모든 스캔 함수는 `os.walk()` 또는
+    `Path.rglob()`로 재귀 검색하여 서브디렉토리 내 파일을 찾는다.
+
+    데이터 정리 (Cleanup):
+    ┌──────────────────────────┬──────────────────────┬────────────────────┐
+    │ 프로브                    │ 주기                  │ 동작                │
+    ├──────────────────────────┼──────────────────────┼────────────────────┤
+    │ run_cleanup_if_due       │ 15분마다              │ retention_days 초과 │
+    │ (보존 기간 정리)          │ (호출은 1시간마다)     │ Normal 쌍 삭제,     │
+    │                          │                      │ 고아 파일 정리       │
+    ├──────────────────────────┼──────────────────────┼────────────────────┤
+    │ remove_normal_pairs_if_  │ 12시간마다            │ Warning/Critical    │
+    │ due (Normal 쌍 제거)     │                      │ 이력 없는 모든       │
+    │                          │                      │ Normal 쌍 전량 삭제  │
+    └──────────────────────────┴──────────────────────┴────────────────────┘
+
+    두 프로브 모두 metadata.csv의 alarm_level이 Warning/Critical인 image_id는
+    보존한다. Normal 쌍 삭제 후 빈 서브디렉토리도 _remove_empty_subdirs()로 정리.
 
     컴포넌트               │ 읽기                │ 쓰기
     ────────────────────┼──────────────────────┼──────────────────────
@@ -306,7 +333,7 @@ thermal_dataset/
     ProductDashboard    │ JPG + NPY            │ NPY (추출), overlay
     data/checking.py    │ JPG + NPY            │ NPY (복구), JPG (정리)
     data/metadata.py    │ JPG + NPY            │ metadata.csv
-    data/cleanup.py     │ 모든 파일             │ 오래된 파일 삭제
+    data/cleanup.py     │ 모든 파일             │ 오래된 파일 삭제, 빈 폴더 정리
 ```
 
 ---
@@ -328,7 +355,7 @@ thermal_dataset/
 ├──────────────────────────┼──────────────────────┼────────────────────┤
 │ MonitorSequencer.        │ _lock (threading.Lock)│ R: 스캔, 로그      │
 │ processed_bases,         │                      │ W: _mark_processed  │
-│ _alarm_count,            │                      │   _process_one     │
+│ _alarm_count,            │                      │   _evaluate_and_act │
 │ _status_counts           │                      │                    │
 ├──────────────────────────┼──────────────────────┼────────────────────┤
 │ MonitorState.status      │ _lock (threading.Lock)│ R: threshold 체크  │
@@ -401,8 +428,8 @@ Telegram Bot API  (api.telegram.org:443)
     └── POST /bot{TOKEN}/sendMessage   — 텍스트만 (폴백)
 
     호출 스레드:
-    ├── MonitorSequencer._process_one()     — 메인 스레드 + ThreadPoolExecutor
-    └── pipeline.py (배치)                   — ThreadPoolExecutor 워커
+    ├── MonitorSequencer._evaluate_and_act()  — 메인 스레드 (상태 판정 후)
+    └── pipeline.py (배치)                     — ThreadPoolExecutor 워커
 
     설정: .env 파일 → BOT_TOKEN, CHAT_ID
 

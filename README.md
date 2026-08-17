@@ -67,7 +67,8 @@ ThermoGuard/
 │   ├── data/
 │   │   ├── checking.py           # 데이터 무결성 검사
 │   │   ├── metadata.py           # metadata.csv 관리
-│   │   ├── cleanup.py            # Normal 데이터 보존 기간 적용
+│   │   ├── pairs.py              # 파일쌍 스캔·서브디렉토리 유틸
+│   │   ├── cleanup.py            # 보존 기간 정리 + 12h Normal 쌍 제거
 │   │   └── quality.py            # 이미지 품질 검사
 │   ├── pipeline/
 │   │   ├── monitor.py
@@ -303,16 +304,36 @@ Backend가 해당 오류를 반환하면 프로필을 동기화한 뒤 같은 �
 
 ## 데이터와 로그
 
-기본 데이터 위치:
+### 디렉토리 구조
+
+이미지는 6시간 블록 단위로 날짜별 서브디렉토리에 저장됩니다.
 
 ```text
 thermal_dataset/
-├── *.jpg
-├── *_visual.jpg
-├── *_thermal.npy
-├── metadata.csv
-└── overlay/
+├── 2026-08-11/
+│   ├── 00-06/   ← 00:00 ~ 05:59
+│   ├── 06-12/   ← 06:00 ~ 11:59
+│   ├── 12-18/   ← 12:00 ~ 17:59
+│   └── 18-24/   ← 18:00 ~ 23:59
+│       ├── 20260811183015_123456.jpg              ← thermal JPEG
+│       ├── 20260811183015_123456_visual.jpg       ← visual JPEG
+│       └── 20260811183015_123456_thermal.npy      ← 온도 행렬
+├── overlay/
+│   └── 20260811183015_123456_overlay.jpg           ← 알람 오버레이
+└── metadata.csv                                    ← 메타데이터
 ```
+
+### 데이터 정리 (Cleanup)
+
+두 가지 정리 프로브가 주기적으로 실행됩니다.
+
+| 프로브 | 주기 | 대상 |
+|---|---|---|
+| 보존 기간 정리 | 1시간마다 | `cleanup_retention_days`보다 오래된 Normal 쌍, 고아 NPY/JPG, 대응 없는 오버레이 |
+| Normal 쌍 제거 | 12시간마다 | Warning/Critical 이력이 없는 모든 Normal 쌍 전량 삭제 |
+
+두 프로브 모두 `metadata.csv`의 `alarm_level`이 `Warning` 또는 `Critical`인
+`image_id`는 보존합니다. Normal 쌍 제거 후 빈 서브디렉토리도 함께 정리됩니다.
 
 애플리케이션 로그는 `logs/app.log`에 기록됩니다.
 
