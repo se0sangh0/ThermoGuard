@@ -11,7 +11,9 @@ notifier.py - Telegram 알림 전송 모듈
 """
 
 import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -24,12 +26,50 @@ _log = get_logger("analysis.notifier")
 # ------------------------------------------------------------
 # .env 파일 로드 (python-dotenv 없이 직접 파싱)
 # ------------------------------------------------------------
-DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+DASHBOARD_ENV_VAR = "THERMOGUARD_DASHBOARD_ENV"
+
+
+def _default_dotenv_path() -> Path:
+    """Return the dashboard-only credential file without release coupling."""
+
+    configured = os.environ.get(DASHBOARD_ENV_VAR, "").strip()
+    if configured:
+        return Path(os.path.expandvars(os.path.expanduser(configured))).resolve(
+            strict=False
+        )
+    if getattr(sys, "frozen", False):
+        return Path("/var/lib/thermoguard/dashboard.env")
+    return Path(__file__).resolve().parents[2] / ".env"
+
+
+DOTENV_PATH = _default_dotenv_path()
 
 
 def _load_dotenv(dotenv_path: str | Path = DOTENV_PATH) -> None:
     """최소 .env 파싱 -- KEY=VALUE 형식의 줄만 처리"""
-    if not os.path.isfile(dotenv_path):
+    dotenv_path = Path(dotenv_path)
+    if not dotenv_path.exists():
+        return
+    try:
+        file_stat = dotenv_path.lstat()
+    except OSError as exc:
+        _log.warning("Telegram environment file cannot be inspected (%s)", type(exc).__name__)
+        return
+    if (
+        dotenv_path.is_symlink()
+        or not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_uid != os.getuid()
+        or not os.access(dotenv_path, os.W_OK)
+    ):
+        _log.warning(
+            "Ignoring Telegram environment file without safe local ownership: %s",
+            dotenv_path,
+        )
+        return
+    try:
+        os.chmod(dotenv_path, 0o600)
+    except OSError as exc:
+        _log.warning("Telegram environment file cannot be hardened (%s)", type(exc).__name__)
         return
     with open(dotenv_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -50,7 +90,9 @@ _load_dotenv()
 # ------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
-TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "true").strip().lower() in {
+# Delivery is opt-in.  A credential-only file must not begin sending factory
+# alarms until commissioning has explicitly enabled and recorded delivery.
+TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "false").strip().lower() in {
     "1", "true", "yes", "on",
 }
 
@@ -89,10 +131,24 @@ def _update_dotenv(
     values: dict[str, Optional[str]],
     dotenv_path: Optional[Path] = None,
 ) -> None:
-    """Update only Telegram keys while preserving unrelated local settings."""
-    dotenv_path = dotenv_path or DOTENV_PATH
+    """Atomically update Telegram keys in a protected local environment file."""
+    dotenv_path = Path(dotenv_path or DOTENV_PATH)
+    if dotenv_path.is_symlink():
+        raise RuntimeError("Telegram environment file must not be a symbolic link.")
     existing_lines = []
     if dotenv_path.exists():
+        file_stat = dotenv_path.lstat()
+        if (
+            dotenv_path.is_symlink()
+            or not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != os.getuid()
+            or not os.access(dotenv_path, os.W_OK)
+        ):
+            raise RuntimeError(
+                "Telegram environment file must be a writable regular file "
+                "owned by the current user."
+            )
+        os.chmod(dotenv_path, 0o600)
         existing_lines = dotenv_path.read_text(encoding="utf-8").splitlines()
 
     pending = dict(values)
@@ -114,13 +170,44 @@ def _update_dotenv(
         if value is not None:
             updated_lines.append(f"{key}={value}")
 
-    dotenv_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = dotenv_path.with_name(f"{dotenv_path.name}.tmp")
-    temporary.write_text(
-        "\n".join(updated_lines).rstrip() + ("\n" if updated_lines else ""),
-        encoding="utf-8",
+    parent = dotenv_path.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, mode=0o700)
+        os.chmod(parent, 0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{dotenv_path.name}.",
+        suffix=".tmp",
+        dir=parent,
+        text=True,
     )
-    temporary.replace(dotenv_path)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as env_file:
+            os.fchmod(env_file.fileno(), 0o600)
+            env_file.write(
+                "\n".join(updated_lines).rstrip()
+                + ("\n" if updated_lines else "")
+            )
+            env_file.flush()
+            os.fsync(env_file.fileno())
+        os.replace(temporary, dotenv_path)
+        try:
+            directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def configure(
@@ -136,19 +223,22 @@ def configure(
     chat_id = chat_id.strip()
     if not bot_token or not chat_id:
         raise ValueError("Bot Token과 Chat ID를 모두 입력하세요.")
+    if "\n" in bot_token or "\r" in bot_token or "\n" in chat_id or "\r" in chat_id:
+        raise ValueError("Bot Token과 Chat ID에는 줄바꿈을 포함할 수 없습니다.")
 
+    next_enabled = bool(enabled)
+    if persist:
+        _update_dotenv({
+            "BOT_TOKEN": bot_token,
+            "CHAT_ID": chat_id,
+            "TELEGRAM_ENABLED": "true" if next_enabled else "false",
+        })
     BOT_TOKEN = bot_token
     CHAT_ID = chat_id
-    TELEGRAM_ENABLED = bool(enabled)
+    TELEGRAM_ENABLED = next_enabled
     os.environ["BOT_TOKEN"] = BOT_TOKEN
     os.environ["CHAT_ID"] = CHAT_ID
     os.environ["TELEGRAM_ENABLED"] = "true" if TELEGRAM_ENABLED else "false"
-    if persist:
-        _update_dotenv({
-            "BOT_TOKEN": BOT_TOKEN,
-            "CHAT_ID": CHAT_ID,
-            "TELEGRAM_ENABLED": os.environ["TELEGRAM_ENABLED"],
-        })
 
 
 def set_enabled(enabled: bool, *, persist: bool = True) -> None:
@@ -156,27 +246,28 @@ def set_enabled(enabled: bool, *, persist: bool = True) -> None:
     global TELEGRAM_ENABLED
     if enabled and not _is_configured():
         raise RuntimeError("Telegram 로그인 후 알림 전송을 활성화하세요.")
-    TELEGRAM_ENABLED = bool(enabled)
-    os.environ["TELEGRAM_ENABLED"] = "true" if TELEGRAM_ENABLED else "false"
+    next_enabled = bool(enabled)
     if persist:
-        _update_dotenv({"TELEGRAM_ENABLED": os.environ["TELEGRAM_ENABLED"]})
+        _update_dotenv({"TELEGRAM_ENABLED": "true" if next_enabled else "false"})
+    TELEGRAM_ENABLED = next_enabled
+    os.environ["TELEGRAM_ENABLED"] = "true" if TELEGRAM_ENABLED else "false"
 
 
 def logout(*, persist: bool = True) -> None:
     """Remove Telegram credentials from memory, environment and local .env."""
     global BOT_TOKEN, CHAT_ID, TELEGRAM_ENABLED
-    BOT_TOKEN = ""
-    CHAT_ID = ""
-    TELEGRAM_ENABLED = False
-    os.environ.pop("BOT_TOKEN", None)
-    os.environ.pop("CHAT_ID", None)
-    os.environ["TELEGRAM_ENABLED"] = "false"
     if persist:
         _update_dotenv({
             "BOT_TOKEN": None,
             "CHAT_ID": None,
             "TELEGRAM_ENABLED": "false",
         })
+    BOT_TOKEN = ""
+    CHAT_ID = ""
+    TELEGRAM_ENABLED = False
+    os.environ.pop("BOT_TOKEN", None)
+    os.environ.pop("CHAT_ID", None)
+    os.environ["TELEGRAM_ENABLED"] = "false"
 
 
 def test_connection(
@@ -207,7 +298,8 @@ def test_connection(
         bot_name = bot_response.json().get("result", {}).get("username", "Telegram Bot")
         return True, f"@{bot_name} 연결 확인 완료"
     except requests.RequestException as exc:
-        return False, f"Telegram 연결 실패: {exc}"
+        _log.warning("Telegram connection check failed (%s)", type(exc).__name__)
+        return False, f"Telegram 연결 실패 ({type(exc).__name__})"
 
 
 # ------------------------------------------------------------
@@ -253,8 +345,8 @@ def save_delivery_result(
     """Telegram 전송 결과를 FastAPI를 통해 DB에 저장한다."""
     _log.debug(
         "[DBG-NOTIFIER] save_delivery_result ENTER: alert_id=%s success=%s "
-        "http_status=%s error=%s",
-        alert_id, success, http_status, error_message,
+        "http_status=%s error_present=%s",
+        alert_id, success, http_status, bool(error_message),
     )
 
     target_url = (
@@ -282,9 +374,9 @@ def save_delivery_result(
 
         if result.get("status") != "created":
             _log.error(
-                "notification_deliveries 저장 실패: %s url=%s",
-                result,
-                target_url,
+                "notification delivery API returned an unexpected response "
+                "for alert_id=%s",
+                alert_id,
             )
             return False
 
@@ -298,11 +390,10 @@ def save_delivery_result(
 
     except Exception as exc:
         _log.error(
-            "notification delivery API 호출 실패: "
-            "alert_id=%s url=%s error=%s",
+            "notification delivery API call failed: "
+            "alert_id=%s error_type=%s",
             alert_id,
-            target_url,
-            exc,
+            type(exc).__name__,
         )
         return False
 
@@ -370,14 +461,12 @@ def send_alarm(
                 photo_sent = True
                 _log.info("sendPhoto success: temp=%.1f°C", temp)
             else:
-                last_error_message = (
-                    f"Telegram sendPhoto 실패: HTTP {resp.status_code} {resp.text}"
-                )
-                _log.error("sendPhoto failed: HTTP %d %s", resp.status_code, resp.text)
-                print(f"[Telegram] sendPhoto failed: {resp.status_code} {resp.text}")
+                last_error_message = f"Telegram sendPhoto failed (HTTP {resp.status_code})"
+                _log.error("sendPhoto failed: HTTP %d", resp.status_code)
+                print(f"[Telegram] sendPhoto failed: {resp.status_code}")
         except Exception as e:
-            last_error_message = f"Telegram sendPhoto 예외: {e}"
-            _log.error("sendPhoto exception: %s", e)
+            last_error_message = f"Telegram sendPhoto exception ({type(e).__name__})"
+            _log.error("sendPhoto exception (%s)", type(e).__name__)
             print(f"[Telegram] sendPhoto error - falling back to text")
     else:
         _log.warning("Image not found for alarm: %s", image_path)
@@ -395,14 +484,12 @@ def send_alarm(
             if resp.status_code == 200:
                 photo_sent = True
             else:
-                last_error_message = (
-                    f"Telegram sendMessage 실패: HTTP {resp.status_code} {resp.text}"
-                )
-                _log.error("sendMessage fallback failed: HTTP %d %s", resp.status_code, resp.text)
-                print(f"[Telegram] sendMessage failed: {resp.status_code} {resp.text}")
+                last_error_message = f"Telegram sendMessage failed (HTTP {resp.status_code})"
+                _log.error("sendMessage fallback failed: HTTP %d", resp.status_code)
+                print(f"[Telegram] sendMessage failed: {resp.status_code}")
         except Exception as e:
-            last_error_message = f"Telegram sendMessage 예외: {e}"
-            _log.error("sendMessage exception: %s", e)
+            last_error_message = f"Telegram sendMessage exception ({type(e).__name__})"
+            _log.error("sendMessage exception (%s)", type(e).__name__)
             print(f"[Telegram] sendMessage error")
 
     if alert_id is not None:

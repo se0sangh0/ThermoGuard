@@ -1,5 +1,10 @@
 # Thermal Monitoring System — Architecture
 
+> **현재 운영 기준**: ThermoGuard의 수집·분석·상태 전이·알림·DB 기록은
+> 프로젝트 루트의 `python dashboard.py`로만 시작합니다. 이 문서에 남은
+> `MonitorSequencer`/batch pipeline 설명은 구현 이력을 위한 참고이며 실행 경로가
+> 아닙니다. FastAPI 백엔드는 대시보드의 지원 서비스로 계속 실행됩니다.
+
 ## 1. 시스템 개요
 
 ```
@@ -9,20 +14,19 @@
 └────────────────────────────────┬─────────────────────────────────┘
                                  │ load_config()
                                  ▼
-┌──────────────────────┐  ┌──────────────────────────┐
-│   MonitorSequencer   │  │    ProductDashboard       │
-│   (monitor.py, CLI)  │  │  (product_dashboard.py,   │
-│                      │  │       tkinter GUI)        │
-│  Main thread loop    │  │  Main thread = tk.mainloop│
-│                      │  │                           │
-│  • _monitoring_loop  │  │  • root.after() callback  │
-│    → scan → process  │  │    → _schedule_analysis   │
-│    → sleep           │  │  • _thread_pool executor  │
-└──────────┬───────────┘  └────────────┬──────────────┘
-           │                           │
-           │  owns CaptureSession       │  owns CaptureSession
-           │                           │
-           ▼                           ▼
+                  ┌──────────────────────────┐
+                  │    ProductDashboard       │
+                  │  (python dashboard.py,    │
+                  │       tkinter GUI)        │
+                  │                           │
+                  │  Main thread = tk.mainloop│
+                  │  • root.after() callback  │
+                  │    → _schedule_analysis   │
+                  │  • _thread_pool executor  │
+                  └────────────┬──────────────┘
+                               │
+                               │ owns CaptureSession
+                               ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                      CaptureSession                              │
 │                      (capture.py)                                │
@@ -63,9 +67,13 @@
 
 ---
 
-## 2. 실행 모드 (진입점)
+## 2. 운영 진입점과 보관된 구현
 
-### 2A. CLI 모드 — MonitorSequencer
+### 2A. Retired CLI — MonitorSequencer (실행 차단)
+
+아래 구현은 과거 동작을 설명하기 위한 참고입니다. `python monitor.py` 및
+`python -m thermal_monitoring.pipeline.monitor`은 의도적으로 종료되며,
+대시보드와 병행 실행할 수 없습니다.
 
 ```
 python -m thermal_monitoring.pipeline.monitor
@@ -94,10 +102,10 @@ python -m thermal_monitoring.pipeline.monitor
         → _evaluate_and_act() per pair (메인 스레드에서 순차 상태 판정)
 ```
 
-### 2B. GUI 모드 — ProductDashboard
+### 2B. Product Dashboard — 유일한 운영 경로
 
 ```
-python -m thermal_monitoring.tools.product_dashboard
+python dashboard.py
 
 프로세스 (단일 Python 프로세스):
 ├── 메인 스레드 = tkinter root.mainloop()
@@ -446,7 +454,8 @@ logger.py — 일자별 롤링 파일을 지원하는 중앙 로거
 
     포맷: 2026-07-20 14:32:15.123 [INFO ] [module.name] message
 
-    로그 디렉토리: logs/  (config.json → monitoring.log_dir로 설정 가능)
+    로그 디렉토리: 프로젝트 루트 logs/
+                   (THERMOGUARD_LOG_DIR 환경변수로만 명시적 변경 가능)
 
     핸들러:
     ├── TimedRotatingFileHandler  — logs/YYYY-MM-DD.log, 자정 롤링
@@ -475,21 +484,11 @@ logger.py — 일자별 롤링 파일을 지원하는 중앙 로거
 2. config.json 로드 (load_config)
 3. .env 로드 (notifier.py BOT_TOKEN, CHAT_ID)
 4. Logger 초기화
-5. 진입점 선택:
-
-   CLI 모드 (monitor.py):
-   5a. MonitorSequencer.__init__()
-   5b. .start()
-       ├── load_roi_config()
-       ├── _prime_processed_cache()  — 기존 쌍을 처리済으로 표시
-       ├── CaptureSession.start()    — 데몬 스레드에서 캡처 시작
-       └── _monitoring_loop()        — 메인 스레드 블로킹, 신규 쌍 처리
-
-   GUI 모드 (product_dashboard.py):
+5. `python dashboard.py` 실행:
    5a. ProductDashboard.__init__()  — tkinter UI 구성
    5b. root.mainloop()
    5c. _check_connection_async()  — 일회성 상태 확인
-   5d. start_monitoring()         — 사용자 동작
+   5d. 사용자가 모니터링을 시작
        ├── CaptureSession.start() — 데몬 스레드
        └── _schedule_analysis()   — root.after() 주기적 분석
 ```
@@ -499,16 +498,7 @@ logger.py — 일자별 롤링 파일을 지원하는 중앙 로거
 ## 14. 셧다운 / 시그널 처리
 
 ```
-CLI 모드:
-    KeyboardInterrupt (Ctrl+C) in _monitoring_loop()
-    → self.stop()
-      → self._running = False
-      → self.capture.stop()
-        → self._running = False
-        → self._thread.join(timeout=interval+5)
-      → 요약 로그 출력
-
-GUI 모드:
+대시보드:
     사용자가 창 닫기 / "촬영 정지" 버튼 클릭
     → stop_monitoring()
       → self.monitoring = False
@@ -553,4 +543,3 @@ send_alarm()  [notifier.py]
 알람 쿨다운 시작 (기본 600초)
     쿨다운 만료 전까지 추가 Critical 감지 억제
 ```
-

@@ -22,8 +22,6 @@ from ..logger import get_logger
 
 _logger = get_logger("data.metadata")
 
-SAVE_DIR = load_config().paths.dataset_dir
-
 CSV_HEADER = [
     "image_id",
     "timestamp",

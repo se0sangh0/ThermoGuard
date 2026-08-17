@@ -7,6 +7,11 @@ FastAPI와 MariaDB에 저장하며 Critical 이벤트를 Telegram으로 알리�
 확장 가능한 형태를 유지하지만, 장비 선택이나 여러 로봇 간 ID 비교는 현재 운영의
 핵심 요구사항이 아닙니다. 한 카메라 안에 여러 ROI를 설정하는 것은 지원합니다.
 
+> 운영 정책: 수집·분석·알림·DB 기록은 프로젝트 루트의
+> `python dashboard.py` 한 경로로만 실행합니다. `monitor.py`, `pipeline.py`,
+> `Project_hotspot/backend/collector/`는 과거 구현을 보관하지만 의도적으로
+> 실행을 차단합니다. FastAPI 백엔드는 대시보드의 지원 서비스이므로 유지합니다.
+
 ## 동작 흐름
 
 ```text
@@ -36,9 +41,9 @@ Warning은 빠른 재촬영을 위한 상태이며 알람 전송 조건이 아�
 
 | 파일 | 역할 |
 |---|---|
-| `dashboard.py` | 권장 운영 진입점. 수집, 분석, 설정, DB 연동, 이벤트 확인, Telegram을 통합 |
-| `monitor.py` | GUI 없이 실시간 감시 시퀀서 실행 |
-| `pipeline.py` | 저장된 데이터셋을 대상으로 배치 분석 |
+| `dashboard.py` | **유일한 운영 진입점.** 수집, 분석, 설정, DB 연동, 이벤트 확인, Telegram을 통합 |
+| `monitor.py` | 비운영 경로. 실행 시 대시보드 사용 안내 후 종료 |
+| `pipeline.py` | 비운영 경로. 실행 시 대시보드 사용 안내 후 종료 |
 | `Project_hotspot/backend/app.py` | FastAPI 백엔드 |
 | `Project_hotspot/backend/database.py` | MariaDB 연결 설정 |
 
@@ -47,8 +52,8 @@ Warning은 빠른 재촬영을 위한 상태이며 알람 전송 조건이 아�
 ```text
 ThermoGuard/
 ├── dashboard.py
-├── monitor.py
-├── pipeline.py
+├── monitor.py                 # 차단된 과거 CLI 진입점
+├── pipeline.py                # 차단된 과거 배치 진입점
 ├── config.json
 ├── .env.example
 ├── requirements.txt
@@ -71,8 +76,7 @@ ThermoGuard/
 │   │   ├── cleanup.py            # 보존 기간 정리 + 12h Normal 쌍 제거
 │   │   └── quality.py            # 이미지 품질 검사
 │   ├── pipeline/
-│   │   ├── monitor.py
-│   │   └── pipeline.py
+│   │   └── ...                # 보관된 비운영 구현
 │   └── tools/
 │       ├── product_dashboard.py  # 운영 대시보드 본체
 │       ├── telegram_dispatcher.py
@@ -86,7 +90,7 @@ ThermoGuard/
 │   └── backend/
 │       ├── app.py                # FastAPI 라우트와 DB 기록 로직
 │       ├── database.py
-│       └── collector/
+│       └── collector/            # 차단된 과거 수집기 stub
 │
 ├── tests/
 ├── logs/
@@ -95,7 +99,11 @@ ThermoGuard/
 
 ## 설치
 
-Python 3.12 환경을 권장합니다.
+공장 전환 기준으로 검증할 Python 버전은 **3.10–3.12**이며, 현재 현장 런타임
+기준선은 3.10입니다. 임의의 전역 Python 대신 승인된 전용 가상환경을 사용합니다.
+
+실제 라인 전환 후보 가상환경은 일반 `requirements.txt`가 아니라
+[고정 의존성 기준선](requirements/README.ko.md)의 후보 환경 절차로 만들고 검증합니다.
 
 ```bash
 python -m pip install -r requirements.txt
@@ -109,7 +117,7 @@ Linux에서는 GUI와 FLIR 메타데이터 처리를 위해 시스템 패키지�
 sudo apt install exiftool python3-tk libgl1
 ```
 
-환경변수 파일을 만들고 실제 값을 입력합니다.
+개발 환경에서는 환경변수 파일을 만들고 실제 값을 입력합니다.
 
 ```bash
 cp .env.example .env
@@ -118,19 +126,25 @@ cp .env.example .env
 ```dotenv
 BOT_TOKEN=
 CHAT_ID=
-TELEGRAM_ENABLED=true
+TELEGRAM_ENABLED=false
 FASTAPI_URL=http://127.0.0.1:8000
-
-DB_HOST=127.0.0.1
-DB_PORT=3306
-DB_NAME=hotspot_guard
-DB_USER=root
-DB_PASSWORD=
 ```
 
-Telegram 자격 증명과 활성화 여부는 Product Dashboard의 환경설정에서도 저장할 수
-있습니다. `FASTAPI_URL`은 Telegram 전송 결과를 기록할 Backend 주소이며, 생략하면
-`http://127.0.0.1:8000`을 사용합니다. `.env`는 저장소에 커밋하지 않습니다.
+공장 장비에서는 불변 릴리스 안에 `.env`나 `config.json`을 만들지 않습니다.
+`/var/lib/thermoguard/dashboard.env`와 `/var/lib/thermoguard/config.json`을 쓰고,
+각각 `THERMOGUARD_DASHBOARD_ENV`, `THERMOGUARD_CONFIG`로 지정합니다. 대시보드
+운영자는 코드에 고정된 `/run/thermoguard/dashboard.lock`을 공용으로 사용합니다.
+GUI는 `dashboard.env`와 `config.json`의 소유자인 전용 `thermoguard` 런타임 계정으로
+실행합니다. `thermoguard` 그룹은 root가 만든 lock 파일을 읽기 위한 용도일 뿐, 다른
+계정에 비밀 파일이나 lock 파일의 쓰기 권한을 부여하지 않습니다.
+권한·런처·tmpfiles의 정확한 설치는
+[공장 전환 런북](deployment/FACTORY_RUNBOOK.ko.md)을 따릅니다.
+
+Telegram 자격 증명과 활성화 여부는 Dashboard 설정 화면에서도 외부
+`dashboard.env`에 저장할 수 있습니다. `FASTAPI_URL`은 전송 결과 감사 기록을
+시도할 Backend 주소이며, 생략하면 `http://127.0.0.1:8000`을 사용합니다. DB
+자격 증명은 별도의 backend 환경 파일에만 두며, `.env`는 저장소에 커밋하지
+않습니다. 기본값은 `TELEGRAM_ENABLED=false`입니다.
 
 ## 실행
 
@@ -140,12 +154,13 @@ DB 스키마가 준비된 MariaDB를 먼저 실행한 뒤 백엔드를 시작합
 
 ```bash
 cd Project_hotspot/backend
-uvicorn app:app --host 0.0.0.0 --port 8000
+uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
 기본 확인 주소:
 
-- 상태 확인: `http://127.0.0.1:8000/api/health`
+- 프로세스 상태(liveness): `http://127.0.0.1:8000/api/health`
+- DB 준비(readiness): `http://127.0.0.1:8000/api/ready`
 - Swagger UI: `http://127.0.0.1:8000/docs`
 
 systemd로 설치된 운영 장비에서는 다음 서비스 로그를 확인합니다.
@@ -153,16 +168,47 @@ systemd로 설치된 운영 장비에서는 다음 서비스 로그를 확인합
 ```bash
 sudo systemctl status hotspot-backend.service
 sudo journalctl -u hotspot-backend.service -n 200 --no-pager
-sudo journalctl -u hotspot-flir-collector.service -n 200 --no-pager
 ```
+
+`hotspot-flir-collector.service`는 대시보드와 중복 수집을 만들 수 있으므로
+**disabled 상태로 유지**합니다. 현재 저장소의 collector 스크립트도 안전하게
+종료하도록 차단되어 있습니다.
 
 ### 2. Product Dashboard
 
-프로젝트 루트에서 실행합니다.
+대시보드는 호스트 단위 단일 인스턴스 잠금을 사용하며, 유효하지 않은 설정·마운트
+루트 데이터 경로·잘못된 임계값에서는 카메라에 접근하지 않고 종료합니다. 공장에서는
+외부 설정·환경 파일과 공용 lock을 지정하는 런처로만 실행합니다. 전환 전에는 다음
+읽기 전용 점검을 먼저 통과해야 합니다.
 
 ```bash
-python dashboard.py
+sudo -u thermoguard env \
+  THERMOGUARD_CONFIG=/var/lib/thermoguard/config.json \
+  THERMOGUARD_DASHBOARD_ENV=/var/lib/thermoguard/dashboard.env \
+  THERMOGUARD_LOG_DIR=/var/log/thermoguard \
+  THERMOGUARD_FACTORY_MODE=1 \
+  /opt/thermoguard/venv/bin/python -m thermal_monitoring.preflight --online
 ```
+
+`--online`은 카메라와 `/api/ready`를 조회하므로 승인된 시험 창에서만 사용합니다.
+DB 17개 필수 테이블과 DDL fingerprint는 backend 가상환경에서 별도로 읽기 전용
+확인합니다.
+
+```bash
+cd Project_hotspot/backend
+python schema_preflight.py --json --verify-fingerprint
+```
+
+`drifted`, `not_ready`, 또는 exit code 1/2이면 DB를 자동 변경하지 말고 전환을
+중단합니다. 그 다음에만 실행합니다.
+
+```bash
+/usr/local/bin/thermoguard-dashboard
+```
+
+개발 환경에서만 프로젝트 루트의 `python dashboard.py`를 직접 실행할 수 있습니다.
+공장 런처의 전체 내용과 `/run/thermoguard` provision은
+[공장 전환 런북](deployment/FACTORY_RUNBOOK.ko.md)에 있습니다.
 
 권장 초기 설정 순서:
 
@@ -178,88 +224,37 @@ python dashboard.py
 `thermal_monitoring/tools/calibration.py`의 `run_calibration()` 안에서
 `max_window_width`, `max_window_height` 값으로 조정합니다.
 
-GUI가 필요 없는 경우 다음 진입점을 사용할 수 있습니다.
-
-```bash
-python monitor.py
-python pipeline.py
-```
+`monitor.py`, `pipeline.py`, `python -m thermal_monitoring.capture.capture`는 운영
+데이터와 알림을 중복 처리하지 않도록 차단되어 있습니다. 수집·분석·수동 촬영은
+대시보드에서만 수행합니다. 대량 무결성 복구·metadata 재생성·삭제 보존 작업은
+자동 타이머에서 실행하지 않으며, 백업과 승인된 별도 유지보수 절차에서만 수행합니다.
 
 ## 통합 설정
 
-`config.json`은 애플리케이션의 단일 설정 파일입니다. 없는 항목은
-`thermal_monitoring/config.py`의 dataclass 기본값으로 보완됩니다.
+`config.json`은 애플리케이션의 단일 설정 파일입니다. 운영 대시보드는
+`0 < warning_delta < critical_delta`, 전용 데이터 하위 폴더, 유효 ROI/주기/URL을
+엄격하게 검증합니다. 잘못된 파일을 기본값으로 덮어쓰지 않습니다.
 
-```json
-{
-  "camera": {
-    "ip": "192.168.0.51",
-    "capture_interval_sec": 30.0,
-    "warning_interval_sec": 5.0
-  },
-  "identity": {
-    "camera_id": "CAM-01",
-    "robot_id": "Robot-01",
-    "factory_name": "",
-    "line_name": "",
-    "robot_name": "",
-    "factory_id": null,
-    "line_id": null,
-    "db_robot_id": null,
-    "db_camera_id": null
-  },
-  "roi": {
-    "x1": 0,
-    "y1": 0,
-    "x2": 640,
-    "y2": 480,
-    "baseline_temp": 35.0,
-    "warning_delta": 15.0,
-    "critical_delta": 25.0,
-    "rois": [
-      {
-        "name": "ROI-1",
-        "x1": 0,
-        "y1": 0,
-        "x2": 640,
-        "y2": 480,
-        "db_roi_id": null
-      }
-    ]
-  },
-  "monitoring": {
-    "process_interval_sec": 10.0,
-    "integrity_interval_sec": 60.0,
-    "metadata_interval_sec": 120.0,
-    "max_processed_cache": 10000,
-    "alarm_cooldown_sec": 600.0,
-    "cleanup_retention_days": 2
-  },
-  "hotspot": {
-    "min_size": 3,
-    "min_size_max": 10
-  },
-  "paths": {
-    "dataset_dir": "thermal_dataset",
-    "overlay_dir": "thermal_dataset/overlay",
-    "homography_path": "thermal_to_rgb.npy"
-  },
-  "display": {
-    "roi_display_width": 640,
-    "roi_display_height": 480,
-    "display_width": 800
-  },
-  "tools": {
-    "exiftool_path": "",
-    "mode": "both"
-  },
-  "backend": {
-    "url": "http://127.0.0.1:8000",
-    "enabled": true,
-    "timeout_sec": 5.0
-  }
-}
+새 설치는 저장소의 전체 예시인 [config.example.json](config.example.json)을 복사해
+승인된 값을 채운 뒤 `preflight`로 검증합니다. 문서에 있는 일부 JSON 조각을 복사해
+새 설정을 만들면 엄격한 스키마를 충족하지 못할 수 있습니다. 공장에서는 다음처럼
+릴리스 밖의 일반 파일을 사용합니다. 예시의 데이터셋·오버레이·보정 행렬 경로도
+`/var/lib/thermoguard` 아래의 절대 경로이므로, 현장 전용 볼륨 하위 경로로 바꿀 경우
+세 경로를 함께 검토합니다.
+
+```bash
+install -o thermoguard -g thermoguard -m 0640 \
+  config.example.json /var/lib/thermoguard/config.json
+THERMOGUARD_CONFIG=/var/lib/thermoguard/config.json \
+THERMOGUARD_DASHBOARD_ENV=/var/lib/thermoguard/dashboard.env \
+THERMOGUARD_LOG_DIR=/var/log/thermoguard \
+THERMOGUARD_FACTORY_MODE=1 \
+  /opt/thermoguard/venv/bin/python -m thermal_monitoring.preflight
 ```
+
+Dashboard의 설정 저장은 `THERMOGUARD_CONFIG`가 가리키는 파일에 원자적으로
+반영됩니다. 수동 편집과 Dashboard 저장을 동시에 수행하지 말고, 변경 전 백업·두 명
+교차 검토·preflight를 운영 절차로 둡니다.
 
 다음 두 종류의 ID를 구분해야 합니다.
 
@@ -278,7 +273,8 @@ Product Dashboard는 DB에 직접 INSERT하지 않고 기존 FastAPI 경로를 �
 
 | 기능 | 경로 | 주요 결과 |
 |---|---|---|
-| 상태 확인 | `GET /api/health` | Backend/DB 연결 확인 |
+| 프로세스 상태 | `GET /api/health` | FastAPI liveness 확인 |
+| DB 준비 상태 | `GET /api/ready` | DB read-only readiness 확인 |
 | 장비 조회·저장 | `GET/POST /api/cameras` 등 | 장비 DB ID 확보 |
 | ROI 조회·저장 | `GET/POST /api/rois` | `db_roi_id` 확보 |
 | 임계값 조회·저장 | `GET/POST/PATCH /api/thresholds` | 활성 threshold profile 유지 |
@@ -301,6 +297,11 @@ Backend가 해당 오류를 반환하면 프로필을 동기화한 뒤 같은 �
 있습니다. Warning이거나, Critical 상태가 계속 유지 중이거나, 알람 쿨다운 중이면
 `do_alarm=false`이므로 이벤트를 만들지 않습니다. Telegram 전송 결과는 백엔드가
 반환한 `alert_id`가 있을 때만 `notification_deliveries`에 연결할 수 있습니다.
+
+Critical Telegram 전송은 느리거나 사용할 수 없는 DB 저장을 기다리지 않고 즉시
+시도합니다. 따라서 Telegram은 도착했지만 `alert_id`가 아직 없어
+`notification_deliveries` 감사 이력이 없을 수 있습니다. Telegram 전달 성공과 DB
+기록 성공은 서로 독립적으로 확인해야 하며, 전송 이력은 best-effort 감사 정보입니다.
 
 ## 데이터와 로그
 
@@ -337,6 +338,9 @@ thermal_dataset/
 
 애플리케이션 로그는 `logs/app.log`에 기록됩니다.
 
+`THERMOGUARD_LOG_DIR` 환경변수로만 로그 위치를 명시적으로 바꿀 수 있습니다.
+로그 초기화는 `config.json`을 생성·수정하지 않습니다.
+
 ```bash
 tail -f logs/app.log
 rg "measurement POST|ALARM|Telegram|notification" logs/app.log
@@ -359,16 +363,19 @@ SELECT * FROM notification_deliveries ORDER BY delivery_id DESC LIMIT 30;
 전체 테스트:
 
 ```bash
-python -m pytest -q
+python -m pytest -q \
+  --deselect tests/test_overlay.py::OverlayIntegrationTests::test_latest_dataset_overlay
 ```
 
 의존성을 별도 설치하지 않는 `uv` 실행 예:
 
 ```bash
-uv run --with-requirements requirements.txt --with pytest python -m pytest -q
+uv run --with-requirements requirements.txt --with pytest python -m pytest -q \
+  --deselect tests/test_overlay.py::OverlayIntegrationTests::test_latest_dataset_overlay
 ```
 
-최종 확인 결과는 **52 passed, 1 skipped**입니다.
+현장 전환 기록에는 해당 승인 릴리스에서 나온 실제 test 결과와 실행 환경을 남깁니다.
+과거의 고정 pass 개수로 새 릴리스를 판정하지 않습니다.
 
 ## 관련 문서
 

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Approved factory dashboard launcher.
+#
+# Keep release code immutable: site configuration, Telegram credentials and
+# logs live outside /opt/thermoguard/current.  This script intentionally does
+# not accept caller-supplied path overrides, so an operator cannot accidentally
+# start a second policy/configuration domain from a shell export.
+set -eu
+
+RELEASE_ROOT=/opt/thermoguard/current
+RUNTIME_ROOT=/var/lib/thermoguard
+
+export THERMOGUARD_CONFIG="$RUNTIME_ROOT/config.json"
+export THERMOGUARD_DASHBOARD_ENV="$RUNTIME_ROOT/dashboard.env"
+export THERMOGUARD_LOG_DIR=/var/log/thermoguard
+# Enables the config guard that keeps capture/calibration outputs outside the
+# immutable release tree.  Do not unset this in production.
+export THERMOGUARD_FACTORY_MODE=1
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+
+PYTHON_BIN=/opt/thermoguard/venv/bin/python
+
+# The approved operational path always performs the complete read-only gate
+# before a Tk process can acquire the camera.  This includes the shared lock,
+# retired collector, required writable paths, camera and backend readiness.
+cd "$RELEASE_ROOT"
+if ! "$PYTHON_BIN" -m thermal_monitoring.preflight --online; then
+    echo "ThermoGuard preflight failed; dashboard was not started." >&2
+    exit 2
+fi
+
+exec "$PYTHON_BIN" "$RELEASE_ROOT/dashboard.py" "$@"

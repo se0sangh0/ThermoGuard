@@ -25,9 +25,16 @@ from ..logger import get_logger
 
 _log = get_logger("analysis.threshold")
 
-_cfg = load_config()
-MIN_HOTSPOT_SIZE = _cfg.hotspot.min_size       # 95th percentile 경로 최소 클러스터 크기
-MIN_HOTSPOT_SIZE_MAX = _cfg.hotspot.min_size_max  # max 온도 경로 최소 클러스터 크기 (노이즈 방지용 상향)
+# Do not load config at module import: this module is imported before the
+# dashboard's strict production gate.  The defaults retain historical values;
+# active analysis reads the validated runtime config below.
+MIN_HOTSPOT_SIZE = 3       # 95th percentile 경로 최소 클러스터 크기
+MIN_HOTSPOT_SIZE_MAX = 10  # max 온도 경로 최소 클러스터 크기 (노이즈 방지용 상향)
+
+
+def _hotspot_limits() -> tuple[int, int]:
+    cfg = load_config()
+    return int(cfg.hotspot.min_size), int(cfg.hotspot.min_size_max)
 
 
 class Status(Enum):
@@ -53,7 +60,7 @@ class MonitorState:
     # ── 하위 호환: 단일 ROI 또는 최악-집계용 필드 ──
     status: Status = Status.NORMAL
     last_alarm_time: float = 0.0
-    alarm_cooldown: float = _cfg.monitoring.alarm_cooldown_sec  # from config.json
+    alarm_cooldown: float = 600.0
     alarm_pending: bool = False        # 전송 실패한 CRITICAL 알람이 재시도 대기 중인지
     last_alarm_attempt: float = 0.0    # 마지막 전송 시도 시각 (재시도 백오프용)
 
@@ -83,8 +90,9 @@ def evaluate_threshold(
     경로 2 (max 온도): ROI 대비 소수 픽셀만 국소 과열되어
         95th가 묻히는 경우를 보완. cluster >= 10px로 노이즈 방지.
     """
-    cluster_95 = max_hotspot_size >= MIN_HOTSPOT_SIZE
-    cluster_max = max_hotspot_size >= MIN_HOTSPOT_SIZE_MAX
+    min_hotspot_size, min_hotspot_size_max = _hotspot_limits()
+    cluster_95 = max_hotspot_size >= min_hotspot_size
+    cluster_max = max_hotspot_size >= min_hotspot_size_max
 
     # 경로 1: 95th percentile 기반
     critical_95 = hot_temp >= baseline + critical_delta and cluster_95

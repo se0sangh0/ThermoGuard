@@ -68,18 +68,31 @@ def resolve_camera_id(
 
     wanted_code = str(camera_code).strip()
     wanted_ip = str(camera_ip).strip()
-    candidates = []
+    matches = []
     for camera in cameras:
         if not isinstance(camera, dict):
             continue
-        candidates.append(camera)
-        if wanted_code and str(camera.get("camera_code", "")).strip() == wanted_code:
-            return int(camera["camera_id"])
-        if wanted_ip and str(camera.get("ip_address", "")).strip() == wanted_ip:
-            return int(camera["camera_id"])
+        if (
+            wanted_code
+            and str(camera.get("camera_code", "")).strip() == wanted_code
+        ) or (
+            wanted_ip
+            and str(camera.get("ip_address", "")).strip() == wanted_ip
+        ):
+            matches.append(camera)
 
-    if len(candidates) == 1:
-        return int(candidates[0]["camera_id"])
+    camera_ids = {
+        int(camera["camera_id"])
+        for camera in matches
+        if camera.get("camera_id") is not None
+    }
+    if len(camera_ids) == 1:
+        return camera_ids.pop()
+    if len(camera_ids) > 1:
+        raise RoiApiError(
+            "camera_code와 IP가 서로 다른 DB 카메라를 가리킵니다. "
+            "자동 선택을 중단합니다."
+        )
 
     raise RoiApiError(
         f"DB에서 카메라를 찾지 못했습니다. camera_code={wanted_code}, ip={wanted_ip}"

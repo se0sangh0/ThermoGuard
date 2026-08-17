@@ -15,6 +15,7 @@ import cv2
 import requests
 
 from ..analysis.threshold import Status
+from ..config import bounded_backend_timeout
 from ..logger import get_logger
 
 _log = get_logger("tools.telegram_dispatcher")
@@ -24,6 +25,7 @@ class TelegramDispatcher:
     """ProductDashboard의 텔레그램 알람 전송 및 백엔드 DB 기록을 위임받는다."""
 
     RETRY_BACKOFF_SECONDS = 60.0
+    BACKEND_LINK_AUDIT_WAIT_SECONDS = 15.0
 
     def __init__(
         self,
@@ -47,10 +49,12 @@ class TelegramDispatcher:
 
     def _op_log(self, result: str, detail: str):
         if self._running():
-            self._dash.root.after(
-                0,
-                lambda: self._dash._add_operating_log("Telegram", result, detail),
-            )
+            callback = lambda: self._dash._add_operating_log("Telegram", result, detail)
+            post_to_ui = getattr(self._dash, "_post_to_ui", None)
+            if post_to_ui is not None:
+                post_to_ui(callback)
+            else:  # compatibility with focused non-Tk test doubles
+                self._dash.root.after(0, callback)
 
     def _trace(self, msg: str, *args):
         _log.debug(f"[TELEGRAM] {msg}", *args)
@@ -63,7 +67,7 @@ class TelegramDispatcher:
             cfg = self._dash.cfg
             return sync_threshold_profiles(
                 base_url=cfg.backend.url,
-                timeout=cfg.backend.timeout_sec,
+                timeout=bounded_backend_timeout(cfg.backend.timeout_sec),
                 camera_id=camera_id,
                 roi_ids=[roi_id],
                 baseline_temp=cfg.roi.baseline_temp,
@@ -210,6 +214,65 @@ class TelegramDispatcher:
                 self._pending_attempt_count = 0
                 self._last_attempt_monotonic = 0.0
 
+    def _record_unlinked_delivery_after_backend_post(
+        self,
+        result: dict,
+        backend_event,
+        *,
+        success: bool,
+        backend_url: str | None,
+    ) -> None:
+        """Link an already-sent Telegram result once a slow POST yields an ID.
+
+        Alarm transmission never waits for database persistence.  This bounded
+        background waiter restores the audit trail when the concurrent
+        measurement POST completes shortly afterwards, without adding latency
+        to the Critical notification path.
+        """
+
+        if backend_event is None:
+            return
+
+        def record() -> None:
+            try:
+                if not backend_event.wait(self.BACKEND_LINK_AUDIT_WAIT_SECONDS):
+                    _log.warning(
+                        "Telegram delivery audit not linked within %.1fs",
+                        self.BACKEND_LINK_AUDIT_WAIT_SECONDS,
+                    )
+                    return
+                alert_id = result.get("alert_id")
+                if alert_id is None:
+                    _log.warning(
+                        "Telegram delivery audit unavailable: backend returned no alert_id"
+                    )
+                    return
+                from ..analysis.notifier import save_delivery_result
+
+                saved = save_delivery_result(
+                    alert_id=int(alert_id),
+                    success=success,
+                    http_status=None,
+                    error_message=(
+                        None
+                        if success
+                        else "Telegram dispatch failed before backend alert link"
+                    ),
+                    retry_count=0,
+                    backend_url=backend_url,
+                )
+                if not saved:
+                    _log.warning("Telegram delivery audit POST failed for linked alert")
+            except Exception as exc:
+                # Do not permit best-effort auditing to affect alarm retry or
+                # reveal backend/credential values in a UI callback.
+                _log.warning(
+                    "Telegram delivery audit link failed (%s)",
+                    type(exc).__name__,
+                )
+
+        threading.Thread(target=record, daemon=True).start()
+
     def _dispatch(self, result: dict, captured_at):
         temp = float(result.get("hot_temp_95", result.get("max_temp", 0.0)))
         overlay = result.get("overlay")
@@ -228,23 +291,20 @@ class TelegramDispatcher:
 
             self._trace("worker START: base=%s temp=%.1f status=%s", base, temp, status_value)
 
-            alert_id = None
+            # Critical notification is independent of database persistence.
+            # Waiting for a slow/unavailable DB here can delay a factory alarm
+            # by twelve seconds, so capture the ID only if it is already ready.
             backend_event = result.get("_backend_posted_event")
-            if backend_event is not None:
-                self._trace("waiting for _backend_posted_event (max 12s)...")
-                if backend_event.wait(12.0):
-                    alert_id = result.get("alert_id")
-                    self._trace("got alert_id=%s", alert_id)
-                else:
-                    _log.warning(
-                        "backend event timeout (12s) — alert_id remains None"
-                    )
-            else:
-                self._trace("no _backend_posted_event — alert_id=None")
+            alert_id = result.get("alert_id")
+            if alert_id is None and backend_event is not None and backend_event.is_set():
+                alert_id = result.get("alert_id")
+            if alert_id is None and backend_event is not None:
+                _log.warning("backend alert link is not ready; sending Telegram without DB link")
 
             tmp_path = None
             image_path = ""
             ok = False
+            delivery_attempted = False
             if overlay is not None:
                 tmp_path = os.path.join(
                     tempfile.gettempdir(), f"thermoguard_alarm_{base}.jpg"
@@ -259,6 +319,7 @@ class TelegramDispatcher:
                 self._trace(
                     "calling send_alarm alert_id=%s image=%s", alert_id, bool(image_path),
                 )
+                delivery_attempted = True
                 ok = send_alarm(
                     image_path=image_path,
                     temp=temp,
@@ -272,11 +333,20 @@ class TelegramDispatcher:
                     f"{temp:.1f}°C · {'사진' if image_path else '텍스트'}",
                 )
             except RuntimeError:
-                self._op_log("실패", ".env의 BOT_TOKEN / CHAT_ID를 확인하세요")
+                self._op_log("실패", "dashboard 환경 파일의 BOT_TOKEN / CHAT_ID를 확인하세요")
             except Exception as e:
-                _log.error("Telegram dispatch error: %s", e, exc_info=True)
-                self._op_log("실패", str(e))
+                # Requests exceptions can contain the token-bearing Telegram
+                # endpoint.  Keep both logs and UI status free of that value.
+                _log.error("Telegram dispatch error (%s)", type(e).__name__)
+                self._op_log("실패", f"전송 오류 ({type(e).__name__})")
             finally:
+                if delivery_attempted and alert_id is None:
+                    self._record_unlinked_delivery_after_backend_post(
+                        result,
+                        backend_event,
+                        success=ok,
+                        backend_url=backend_url,
+                    )
                 if tmp_path:
                     try:
                         os.remove(tmp_path)
@@ -419,7 +489,7 @@ class TelegramDispatcher:
             resp = requests.post(
                 measurement_url,
                 json=payload,
-                timeout=self._dash.cfg.backend.timeout_sec,
+                timeout=bounded_backend_timeout(self._dash.cfg.backend.timeout_sec),
             )
             data = resp.json() if resp.status_code == 200 else {}
             threshold_missing = (
@@ -443,7 +513,7 @@ class TelegramDispatcher:
                 resp = requests.post(
                     measurement_url,
                     json=payload,
-                    timeout=self._dash.cfg.backend.timeout_sec,
+                    timeout=bounded_backend_timeout(self._dash.cfg.backend.timeout_sec),
                 )
                 data = resp.json() if resp.status_code == 200 else {}
 
@@ -505,12 +575,11 @@ class TelegramDispatcher:
                     pass
             local_event_id = result.get("_local_event_id")
             if local_event_id and self._running():
-                try:
-                    self._dash.root.after(
-                        0,
-                        lambda event_id=local_event_id, linked_id=result.get("alert_id"): (
-                            self._dash._link_backend_alert(event_id, linked_id)
-                        ),
-                    )
-                except Exception:
-                    pass
+                callback = lambda event_id=local_event_id, linked_id=result.get("alert_id"): (
+                    self._dash._link_backend_alert(event_id, linked_id)
+                )
+                post_to_ui = getattr(self._dash, "_post_to_ui", None)
+                if post_to_ui is not None:
+                    post_to_ui(callback)
+                else:  # compatibility with focused non-Tk test doubles
+                    self._dash.root.after(0, callback)

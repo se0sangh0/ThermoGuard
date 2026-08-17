@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from ..config import RoiEntry, load_config, save_config
+from ..config import RoiEntry, load_config, resolve_runtime_path, save_collection_config
 
 
 try:
@@ -214,6 +214,9 @@ def _roi_values(entry) -> tuple[str, int, int, int, int]:
 class RoiTkDialog:
     def __init__(self, parent, thermal_path: str, visual_path: str, save_handler=None):
         self.parent = parent
+        # This dialog is launched only by the validated dashboard.  Never fall
+        # back to legacy migration/default creation if its approved config was
+        # removed or damaged while the dashboard is open.
         self.cfg = load_config(force_reload=True)
         self.thermal_path = thermal_path
         self.visual_path = visual_path
@@ -228,7 +231,7 @@ class RoiTkDialog:
         self._redraw_id = None
         self.save_handler = save_handler
 
-        homography_path = Path(self.cfg.paths.homography_path)
+        homography_path = resolve_runtime_path(self.cfg.paths.homography_path)
         if not homography_path.exists():
             raise FileNotFoundError("캘리브레이션 정보가 없습니다. 캘리브레이션을 먼저 실행하세요.")
         calib_data = np.load(homography_path, allow_pickle=True)
@@ -676,7 +679,7 @@ class RoiTkDialog:
         self.cfg.roi.x1, self.cfg.roi.y1 = first.x1, first.y1
         self.cfg.roi.x2, self.cfg.roi.y2 = first.x2, first.y2
         try:
-            save_config(self.cfg)
+            save_collection_config(self.cfg)
         except Exception as exc:
             messagebox.showerror(
                 "ROI 저장 실패",

@@ -18,7 +18,7 @@ import sys
 import os
 import glob
 
-from ..config import load_config
+from ..config import load_config, resolve_runtime_path
 
 thermal_pts = []
 rgb_pts = []
@@ -165,8 +165,10 @@ def run_calibration(
     pair_state = "rgb"
     t_mouse_x = t_mouse_y = r_mouse_x = r_mouse_y = -1
 
-    cfg = load_config()
-    DATASET_DIR = cfg.paths.dataset_dir
+    # Calibration is a dashboard-owned tool.  It must not resurrect a missing
+    # config via legacy fallback after the production startup gate accepted it.
+    cfg = load_config(force_reload=True)
+    DATASET_DIR = str(resolve_runtime_path(cfg.paths.dataset_dir))
 
     if thermal_path is None:
         if len(sys.argv) >= 3:
@@ -489,7 +491,7 @@ def run_calibration(
         _show_error_dialog(mean_error, max_error, len(thermal_arr))
         return False
 
-    output_path = cfg.paths.homography_path
+    output_path = str(resolve_runtime_path(cfg.paths.homography_path))
     # H + 대응점을 dict로 묶어서 저장 (기존 호환성을 위해 .npz 대신 .npy 확장자 유지)
     calib_data = {
         "H": H,
@@ -622,4 +624,6 @@ def _show_calibration_quality_dialog(
 
 
 if __name__ == "__main__":
-    run_calibration()
+    from ..operational_mode import exit_legacy_operation
+
+    exit_legacy_operation("python -m thermal_monitoring.tools.calibration")

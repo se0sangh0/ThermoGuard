@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "schema_fingerprint": {
+    "algorithm": "sha256",
+    "normalization": "show_create_table_v1",
+    "value": "732113c6aaf212d12a1b6ab4b93558893ec841ccaaedfca050f8ca3b4e2b9805"
+  },
+  "required_tables": [
+    "factories",
+    "production_lines",
+    "robots",
+    "cameras",
+    "roi_definitions",
+    "threshold_profiles",
+    "captures",
+    "capture_files",
+    "image_quality_results",
+    "analysis_runs",
+    "roi_measurements",
+    "hotspots",
+    "alert_events",
+    "notification_deliveries",
+    "api_request_logs",
+    "operation_logs",
+    "calibrations"
+  ]
+}

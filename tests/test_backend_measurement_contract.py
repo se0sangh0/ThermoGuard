@@ -3,6 +3,9 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
+
 
 BACKEND_APP = (
     Path(__file__).resolve().parents[1]
@@ -42,6 +45,9 @@ class _Engine:
         self.connection = connection
 
     def begin(self):
+        return _Begin(self.connection)
+
+    def connect(self):
         return _Begin(self.connection)
 
 
@@ -102,3 +108,50 @@ def test_measurement_persists_files_hotspots_quality_and_overlay_link():
     assert "INSERT INTO image_quality_results" in measurement_source
     assert "overlay_file_id" in measurement_source
     assert "INSERT INTO api_request_logs" in measurement_source
+
+
+def test_readiness_checks_database_without_changing_liveness(monkeypatch):
+    connection = _Connection()
+    backend = _load_backend_app(monkeypatch, _Engine(connection))
+
+    assert backend.health() == {
+        "server": "running",
+        "device": "Jetson AGX Orin",
+    }
+    assert backend.readiness() == {"status": "ready", "database": "connected"}
+
+    assert len(connection.calls) == 1
+    statement, params = connection.calls[0]
+    assert "SELECT 1" in statement
+    assert params is None
+
+
+def test_readiness_returns_503_without_database_error_details(monkeypatch):
+    class _UnavailableEngine:
+        def connect(self):
+            raise RuntimeError("database driver connection failure")
+
+    backend = _load_backend_app(monkeypatch, _UnavailableEngine())
+
+    with pytest.raises(HTTPException) as exc_info:
+        backend.readiness()
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == {
+        "status": "not_ready",
+        "database": "unavailable",
+    }
+
+
+def test_database_diagnostic_routes_are_disabled_by_default(monkeypatch):
+    backend = _load_backend_app(monkeypatch, _Engine(_Connection()))
+    monkeypatch.delenv("THERMOGUARD_DIAGNOSTIC_ENDPOINTS", raising=False)
+
+    with pytest.raises(HTTPException) as db_exc:
+        backend.db_test()
+    with pytest.raises(HTTPException) as tables_exc:
+        backend.get_tables()
+
+    assert db_exc.value.status_code == 404
+    assert tables_exc.value.status_code == 404
+    assert db_exc.value.detail == "Not found"

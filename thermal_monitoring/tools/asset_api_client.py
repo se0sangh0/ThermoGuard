@@ -70,10 +70,18 @@ def _find_asset_hierarchy(
             or str(camera.get("ip_address", "")).strip() == camera_ip
         ):
             matches.append(camera)
-    if not matches and len(cameras) == 1:
-        matches = cameras
     if not matches:
         return None
+    camera_ids = {
+        int(camera["camera_id"])
+        for camera in matches
+        if camera.get("camera_id") is not None
+    }
+    if len(camera_ids) != 1:
+        raise AssetApiError(
+            "camera_code와 IP가 서로 다른 Backend 카메라를 가리킵니다. "
+            "자동 등록을 중단하고 자산 식별자를 확인하세요."
+        )
 
     camera = matches[0]
     required = ("robot_id", "camera_id")
@@ -105,17 +113,39 @@ def register_asset_hierarchy(
     robot_name: str,
     camera_code: str,
     camera_ip: str,
+    capture_mode: str = "both",
+    normal_interval_sec: float = 30.0,
+    warning_interval_sec: float = 5.0,
     factory_id: int | None = None,
     line_id: int | None = None,
     robot_id: int | None = None,
     camera_id: int | None = None,
 ) -> AssetRegistration:
     """Persist missing hierarchy levels using the existing FastAPI routes."""
+    camera_body = {
+        "robot_id": None,
+        "camera_code": camera_code,
+        "ip_address": camera_ip,
+        "model_name": None,
+        "capture_mode": capture_mode,
+        "normal_interval_sec": float(normal_interval_sec),
+        "warning_interval_sec": float(warning_interval_sec),
+        "enabled": True,
+    }
     if not all((factory_id, line_id, robot_id, camera_id)):
         existing = _find_asset_hierarchy(
             base_url, camera_code, camera_ip, timeout,
         )
         if existing is not None:
+            camera_body["robot_id"] = existing.robot_id
+            persisted_camera_id = _create(
+                base_url, "/api/cameras", camera_body,
+                "camera_id", timeout,
+            )
+            if persisted_camera_id != existing.camera_id:
+                raise AssetApiError(
+                    "Backend camera upsert returned a different camera_id"
+                )
             return AssetRegistration(
                 factory_id=(
                     int(factory_id)
@@ -157,21 +187,14 @@ def register_asset_hierarchy(
             },
             "robot_id", timeout,
         )
-    if not camera_id:
-        camera_id = _create(
-            base_url, "/api/cameras",
-            {
-                "robot_id": robot_id,
-                "camera_code": camera_code,
-                "ip_address": camera_ip,
-                "model_name": None,
-                "capture_mode": "both",
-                "normal_interval_sec": 30.0,
-                "warning_interval_sec": 5.0,
-                "enabled": True,
-            },
-            "camera_id", timeout,
-        )
+    camera_body["robot_id"] = robot_id
+    persisted_camera_id = _create(
+        base_url, "/api/cameras", camera_body,
+        "camera_id", timeout,
+    )
+    if camera_id and persisted_camera_id != int(camera_id):
+        raise AssetApiError("Backend camera upsert returned a different camera_id")
+    camera_id = persisted_camera_id
     return AssetRegistration(
         factory_id=int(factory_id),
         line_id=int(line_id),

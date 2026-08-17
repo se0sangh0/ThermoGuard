@@ -1,0 +1,3 @@
+# Keep copied, site-specific environment files out of Git.
+env/*.env
+!env/*.env.example

@@ -1,35 +1,19 @@
-import time
-import requests
+#!/usr/bin/env python3
+"""Retired backup collector entry point; intentionally non-operational."""
 
-API_URL = "http://127.0.0.1:8000/api/measurements"
+from __future__ import annotations
 
-CAMERA_ID = 1
-ROI_ID = 4
+import sys
 
 
-def send_measurement():
-    payload = {
-        "camera_id": CAMERA_ID,
-        "roi_id": ROI_ID,
-        "min_temp": 32.0,
-        "max_temp": 42.0,
-        "mean_temp": 36.0,
-        "percentile_95_temp": 40.0,
-        "ambient_temp": 33.0,
-        "delta_temp": 9.0,
-        "over_temp_pixels": 0,
-        "max_hotspot_size": 0
-    }
-
-    response = requests.post(
-        API_URL,
-        json=payload,
-        timeout=10
+def main() -> int:
+    print(
+        "flir_collector_backup.py is retired and cannot send measurements. "
+        "Use `python dashboard.py` from the ThermoGuard project root.",
+        file=sys.stderr,
     )
+    return 2
 
-    print(response.json())
 
-
-while True:
-    send_measurement()
-    time.sleep(30)
+if __name__ == "__main__":
+    raise SystemExit(main())

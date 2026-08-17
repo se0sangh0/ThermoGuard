@@ -1,0 +1,15 @@
+# Direct production runtime dependencies for the supported Dashboard + FastAPI
+# service path.  Resolve these only with factory-runtime.constraints.txt.
+#
+# This file intentionally excludes legacy Flask/collector code, development
+# tools and the non-operational legacy PySpin SDK.  See README.ko.md.
+-c factory-runtime.constraints.txt
+fastapi
+uvicorn[standard]
+SQLAlchemy
+PyMySQL
+python-dotenv
+requests
+numpy
+Pillow
+opencv-python

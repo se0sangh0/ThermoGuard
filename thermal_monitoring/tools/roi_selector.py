@@ -31,11 +31,14 @@ from tkinter import messagebox
 import cv2
 import numpy as np
 
-from ..config import load_config, save_config, RoiEntry
+from ..config import load_config, save_collection_config, RoiEntry
+from ..operational_mode import exit_legacy_operation, reject_legacy_operation
 
-cfg = load_config()
-DATASET_DIR = cfg.paths.dataset_dir
-DISPLAY_WIDTH = cfg.display.display_width
+# This archived selector is never the supported operator entry point.  Keep
+# imports free of configuration I/O so a direct invocation cannot create a
+# default config before the safe dashboard-only exit message.
+DATASET_DIR = "thermal_dataset"
+DISPLAY_WIDTH = 800
 
 # ── UI 상수 ──
 BUTTON_BAR_HEIGHT = 44
@@ -317,7 +320,7 @@ def get_roi_box():
 
 def load_existing_rois():
     global rois, selected_idx
-    c = load_config()
+    c = load_config(force_reload=True)
     rois.clear()
     if c.roi.rois:
         for entry in c.roi.rois:
@@ -417,7 +420,7 @@ def _save_all_rois():
         c.roi.y1 = entries[0]["y1"]
         c.roi.x2 = entries[0]["x2"]
         c.roi.y2 = entries[0]["y2"]
-    save_config(c)
+    save_collection_config(c)
     print(f"[roi_selector] {len(entries)} ROI(s) saved to config.json in thermal 640×480 coordinates:")
     for e in entries:
         print(f"  {e['name']}: ({e['x1']},{e['y1']})-({e['x2']},{e['y2']})")
@@ -432,6 +435,7 @@ def _get_color(idx: int) -> tuple:
 # ───────────────────────────────────────────────────────────────
 
 def main(event_pump=None, display_bounds=None):
+    reject_legacy_operation("thermal_monitoring.tools.roi_selector.main()")
     global scale, selected_idx, rois, roi_start, roi_end, dragging
     global H_inv, use_visual, _running, _quit_flag, _save_flag
     global _canvas_h, _canvas_w, _image_x_offset, _display_image_h
@@ -459,7 +463,7 @@ def main(event_pump=None, display_bounds=None):
         sys.exit(1)
 
     # ── 가시광 ROI 편집에 필요한 Homography 확인 ──
-    HOMOGRAPHY_PATH = cfg.paths.homography_path
+    HOMOGRAPHY_PATH = "thermal_to_rgb.npy"
     if not visual_path or not os.path.isfile(visual_path):
         print("가시광 이미지를 찾을 수 없습니다. ROI는 가시광 이미지에서만 설정합니다.")
         return False
@@ -656,4 +660,4 @@ def main(event_pump=None, display_bounds=None):
 
 
 if __name__ == "__main__":
-    main()
+    exit_legacy_operation("python -m thermal_monitoring.tools.roi_selector")

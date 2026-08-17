@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import os
 
 from thermal_monitoring.analysis import notifier
 from thermal_monitoring.analysis.threshold import Status
@@ -36,6 +37,7 @@ def _dispatcher(logs):
 def test_configure_toggle_and_logout_persist_local_env(tmp_path, monkeypatch):
     env_path = tmp_path / ".env"
     env_path.write_text("KEEP_ME=value\n", encoding="utf-8")
+    os.chmod(env_path, 0o600)
     monkeypatch.setattr(notifier, "DOTENV_PATH", env_path)
     monkeypatch.setattr(notifier, "BOT_TOKEN", "")
     monkeypatch.setattr(notifier, "CHAT_ID", "")
@@ -57,6 +59,35 @@ def test_configure_toggle_and_logout_persist_local_env(tmp_path, monkeypatch):
     assert "CHAT_ID=" not in saved
     assert "TELEGRAM_ENABLED=false" in saved
     assert "KEEP_ME=value" in saved
+    assert (env_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_credential_update_hardens_owned_environment_file(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text("TELEGRAM_ENABLED=false\n", encoding="utf-8")
+    os.chmod(env_path, 0o664)
+    monkeypatch.setattr(notifier, "DOTENV_PATH", env_path)
+    monkeypatch.setattr(notifier, "BOT_TOKEN", "old-token")
+    monkeypatch.setattr(notifier, "CHAT_ID", "old-chat")
+    monkeypatch.setattr(notifier, "TELEGRAM_ENABLED", False)
+
+    notifier.configure("test-token", "-100123", persist=True)
+
+    assert notifier.BOT_TOKEN == "test-token"
+    assert notifier.CHAT_ID == "-100123"
+    assert (env_path.stat().st_mode & 0o777) == 0o600
+    saved = env_path.read_text(encoding="utf-8")
+    assert "BOT_TOKEN=test-token" in saved
+    assert "CHAT_ID=-100123" in saved
+
+
+def test_configure_rejects_newline_in_credential():
+    try:
+        notifier.configure("token\nINJECTED=true", "-100123", persist=False)
+    except ValueError as exc:
+        assert "줄바꿈" in str(exc)
+    else:
+        raise AssertionError("credential line injection must be rejected")
 
 
 def test_connection_validates_bot_and_chat(monkeypatch):
@@ -181,6 +212,28 @@ def test_save_delivery_result_falls_back_to_fastapi_url(monkeypatch):
     assert posted == [
         "http://default-fastapi.local:5000/api/notification-deliveries"
     ]
+
+
+def test_delivery_audit_failure_does_not_log_backend_url_or_error_text(monkeypatch):
+    logged = []
+    monkeypatch.setattr(
+        notifier.requests,
+        "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("backend-password-should-not-be-logged")
+        ),
+    )
+    monkeypatch.setattr(notifier._log, "error", lambda *args: logged.append(args))
+
+    result = notifier.save_delivery_result(
+        alert_id=12,
+        success=False,
+        backend_url="http://operator:backend-password@backend.local:8000",
+    )
+
+    assert result is False
+    rendered = " ".join(str(part) for entry in logged for part in entry)
+    assert "backend-password" not in rendered
 
 
 def test_send_alarm_keeps_telegram_result_separate_from_delivery_save(

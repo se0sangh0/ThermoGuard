@@ -75,7 +75,7 @@ def test_sync_rois_does_not_post_unchanged_definition(monkeypatch):
     assert roi_id_map == {"ROI-1": 12}
 
 
-def test_resolve_camera_id_falls_back_to_the_only_camera(monkeypatch):
+def test_resolve_camera_id_does_not_fall_back_to_unmatched_only_camera(monkeypatch):
     monkeypatch.setattr(
         roi_api_client.requests,
         "get",
@@ -88,8 +88,39 @@ def test_resolve_camera_id_falls_back_to_the_only_camera(monkeypatch):
         }),
     )
 
-    assert roi_api_client.resolve_camera_id(
-        "http://127.0.0.1:8000",
-        "CAM-01",
-        "192.168.0.51",
-    ) == 7
+    try:
+        roi_api_client.resolve_camera_id(
+            "http://127.0.0.1:8000",
+            "CAM-01",
+            "192.168.0.51",
+        )
+    except roi_api_client.RoiApiError as exc:
+        assert "찾지 못했습니다" in str(exc)
+    else:
+        raise AssertionError("an unmatched camera must not be selected by count")
+
+
+def test_resolve_camera_id_rejects_conflicting_code_and_ip(monkeypatch):
+    monkeypatch.setattr(
+        roi_api_client.requests,
+        "get",
+        lambda *_args, **_kwargs: FakeResponse({
+            "cameras": [
+                {"camera_id": 7, "camera_code": "CAM-01",
+                 "ip_address": "192.168.0.10"},
+                {"camera_id": 8, "camera_code": "CAM-02",
+                 "ip_address": "192.168.0.51"},
+            ]
+        }),
+    )
+
+    try:
+        roi_api_client.resolve_camera_id(
+            "http://127.0.0.1:8000",
+            "CAM-01",
+            "192.168.0.51",
+        )
+    except roi_api_client.RoiApiError as exc:
+        assert "서로 다른" in str(exc)
+    else:
+        raise AssertionError("conflicting camera identities must fail closed")

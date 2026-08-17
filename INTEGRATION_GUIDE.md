@@ -19,14 +19,36 @@ Dashboard와 기존 FastAPI 백엔드 사이의 연동 계약을 설명합니다
 DB 스키마는 확장 가능성을 유지하지만 현재 Product Dashboard에서 여러 카메라나
 여러 로봇을 선택·비교하는 운영 절차는 다루지 않습니다.
 
+## 운영 경로 정책
+
+실제 카메라 수집, 분석, 상태 전이, Telegram 전송, DB 기록은 반드시
+대시보드 런처가 호출하는 `python dashboard.py`로 시작합니다. 이 흐름을 별도 CLI나
+collector로 실행하면 동일 카메라와 데이터셋을 중복 처리할 수 있습니다. 공장
+런처는 `THERMOGUARD_CONFIG=/var/lib/thermoguard/config.json`,
+`THERMOGUARD_DASHBOARD_ENV=/var/lib/thermoguard/dashboard.env`,
+`THERMOGUARD_FACTORY_MODE=1`을 일관되게 지정한다. lock 경로는 코드에 고정된
+`/run/thermoguard/dashboard.lock`이며, tmpfiles가 root 소유 디렉터리와 파일을
+미리 만든다. Dashboard는 lock 파일을 읽고 flock만 잡으며 파일을 바꿀 수 없다.
+따라서 릴리스 디렉터리는 코드만 담는 불변 상태로 유지되고, 승인된 실행은 같은
+호스트 lock을 사용한다.
+GUI 프로세스 자체는 `dashboard.env`와 `config.json`의 소유자인 전용 `thermoguard`
+런타임 계정으로 실행한다. 그룹은 root가 만든 lock 파일의 read 권한을 제공할 뿐,
+다른 사용자에게 비밀 환경 파일 읽기·설정 파일 쓰기·lock 변경 권한을 허용하지
+않는다.
+
+- `monitor.py`, `pipeline.py`, `thermal_monitoring.pipeline.*`는 보관된 과거
+  구현이며 실행 시 종료됩니다.
+- `Project_hotspot/backend/collector/`도 차단된 과거 수집기입니다.
+- `hotspot-backend.service`는 FastAPI/MariaDB 연동을 제공하므로 대시보드와 함께
+  유지합니다. `hotspot-flir-collector.service`는 disabled 상태로 유지합니다.
+
 ## 진입점과 책임
 
 | 진입점 | 책임 |
 |---|---|
-| `python dashboard.py` | 실제 운영용 통합 GUI |
-| `python monitor.py` | 실시간 감시 시퀀서 |
-| `python pipeline.py` | 기존 파일 배치 분석 |
-| `uvicorn app:app ...` | FastAPI 백엔드 실행 |
+| `python dashboard.py` | **유일한 운영용 통합 GUI** |
+| `uvicorn app:app ...` | 대시보드의 FastAPI 백엔드 지원 서비스 |
+| `python monitor.py` / `python pipeline.py` | 차단된 과거 진입점 |
 
 Product Dashboard가 담당하는 작업:
 
@@ -88,7 +110,7 @@ from thermal_monitoring.analysis import (
 )
 ```
 
-데이터 관리와 파이프라인:
+데이터 관리 API는 대시보드 내부에서 사용합니다.
 
 ```python
 from thermal_monitoring.data import (
@@ -96,12 +118,6 @@ from thermal_monitoring.data import (
     run_cleanup,
     run_cleanup_if_due,
     run_metadata,
-)
-from thermal_monitoring.pipeline import (
-    MonitorSequencer,
-    monitor_main,
-    pipeline_main,
-    run_pipeline,
 )
 ```
 
@@ -115,17 +131,25 @@ from thermal_monitoring.pipeline import (
 ```python
 from thermal_monitoring import load_config, save_config
 
-cfg = load_config()
+cfg = load_config(strict=True)
 cfg.camera.ip = "192.168.0.51"
 cfg.monitoring.alarm_cooldown_sec = 600.0
 save_config(cfg)
 ```
 
-`load_config()`는 프로세스 안에서 값을 캐시합니다. 파일을 외부에서 바꾼 뒤 다시
-읽어야 한다면 다음처럼 강제 갱신합니다.
+운영 시작과 자동화 점검에는 항상 `strict=True`를 사용합니다. 이 모드는 누락·형식
+오류·위험한 데이터셋 경로를 기본값으로 바꾸지 않고 실패시킵니다. 새 설정은 문서의
+일부 JSON 조각이 아니라 저장소의 [config.example.json](config.example.json) 전체를
+복사해 작성합니다. 공장 설정은 `THERMOGUARD_CONFIG`가 가리키는 릴리스 밖의 일반
+파일이어야 하며, 심볼릭 링크로 대체하지 않습니다. 공장 모드에서는 `dataset_dir`,
+`overlay_dir`, `homography_path`도 절대 경로이며 불변 release 밖이어야 합니다.
+
+라이브러리 호환용 `load_config()`는 프로세스 안에서 값을 캐시합니다. 파일을 외부에서
+바꾼 뒤 다시 읽어야 한다면 다음처럼 강제 갱신합니다. 운영 프로세스 중 수동 편집과
+Dashboard 저장을 동시에 수행하지 않습니다.
 
 ```python
-cfg = load_config(force_reload=True)
+cfg = load_config(force_reload=True, strict=True)
 ```
 
 ### 문자열 ID와 DB ID
@@ -154,28 +178,15 @@ ROI 정보를 저장하면 `asset_api_client.py`와 `roi_api_client.py`가 정�
 
 ## 수집 연동
 
-```python
-from thermal_monitoring.capture import CaptureSession
-
-capture = CaptureSession(
-    cam_ip="192.168.0.51",
-    mode="both",
-    interval=30.0,
-    save_dir="thermal_dataset",
-)
-capture.start()
-```
+`CaptureSession`은 Product Dashboard가 소유합니다. 운영 중 직접 인스턴스를
+만들어 수집을 시작하지 마세요. 대시보드의 **촬영 시작/정지**와 **새로고침**을
+사용하면 현재 설정값과 상태 머신, DB 연동이 하나의 흐름으로 유지됩니다.
 
 주요 제어:
 
 ```python
-capture.set_warning_mode(True)   # warning_interval_sec, 기본 5초
-capture.set_warning_mode(False)  # capture_interval_sec, 기본 30초
-
-thermal_path, visual_path = capture.last_saved_pair
-
-capture.request_stop()           # 중단 신호만 설정, GUI를 기다리게 하지 않음
-capture.stop()                   # 중단 후 캡처 스레드 join 시도
+# ProductDashboard가 내부적으로 수행:
+# CaptureSession.start() / set_warning_mode() / request_stop()
 ```
 
 Warning 모드는 이름과 무관하게 Warning과 Critical에서 사용하는 빠른 수집
@@ -295,7 +306,8 @@ Dashboard는 MariaDB에 직접 연결하지 않습니다. 다음 기존 FastAPI 
 
 | 목적 | 메서드와 경로 |
 |---|---|
-| 연결 상태 | `GET /api/health` |
+| 프로세스 liveness | `GET /api/health` |
+| DB readiness | `GET /api/ready` (읽기 전용 DB 연결 검사) |
 | 카메라 확인 | `GET /api/cameras` |
 | 장비 계층 저장 | `POST /api/factories`, `/api/production-lines`, `/api/robots`, `/api/cameras` |
 | ROI 동기화 | `GET/POST /api/rois` |
@@ -303,6 +315,11 @@ Dashboard는 MariaDB에 직접 연결하지 않습니다. 다음 기존 FastAPI 
 | 측정 기록 | `POST /api/measurements` |
 | 이벤트 조회·확인 | `GET /api/alerts`, `PATCH /api/alerts/{alert_id}` |
 | 전송 결과 기록 | `POST /api/notification-deliveries` |
+
+`/api/health` 성공만으로 DB 준비가 보장되지는 않는다. 공장 전환 전에는 `/api/ready`와
+backend의 `schema_preflight.py --verify-fingerprint`를 모두 실행한다. fingerprint
+검사는 `SHOW TABLES`와 `SHOW CREATE TABLE`만 사용하며, 누락·drift를 발견해도 DB를
+자동 변경하지 않는다.
 
 ### 측정 요청 전제조건
 
@@ -333,9 +350,11 @@ captures
 
 응답의 `alert_id`는 `do_alarm=false`이면 `null`입니다.
 
-Telegram 작업자는 측정 POST 완료를 기다려 `alert_id`를 받은 뒤 알림을
-전송합니다. `alert_id`가 있어야 전송 성공 또는 실패를
-`notification_deliveries`에 연결할 수 있습니다.
+Critical Telegram 작업은 측정 POST 완료를 기다리지 않고 즉시 전송을 시도합니다.
+이미 준비된 `alert_id`가 있으면 전송 성공 또는 실패를 `notification_deliveries`에
+연결하지만, DB 지연·장애 중에는 `alert_id=None`으로 전송될 수 있습니다. 따라서
+Telegram 전달은 Critical 안전 경로이고, `notification_deliveries`는 best-effort
+감사 경로입니다. 둘 중 하나의 성공으로 다른 하나를 추론하면 안 됩니다.
 
 측정 요청이 `적용 가능한 threshold profile이 없습니다`로 거부되면 Dashboard는
 해당 `camera_id + roi_id`의 프로필을 동기화하고 동일 측정을 한 번만
@@ -348,9 +367,13 @@ Telegram 작업자는 측정 POST 완료를 기다려 `alert_id`를 받은 뒤 �
 ```dotenv
 BOT_TOKEN=
 CHAT_ID=
-TELEGRAM_ENABLED=true
+TELEGRAM_ENABLED=false
 FASTAPI_URL=http://127.0.0.1:8000
 ```
+
+공장에서는 이 값을 릴리스 내부 `.env`가 아니라
+`THERMOGUARD_DASHBOARD_ENV=/var/lib/thermoguard/dashboard.env`에 둡니다. 수신자와
+토큰을 검증한 뒤에만 `TELEGRAM_ENABLED=true`로 바꿉니다.
 
 Product Dashboard에서는 `TelegramDispatcher.maybe_dispatch()`가 다음을 모두
 만족하는 프레임만 전송합니다.
@@ -365,11 +388,14 @@ Product Dashboard에서는 `TelegramDispatcher.maybe_dispatch()`가 다음을 �
 전송 실패 건은 60초 백오프 후 재시도 대상으로 유지됩니다. Warning 프레임을
 Telegram으로 보내는 호출을 추가하면 현재 제품 규칙과 맞지 않습니다.
 
-저수준 `send_alarm()`을 직접 호출할 수는 있지만 운영 코드에서는 상태 머신과
-DB `alert_id` 연계를 보장하는 `TelegramDispatcher`를 거치는 것이 원칙입니다.
-`FASTAPI_URL`은 전송 결과를 `notification_deliveries`에 기록할 Backend 주소이며,
-생략하면 `http://127.0.0.1:8000`을 사용합니다. Dashboard의 `backend.url`을 원격
-주소로 바꿨다면 이 값도 같은 Backend를 가리키도록 설정해야 합니다.
+저수준 `send_alarm()`을 직접 호출할 수는 있지만 운영 코드에서는 상태 머신의
+Critical 승인·중복 방지·재시도를 담당하는 `TelegramDispatcher`를 거치는 것이
+원칙입니다. `FASTAPI_URL`은 전송 결과를 `notification_deliveries`에 기록하려고
+시도할 Backend 주소이며, 생략하면 `http://127.0.0.1:8000`을 사용합니다.
+Dashboard의 `backend.url`을 원격 주소로 바꿨다면 이 값도 같은 Backend를 가리키도록
+설정해야 합니다. DB audit 연결이 준비되지 않아도 Critical 전달 시도 자체는 지연되지
+않습니다. 전송 뒤 최대 15초 안에 `alert_id`를 얻으면 delivery 결과를 best-effort로
+기록하지만, Backend 지연·장애 시 감사 이력이 없을 수 있습니다.
 
 ## 데이터 관리
 
@@ -381,21 +407,23 @@ from thermal_monitoring.data import (
     run_metadata,
 )
 
-check_result = run_check(save_dir="thermal_dataset")
-metadata_result = run_metadata(save_dir="thermal_dataset")
+check_result = run_check(save_dir="/approved/dataset/subdirectory")
+metadata_result = run_metadata(save_dir="/approved/dataset/subdirectory")
 cleanup_result = run_cleanup(
-    save_dir="thermal_dataset",
+    save_dir="/approved/dataset/subdirectory",
     retention_days=2,
 )
 ```
 
-`run_cleanup_if_due()`의 내부 실행 간격은 현재 15분입니다. Product Dashboard는
-불필요한 호출을 줄이기 위해 1시간마다 실행 여부를 확인합니다. 이 간격은
-`MonitoringConfig`의 필드가 아니며 `cleanup_interval_sec` 설정도 존재하지
-않습니다. 설정에서 조정하는 값은 `cleanup_retention_days`입니다.
+`run_check`, `run_metadata`, `run_cleanup`, `run_cleanup_if_due`는 명시적 유지보수
+API입니다. Product Dashboard의 자동 타이머는 무결성 복구, metadata 재생성, 보존
+삭제를 호출하지 않습니다. 자동 삭제 간격이나 `cleanup_interval_sec` 설정은
+존재하지 않습니다.
 
 정리 작업은 보존 기간이 지난 Normal 파일 쌍과 고아 파일을 제거하고, 메타데이터에
-Warning/Critical 이력이 있는 쌍은 보존합니다.
+Warning/Critical 이력이 있는 쌍은 보존합니다. 삭제 전에 승인된 백업을 확인하고
+전용 데이터셋 하위 폴더에 `.thermoguard-dataset` marker를 명시적으로 만든 경우에만
+실행합니다. 볼륨 루트·홈·저장소 루트에는 marker 생성과 삭제가 거부되어야 정상입니다.
 
 ## 로그
 
@@ -417,13 +445,16 @@ rg "measurement POST|alert_id|Telegram|notification" logs/app.log
 
 ```bash
 sudo journalctl -u hotspot-backend.service -n 200 --no-pager
-sudo journalctl -u hotspot-flir-collector.service -n 200 --no-pager
 ```
+
+`hotspot-flir-collector.service`는 비운영 상태이므로 시작하거나 로그를 운영
+점검 대상으로 사용하지 않습니다.
 
 ## 검증
 
 ```bash
-python -m pytest -q
+python -m pytest -q \
+  --deselect tests/test_overlay.py::OverlayIntegrationTests::test_latest_dataset_overlay
 ```
 
 핵심 회귀 테스트:
@@ -435,11 +466,17 @@ python -m pytest -q
 | `test_threshold_api_client.py` | ROI별 threshold 생성·갱신과 오류 전달 |
 | `test_backend_measurement_contract.py` | 측정/이벤트 요청 계약 |
 | `test_telegram_dispatcher.py` | Critical 전송과 `alert_id` 연결 |
+| `test_operational_entrypoints.py` | 대시보드 단일 운영 경로와 구형 진입점 차단 |
+| `test_runtime_lock.py` | 호스트 공용 대시보드 lock과 중복 실행 차단 |
+| `test_config_safety.py` | 엄격한 현장 설정과 원자적 저장 |
+| `test_cleanup_safety.py` | marker 없는/위험한 경로의 삭제 거부 |
+| `test_schema_preflight.py` | 읽기 전용 스키마·fingerprint 점검 |
 | `test_threshold.py` | Warning 미전송, Critical 상태 전환과 쿨다운 |
 | `test_product_dashboard_calibration.py` | 기존 캘리브레이션 함수 호출 |
 | `test_dashboard_regressions.py` | Dashboard 회귀 조건 |
 
-최종 확인 결과는 **52 passed, 1 skipped**입니다.
+테스트 수는 릴리스마다 달라질 수 있으므로, 전환 기록에는 해당 승인 릴리스에서 나온
+실제 결과와 실행 환경을 남깁니다.
 
 ## 문제 해결
 
@@ -470,9 +507,9 @@ Critical 최초 진입이어야 하는데도 없다면 `logs/app.log`에서 `do_
 
 ### Telegram은 왔는데 `notification_deliveries`가 없음
 
-전송 시점에 Backend 측정 POST가 성공하여 `alert_id`를 반환했는지 확인합니다.
-`alert_id=None`이면 Telegram은 전송될 수 있어도 DB 전송 이력과 연결할 수
-없습니다.
+전송 시점 또는 그 뒤 최대 15초 안에 Backend 측정 POST가 `alert_id`를 반환했는지
+확인합니다. `alert_id=None` 상태가 지속되거나 Backend 기록이 실패하면 Telegram은
+전송될 수 있어도 DB 전송 이력과 연결되지 않을 수 있습니다.
 
 MariaDB 조회 시 실제 컬럼명을 먼저 확인합니다.
 

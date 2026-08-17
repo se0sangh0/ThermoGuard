@@ -101,6 +101,51 @@ def test_open_calibration_treats_api_cancel_as_unsaved(monkeypatch, tmp_path):
     assert ("캘리브레이션", "종료", "저장 없이 종료") in logs
 
 
+def test_roi_precheck_resolves_relative_calibration_from_config(
+    monkeypatch, tmp_path
+):
+    config_dir = tmp_path / "home" / "operator" / ".config" / "thermoguard"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    (config_dir / "thermal_to_rgb.npy").touch()
+    service_cwd = tmp_path / "service-cwd"
+    service_cwd.mkdir()
+    monkeypatch.chdir(service_cwd)
+    monkeypatch.setenv("THERMOGUARD_CONFIG", str(config_path))
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    thermal = dataset / "20260729120000_000001.jpg"
+    visual = dataset / "20260729120000_000001_visual.jpg"
+    thermal.touch()
+    visual.touch()
+    dialog = SettingsDialog.__new__(SettingsDialog)
+    dialog.d = SimpleNamespace(
+        cfg=SimpleNamespace(
+            paths=SimpleNamespace(
+                dataset_dir=str(dataset),
+                homography_path="thermal_to_rgb.npy",
+            )
+        )
+    )
+    dialog.win = object()
+    dialog._require_factory_capture_quiescent = lambda _action: True
+    started = []
+    dialog._begin_tool = lambda name: started.append(name) or False
+    warnings = []
+    monkeypatch.setattr(
+        product_dashboard.messagebox,
+        "showwarning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    dialog.open_roi_editor()
+
+    assert started == ["ROI 설정"]
+    assert warnings == []
+
+
 def test_open_calibration_restores_tool_state_after_api_error(
     monkeypatch,
     tmp_path,

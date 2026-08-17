@@ -9,12 +9,12 @@ import time
 from collections import deque
 
 from thermal_monitoring._encoding import setup_encoding
-from thermal_monitoring.config import load_config
+from thermal_monitoring.config import AppConfig
 from thermal_monitoring.analysis.threshold import Status, MonitorState, evaluate_threshold, should_alarm
 
 setup_encoding()
 
-cfg = load_config()
+cfg = AppConfig()
 
 # ============================================================
 # 테스트 설정 (config.json 기준)

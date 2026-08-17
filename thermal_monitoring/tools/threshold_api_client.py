@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Iterable
 
 import requests
@@ -55,6 +56,34 @@ def _optional_int(value) -> int | None:
         return None
 
 
+def _validate_threshold_values(
+    *,
+    baseline_temp: float,
+    warning_delta: float,
+    critical_delta: float,
+    min_hotspot_size: int,
+    min_hotspot_size_max: int,
+    alarm_cooldown_sec: float,
+) -> None:
+    """Match the FastAPI threshold policy before making any network call."""
+
+    if not all(
+        math.isfinite(float(value))
+        for value in (baseline_temp, warning_delta, critical_delta, alarm_cooldown_sec)
+    ):
+        raise ThresholdApiError("Threshold 값은 유한한 숫자여야 합니다.")
+    if not 0 < float(warning_delta) < float(critical_delta):
+        raise ThresholdApiError(
+            "Threshold는 0 < warning_delta < critical_delta를 만족해야 합니다."
+        )
+    if int(min_hotspot_size) <= 0 or int(min_hotspot_size_max) <= 0:
+        raise ThresholdApiError("Hotspot 크기는 양수여야 합니다.")
+    if int(min_hotspot_size) > int(min_hotspot_size_max):
+        raise ThresholdApiError("min_hotspot_size가 최대값보다 클 수 없습니다.")
+    if float(alarm_cooldown_sec) < 0:
+        raise ThresholdApiError("alarm_cooldown_sec는 음수일 수 없습니다.")
+
+
 def sync_threshold_profiles(
     *,
     base_url: str,
@@ -69,6 +98,14 @@ def sync_threshold_profiles(
     alarm_cooldown_sec: float,
 ) -> ThresholdSyncResult:
     """Create or update the active exact-match profile for every DB ROI."""
+    _validate_threshold_values(
+        baseline_temp=baseline_temp,
+        warning_delta=warning_delta,
+        critical_delta=critical_delta,
+        min_hotspot_size=min_hotspot_size,
+        min_hotspot_size_max=min_hotspot_size_max,
+        alarm_cooldown_sec=alarm_cooldown_sec,
+    )
     normalized_roi_ids = tuple(
         sorted({
             normalized
@@ -77,13 +114,14 @@ def sync_threshold_profiles(
         })
     )
     normalized_camera_id = int(camera_id)
-    if not normalized_roi_ids:
-        return ThresholdSyncResult(
-            camera_id=normalized_camera_id,
-            roi_ids=(),
-            created=0,
-            updated=0,
-        )
+    # Before ROI commissioning, persist one camera-wide fallback profile.  The
+    # backend measurement contract explicitly selects an exact ROI profile
+    # first and this fallback second.  This keeps Settings atomic even when no
+    # DB ROI ID exists yet: successful FastAPI persistence still precedes the
+    # local config replacement.
+    target_roi_ids: tuple[int | None, ...] = (
+        normalized_roi_ids if normalized_roi_ids else (None,)
+    )
 
     root = base_url.rstrip("/")
     payload = _request(
@@ -97,7 +135,7 @@ def sync_threshold_profiles(
             "Threshold 조회 응답에 thresholds 목록이 없습니다."
         )
 
-    active_by_roi: dict[int, list[dict]] = {}
+    active_by_roi: dict[int | None, list[dict]] = {}
     for threshold in thresholds:
         if not isinstance(threshold, dict):
             continue
@@ -105,7 +143,7 @@ def sync_threshold_profiles(
         threshold_roi_id = _optional_int(threshold.get("roi_id"))
         if (
             threshold_camera_id != normalized_camera_id
-            or threshold_roi_id not in normalized_roi_ids
+            or threshold_roi_id not in target_roi_ids
             or threshold.get("valid_to") is not None
         ):
             continue
@@ -121,7 +159,7 @@ def sync_threshold_profiles(
     }
     created = 0
     updated = 0
-    for roi_id in normalized_roi_ids:
+    for roi_id in target_roi_ids:
         matching = active_by_roi.get(roi_id, [])
         if matching:
             latest = max(
@@ -131,7 +169,8 @@ def sync_threshold_profiles(
             threshold_id = _optional_int(latest.get("threshold_id"))
             if threshold_id is None:
                 raise ThresholdApiError(
-                    f"ROI {roi_id}의 threshold_id를 확인할 수 없습니다."
+                    f"ROI {roi_id if roi_id is not None else 'camera-wide'}의 "
+                    "threshold_id를 확인할 수 없습니다."
                 )
             update = _request(
                 "PATCH",
@@ -141,7 +180,8 @@ def sync_threshold_profiles(
             )
             if update.get("status") != "updated":
                 raise ThresholdApiError(
-                    f"ROI {roi_id} threshold 수정 응답이 올바르지 않습니다: "
+                    f"ROI {roi_id if roi_id is not None else 'camera-wide'} "
+                    "threshold 수정 응답이 올바르지 않습니다: "
                     f"{update}"
                 )
             updated += 1
@@ -159,7 +199,8 @@ def sync_threshold_profiles(
         )
         if create.get("status") != "created" or create.get("threshold_id") is None:
             raise ThresholdApiError(
-                f"ROI {roi_id} threshold 생성 응답이 올바르지 않습니다: "
+                f"ROI {roi_id if roi_id is not None else 'camera-wide'} "
+                "threshold 생성 응답이 올바르지 않습니다: "
                 f"{create}"
             )
         created += 1

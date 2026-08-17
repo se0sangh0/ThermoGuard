@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import re
 import threading
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import requests
@@ -34,18 +36,31 @@ from ..analysis.threshold import (
     apply_roi_state_updates,
 )
 from ..capture.capture import CaptureSession, camera_image_url
-from ..capture.gige_backend import GigeTemperatureReader
 from ..data import pairs
-from ..data.checking import run_check
-from ..data.cleanup import run_cleanup_if_due, remove_normal_pairs_if_due
 from ..data.metadata import run_metadata
 from ..data.pairs import capture_time_from_file, latest_analysis_pair
 from ..data.quality import assess_image_quality
-from ..config import load_config, save_config
+from ..config import (
+    PROJECT_ROOT,
+    ConfigValidationError,
+    bounded_backend_timeout,
+    factory_mode_enabled,
+    load_config,
+    resolve_runtime_path,
+    save_collection_config,
+    validate_config,
+)
 from ..logger import get_logger
+from ..runtime_lock import dashboard_runtime_scope
 from .telegram_dispatcher import TelegramDispatcher
 
 _file_log = get_logger("tools.dashboard")
+
+# Legacy PySpin support is deliberately lazy and is not imported by the
+# supported HTTP REST + ExifTool dashboard path.  Keeping the symbol allows a
+# separately qualified legacy caller to opt in without making PySpin a factory
+# startup dependency.
+GigeTemperatureReader = None
 
 try:
     RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
@@ -98,6 +113,7 @@ class ProductDashboard:
     TREND_HISTORY_DAYS = 7
     TREND_API_LIMIT = 150000
     TREND_DRAW_POINTS = 1000
+    GIGE_READY_TIMEOUT_SEC = 10.0
     HISTORY_PERIODS = {
         "1시간": 1,
         "1일": 24,
@@ -112,14 +128,24 @@ class ProductDashboard:
         self.root.minsize(1180, 760)
         self.root.configure(bg=COLORS["bg"])
 
+        # This installation is used for supervised data collection.  Preserve
+        # the historical permissive loader so the current site config can open
+        # the GUI even when it does not satisfy factory commissioning policy.
         self.cfg = load_config(force_reload=True)
         self.lifecycle = "running"  # running -> closing -> closed
         self.monitoring = False
         self.capture_paused_by_user = False
+        self._commissioning_block_announced = False
         self.capture: Optional[CaptureSession] = None
+        self._stopping_capture: Optional[CaptureSession] = None
+        self._restart_after_capture_stop = False
         self.timer_id: Optional[str] = None
+        self._ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._ui_dispatch_timer: Optional[str] = None
         self.processed: set[str] = set()
-        self.state = MonitorState()
+        self.state = MonitorState(
+            alarm_cooldown=float(self.cfg.monitoring.alarm_cooldown_sec)
+        )
         self.metrics = RuntimeMetrics()
         self.latest_result: Optional[RoiResult] = None
         self.latest_status = Status.NORMAL          # 표시용(raw) 이전 상태
@@ -140,6 +166,8 @@ class ProductDashboard:
         self.alert_range_label: Optional[ttk.Label] = None
         self.operating_logs: list[tuple[str, str, str, str]] = []
         self.operating_log_window: Optional[tk.Toplevel] = None
+        self.operating_log_summary_label: Optional[ttk.Label] = None
+        self.operating_log_tree: Optional[ttk.Treeview] = None
         self._operating_log_opening = False
         self.settings_dialog: Optional[SettingsDialog] = None
         self.temperature_history: list[tuple[datetime, float]] = []
@@ -155,16 +183,30 @@ class ProductDashboard:
         self._connection_ok: Optional[bool] = None
         self._connection_check_running = False
         self._resume_after_connection_check = False
+        self._connection_retry_timer: Optional[str] = None
+        self._connection_retry_attempt = 0
         self._last_quality_capture_id: Optional[str] = None
         self._latest_pair_quality_ok = False
         self._latest_pair_fresh = False
         self._last_successful_capture_at: Optional[datetime] = None
+        self._capture_started_at: Optional[datetime] = None
+        self._capture_stale_announced = False
 
         # GigE 5초 프로브
         self._gige_reader: Optional[GigeTemperatureReader] = None
+        # A reader that timed out during shutdown retains its SDK ownership
+        # until its own worker has left GetNextImage and completed cleanup.
+        self._stopping_gige_reader: Optional[GigeTemperatureReader] = None
         self._gige_probe_timer: Optional[str] = None
+        self._gige_stop_wait_timer: Optional[str] = None
+        self._gige_ready_timer: Optional[str] = None
+        self._gige_ready_deadline: Optional[float] = None
+        self._gige_failure_announced = False
 
         self._analysis_executor = ThreadPoolExecutor(max_workers=1)
+        # Slow storage scans and backend calls must never queue ahead of live
+        # image analysis and critical alarm evaluation.
+        self._maintenance_executor = ThreadPoolExecutor(max_workers=1)
         self._analysis_running = False
         self._analysis_pending = False
         self._analysis_generation = 0
@@ -177,6 +219,7 @@ class ProductDashboard:
 
         self._configure_style()
         self._build_ui()
+        self._ui_dispatch_timer = self.root.after(50, self._drain_ui_queue)
         self._set_system_state("확인 중", COLORS["orange"])
         self._check_connection_async()
         self._schedule_refresh(1000)
@@ -215,6 +258,49 @@ class ProductDashboard:
             foreground=[("active", "white"), ("pressed", "white")],
         )
         style.configure("Side.TButton", font=("맑은 고딕", 11, "bold"), padding=11)
+
+    # ── Tk thread handoff ─────────────────────────────────────
+
+    def _post_to_ui(self, callback: Callable[[], None]) -> bool:
+        """Queue worker results for execution only by the Tk main thread.
+
+        Calling ``root.after`` directly from worker threads races Tk teardown.
+        A queue lets shutdown discard pending callbacks without a worker ever
+        touching the destroyed interpreter.
+        """
+        if getattr(self, "lifecycle", None) != "running":
+            return False
+        ui_queue = getattr(self, "_ui_queue", None)
+        if ui_queue is None:
+            return False
+        ui_queue.put(callback)
+        return True
+
+    def _drain_ui_queue(self) -> None:
+        self._ui_dispatch_timer = None
+        if self.lifecycle != "running":
+            return
+        for _ in range(100):
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                _file_log.exception("dashboard UI callback failed")
+        if self.lifecycle == "running":
+            try:
+                self._ui_dispatch_timer = self.root.after(50, self._drain_ui_queue)
+            except tk.TclError:
+                self.lifecycle = "closed"
+
+    def _discard_ui_callbacks(self) -> None:
+        while True:
+            try:
+                self._ui_queue.get_nowait()
+            except queue.Empty:
+                return
 
     def _build_ui(self):
         self._build_header()
@@ -281,7 +367,7 @@ class ProductDashboard:
                  font=("맑은 고딕", 11, "bold")).pack(side="left", padx=14)
         controls = tk.Frame(toolbar, bg=COLORS["panel"])
         controls.pack(side="right", padx=8, pady=7)
-        self.capture_toggle_button = ttk.Button(controls, text="■  촬영 정지", style="Action.TButton",
+        self.capture_toggle_button = ttk.Button(controls, text="▶  촬영 시작", style="Action.TButton",
                                                 command=self.toggle_capture)
         self.capture_toggle_button.pack(side="left", padx=3)
         self.refresh_button = ttk.Button(controls, text="↻  새로고침", style="Action.TButton",
@@ -327,7 +413,7 @@ class ProductDashboard:
         self._update_carousel_navigation()
         if self.carousel_expanded:
             if self.cfg.backend.enabled:
-                self._analysis_executor.submit(self._sync_temperature_history)
+                self._maintenance_executor.submit(self._sync_temperature_history)
             self.root.after_idle(self._draw_temperature_trend)
 
     def _on_trend_period_changed(self, _event=None):
@@ -336,7 +422,7 @@ class ProductDashboard:
         self.trend_title_label.configure(text="최근 전체온도추이")
         self._draw_temperature_trend()
         if self.cfg.backend.enabled:
-            self._analysis_executor.submit(self._sync_temperature_history)
+            self._maintenance_executor.submit(self._sync_temperature_history)
 
     def _set_carousel_expanded(self, expanded):
         self.carousel_expanded = expanded
@@ -638,7 +724,7 @@ class ProductDashboard:
 
     def _refresh_alert_history(self):
         if self.cfg.backend.enabled:
-            self._analysis_executor.submit(self._sync_events_from_backend)
+            self._maintenance_executor.submit(self._sync_events_from_backend)
         else:
             self._render_alert_cards()
 
@@ -933,6 +1019,11 @@ class ProductDashboard:
         self.header_state.configure(text=f"● {text}", fg=color)
 
     def _check_connection_async(self, resume_on_success=False):
+        capture = getattr(self, "capture", None)
+        if capture is not None and capture.running:
+            # CaptureSession owns every camera request while active.  A second
+            # dashboard GET here amplifies a camera-busy failure into a storm.
+            return
         self._resume_after_connection_check |= bool(resume_on_success)
         if self._connection_check_running or self.lifecycle != "running":
             return
@@ -957,9 +1048,36 @@ class ProductDashboard:
                 self.metrics.exception_count += 1
             if result["ok"]:
                 self.metrics.connection_successes += 1
-            if self.lifecycle == "running":
-                self.root.after(0, lambda: self._connection_result(result))
+            self._post_to_ui(lambda: self._connection_result(result))
         threading.Thread(target=work, daemon=True).start()
+
+    def _schedule_connection_retry(self) -> None:
+        """Retry an unavailable camera with bounded backoff unless user-paused."""
+        if (
+            self.lifecycle != "running"
+            or self.capture_paused_by_user
+            or self._connection_retry_timer is not None
+        ):
+            return
+        self._connection_retry_attempt = min(self._connection_retry_attempt + 1, 6)
+        delay_ms = min(60_000, 1_000 * (2 ** self._connection_retry_attempt))
+        self._connection_retry_timer = self.root.after(
+            delay_ms,
+            self._run_connection_retry,
+        )
+
+    def _run_connection_retry(self) -> None:
+        self._connection_retry_timer = None
+        if self.lifecycle == "running" and not self.capture_paused_by_user:
+            self._check_connection_async()
+
+    def _cancel_connection_retry(self) -> None:
+        if self._connection_retry_timer:
+            try:
+                self.root.after_cancel(self._connection_retry_timer)
+            except tk.TclError:
+                pass
+            self._connection_retry_timer = None
 
     def _connection_result(self, result):
         self._connection_check_running = False
@@ -973,6 +1091,8 @@ class ProductDashboard:
             error_kind=result.get("error_kind"),
         )
         if ok:
+            self._cancel_connection_retry()
+            self._connection_retry_attempt = 0
             self._add_operating_log("연결", "성공", f"카메라 {self.cfg.camera.ip} 응답 확인")
             if resume_on_success:
                 self.capture_paused_by_user = False
@@ -989,27 +1109,77 @@ class ProductDashboard:
                 else result.get("error_kind") or "응답 없음"
             )
             self._add_operating_log("연결", "실패", f"카메라 {self.cfg.camera.ip} · {detail}")
-            if resume_on_success:
-                self.capture_toggle_button.configure(text="▶  촬영 시작", state="normal")
+            self.capture_toggle_button.configure(text="▶  촬영 시작", state="normal")
+            self._schedule_connection_retry()
         self._update_connection_stability_display()
         self._update_metric_text()
 
     def start_monitoring(self):
         if self.monitoring or self.lifecycle != "running":
             return
+        if self._stopping_capture is not None:
+            self._restart_after_capture_stop = True
+            self.capture_toggle_button.configure(
+                text="이전 촬영 종료 대기...",
+                state="disabled",
+            )
+            return
         self.capture_paused_by_user = False
+        self._restart_after_capture_stop = False
+        self._cancel_connection_retry()
+
+        self._start_capture_session()
+
+    def _start_capture_session(self) -> None:
+        """Start HTTP capture only after every required safety input is ready."""
+
+        if self.monitoring or self.lifecycle != "running":
+            return
         self.monitoring = True
-        self.capture_toggle_button.configure(text="■  촬영 정지")
+        self.capture_toggle_button.configure(text="■  촬영 정지", state="normal")
+
+        probe_state = {"elevated": False}
+
+        def _probe_callback(max_temp: float) -> bool:
+            threshold = (
+                float(self.cfg.roi.baseline_temp)
+                + float(self.cfg.roi.warning_delta)
+            )
+            elevated = max_temp >= threshold
+            if elevated and not probe_state["elevated"]:
+                self._post_to_ui(
+                    lambda temp=max_temp, limit=threshold: (
+                        self._add_operating_log(
+                            "HTTP 프로브",
+                            "경고",
+                            f"{temp:.1f}°C (threshold {limit:.1f}°C) - 즉시 전체 촬영",
+                        ),
+                        self._schedule_refresh(100),
+                    )
+                )
+            probe_state["elevated"] = elevated
+            return elevated
+
+        def _status_callback(state: str, detail: str) -> None:
+            self._post_to_ui(
+                lambda current=state, message=detail: self._handle_capture_status(
+                    current,
+                    message,
+                )
+            )
 
         self.capture = CaptureSession(
             cam_ip=self.cfg.camera.ip, mode=self.cfg.tools.mode,
-            interval=max(10.0, float(self.cfg.camera.capture_interval_sec)),
+            interval=float(self.cfg.camera.capture_interval_sec),
+            probe_interval=float(self.cfg.camera.warning_interval_sec),
             save_dir=self.cfg.paths.dataset_dir, log_callback=self._capture_log,
+            probe_callback=_probe_callback,
+            status_callback=_status_callback,
+            cfg=self.cfg,
         )
         self.capture.start()
-
-        # GigE 5초 온도 프로브 (PySpin 미설치 시 무시)
-        self._start_gige_probe()
+        self._capture_started_at = datetime.now()
+        self._capture_stale_announced = False
 
     def toggle_capture(self):
         """현장 사용자가 촬영만 정지하거나 다시 시작할 수 있게 한다."""
@@ -1022,48 +1192,178 @@ class ProductDashboard:
             self._check_connection_async(resume_on_success=True)
 
     def stop_monitoring(self):
-        if not self.monitoring:
+        if (
+            not self.monitoring
+            and self._stopping_capture is None
+            and self._gige_reader is None
+            and self._stopping_gige_reader is None
+            and self._gige_ready_timer is None
+        ):
             return
         self.capture_paused_by_user = True
+        self._cancel_connection_retry()
         self.monitoring = False
         self._stop_gige_probe()
         capture = self.capture
         self.capture = None
         if capture:
             capture.request_stop()
+            self._stopping_capture = capture
+            self._wait_for_capture_stop(capture, restart=False)
         self.capture_toggle_button.configure(text="▶  촬영 시작")
         self._set_system_state("촬영 정지", COLORS["orange"])
         self._add_operating_log("캡처", "성공", "사용자가 촬영을 정지함")
 
+    def _wait_for_capture_stop(self, capture: CaptureSession, *, restart: bool) -> None:
+        """Poll a stop request without blocking Tk, then optionally restart.
+
+        Camera HTTP requests can take up to ten seconds.  Starting a replacement
+        before the old thread leaves would create concurrent camera traffic.
+        """
+        if self.lifecycle != "running":
+            return
+        if capture.wait_stopped(timeout=0):
+            if self._stopping_capture is capture:
+                self._stopping_capture = None
+            should_restart = restart or self._restart_after_capture_stop
+            self._restart_after_capture_stop = False
+            if should_restart and not self.capture_paused_by_user:
+                self.capture_toggle_button.configure(text="▶  촬영 시작", state="normal")
+                self.start_monitoring()
+            elif self.lifecycle == "running":
+                self.capture_toggle_button.configure(text="▶  촬영 시작", state="normal")
+            return
+        try:
+            self.root.after(100, lambda: self._wait_for_capture_stop(capture, restart=restart))
+        except tk.TclError:
+            pass
+
     def _capture_log(self, message: str):
+        self._post_to_ui(lambda: self._handle_capture_log(message))
+
+    def _handle_capture_log(self, message: str):
+        """Handle capture-thread messages from the Tk main thread only."""
+        if self.lifecycle != "running":
+            return
         if "saved" in message:
             self.metrics.capture_attempts += 1; self.metrics.capture_successes += 1
+            self._last_successful_capture_at = datetime.now()
+            self._capture_stale_announced = False
             self._add_operating_log("캡처", "성공", message)
             self._record_api_result(True)
         elif any(word in message.lower() for word in ("error", "timeout", "http", "connection")):
             self.metrics.capture_attempts += 1; self.metrics.exception_count += 1
             self._add_operating_log("캡처", "실패", message)
             self._record_api_message(message)
-            self.root.after(0, self._check_connection_async)
-        self.root.after(0, self._update_connection_stability_display)
-        self._update_metric_text_async()
+        self._update_connection_stability_display()
+        self._update_metric_text()
+
+    def _handle_capture_status(self, state: str, detail: str) -> None:
+        """Reflect CaptureSession state without issuing another camera GET."""
+        if self.lifecycle != "running":
+            return
+        if state == "disconnected":
+            self._connection_ok = False
+            self._set_system_state("연결 없음", COLORS["red"])
+            self._add_operating_log("카메라", "실패", detail)
+        elif state in {"degraded", "backoff"}:
+            self._set_system_state("카메라 응답 대기", COLORS["orange"])
+            self._add_operating_log("카메라", "경고", detail)
+        elif state == "recovered":
+            self._connection_ok = True
+            self._set_system_state("정상 운영 중", COLORS["green"])
+            self._add_operating_log("카메라", "복구", detail)
 
     # ── GigE 5초 프로브 ─────────────────────────────────────
 
-    def _start_gige_probe(self):
-        """GigE Vision 5초 주기 온도 프로브를 시작한다. 실패 시 무시."""
+    def _start_gige_probe(self) -> bool:
+        """Legacy opt-in PySpin reader; not called by the dashboard runtime."""
         if not self.cfg.camera.gige_enabled:
+            return True
+        if self._gige_reader is not None:
+            return True
+        if self._stopping_gige_reader is not None:
+            # Never create another PySpin session until the previous worker
+            # has released its SDK resources.
+            self._wait_for_gige_stop(self._stopping_gige_reader)
+            return False
+        try:
+            reader_factory = GigeTemperatureReader
+            if reader_factory is None:
+                from ..capture.gige_backend import GigeTemperatureReader as reader_factory
+            reader = reader_factory(device_index=self.cfg.camera.gige_device_index)
+            if not reader.start():
+                return False
+        except Exception as exc:
+            _file_log.error("required GigE reader initialization failed (%s)", type(exc).__name__)
+            return False
+        self._gige_reader = reader
+        self._add_operating_log("GigE", "시작", "온도 프레임 수신 대기")
+        return True
+
+    def _wait_for_required_gige_ready(self) -> None:
+        """Poll GigE readiness without blocking Tk or starting HTTP capture."""
+
+        self._gige_ready_timer = None
+        if self.lifecycle != "running":
+            return
+        reader = self._gige_reader
+        if reader is None or reader.stopped:
+            self._fail_closed_gige("GigE 온도 프로브가 준비 전에 종료되었습니다.")
+            return
+        temperature = reader.read_temperature()
+        if reader.connected and temperature is not None:
+            self._gige_ready_deadline = None
+            self._gige_failure_announced = False
+            self._add_operating_log(
+                "GigE", "성공", f"필수 온도 프로브 준비 완료 ({temperature:.1f}°C)"
+            )
+            self._start_capture_session()
+            return
+        deadline = self._gige_ready_deadline or time.monotonic()
+        if time.monotonic() >= deadline:
+            self._fail_closed_gige(
+                f"{self.GIGE_READY_TIMEOUT_SEC:.0f}초 안에 GigE 온도 프레임을 받지 못했습니다."
+            )
             return
         try:
-            reader = GigeTemperatureReader(device_index=self.cfg.camera.gige_device_index)
-        except Exception:
-            return
-        if not reader.start():
-            return
-        self._gige_reader = reader
-        self._add_operating_log("GigE", "성공", "리더 연결 완료")
-        # 리더 연결 즉시 5초 프로브 타이머 시작
-        self._schedule_gige_probe()
+            self._gige_ready_timer = self.root.after(
+                100,
+                self._wait_for_required_gige_ready,
+            )
+        except tk.TclError:
+            pass
+
+    def _fail_closed_gige(self, reason: str) -> None:
+        """Stop all collection when the configured factory GigE input is lost."""
+
+        self._gige_ready_deadline = None
+        if getattr(self, "_gige_ready_timer", None):
+            try:
+                self.root.after_cancel(self._gige_ready_timer)
+            except tk.TclError:
+                pass
+            self._gige_ready_timer = None
+        self.capture_paused_by_user = True
+        self.monitoring = False
+        self._restart_after_capture_stop = False
+        self._cancel_connection_retry()
+        self._stop_gige_probe()
+        capture, self.capture = self.capture, None
+        if capture is not None:
+            capture.request_stop()
+            self._stopping_capture = capture
+            self._wait_for_capture_stop(capture, restart=False)
+        self.capture_toggle_button.configure(text="GigE 점검 필요", state="normal")
+        self._set_system_state("GigE 필수 프로브 장애 · 수집 정지", COLORS["red"])
+        self._add_operating_log("GigE", "차단", reason)
+        if not self._gige_failure_announced:
+            self._gige_failure_announced = True
+            messagebox.showerror(
+                "GigE 필수 프로브 장애",
+                f"{reason}\n\nHTTP 촬영을 포함한 모든 수집을 안전 정지했습니다.",
+                parent=self.root,
+            )
 
     def _start_gige_timer(self):
         """5초 GigE 프로브 타이머를 시작한다. 이미 실행 중이면 무시."""
@@ -1088,7 +1388,18 @@ class ProductDashboard:
         if not self.monitoring or self._gige_reader is None:
             self._gige_probe_timer = None
             return
-        temp = self._gige_reader.read_temperature()
+        reader = self._gige_reader
+        if factory_mode_enabled() and (
+            reader.stopped or not reader.connected
+        ):
+            self._gige_probe_timer = None
+            self._fail_closed_gige("운영 중 GigE 온도 프레임이 중단되었습니다.")
+            return
+        temp = reader.read_temperature()
+        if factory_mode_enabled() and temp is None:
+            self._gige_probe_timer = None
+            self._fail_closed_gige("운영 중 GigE 온도값을 읽을 수 없습니다.")
+            return
         if temp is not None:
             threshold = self.cfg.roi.baseline_temp + self.cfg.roi.warning_delta
             capture = self.capture
@@ -1106,12 +1417,46 @@ class ProductDashboard:
             self._schedule_gige_probe()
 
     def _stop_gige_probe(self):
-        """GigE 프로브를 완전히 중지하고 리소스를 정리한다."""
+        """Request GigE shutdown without releasing SDK objects from Tk's thread."""
+        if getattr(self, "_gige_ready_timer", None):
+            try:
+                self.root.after_cancel(self._gige_ready_timer)
+            except tk.TclError:
+                pass
+            self._gige_ready_timer = None
+        self._gige_ready_deadline = None
         self._stop_gige_timer()
         reader, self._gige_reader = self._gige_reader, None
         if reader is not None:
-            reader.stop()
-            self._add_operating_log("GigE", "성공", "온도 프로브 정지")
+            reader.request_stop()
+            self._stopping_gige_reader = reader
+            self._wait_for_gige_stop(reader)
+
+    def _wait_for_gige_stop(self, reader: GigeTemperatureReader) -> None:
+        """Poll a GigE stop without freezing the dashboard UI.
+
+        ``GigeTemperatureReader`` performs PySpin cleanup in its acquisition
+        worker's finally block.  Holding the reader here prevents an immediate
+        replacement reader from racing that teardown after a timeout.
+        """
+        self._gige_stop_wait_timer = None
+        if reader.wait_stopped(timeout=0):
+            if self._stopping_gige_reader is reader:
+                self._stopping_gige_reader = None
+            if self.lifecycle == "running":
+                self._add_operating_log("GigE", "성공", "온도 프로브 정지")
+                if self.monitoring and self._gige_reader is None:
+                    self._start_gige_probe()
+            return
+        if self.lifecycle != "running":
+            return
+        try:
+            self._gige_stop_wait_timer = self.root.after(
+                100,
+                lambda: self._wait_for_gige_stop(reader),
+            )
+        except tk.TclError:
+            pass
 
     def _record_api_result(self, success, status_code=None, error_kind=None):
         if success:
@@ -1173,92 +1518,67 @@ class ProductDashboard:
         self.timer_id = None
         self._run_maintenance()
         self._schedule_analysis()
+        self._update_capture_freshness()
         self._update_metric_text()
         # 환경설정에서 지정한 화면 갱신 주기를 상태와 관계없이 적용한다.
         self._schedule_refresh(self.REFRESH_SECONDS * 1000)
 
-    def _run_maintenance(self):
-        """주기적 데이터 무결성 검사, 메타데이터 갱신, 오래된 파일 정리,
-        백엔드 알람 이벤트 동기화.
+    def _update_capture_freshness(self) -> None:
+        """Do not display an old Normal frame as live production data."""
+        if not self.monitoring or self.capture_paused_by_user:
+            return
+        reference = self._last_successful_capture_at or self._capture_started_at
+        if reference is None:
+            return
+        stale_after = max(
+            self.REFRESH_SECONDS * 2,
+            float(self.cfg.camera.capture_interval_sec) * 2,
+        ) + 10.0
+        age = (datetime.now() - reference).total_seconds()
+        if age > stale_after:
+            self._set_system_state("데이터 지연", COLORS["red"])
+            if not self._capture_stale_announced:
+                self._capture_stale_announced = True
+                self._add_operating_log(
+                    "캡처",
+                    "경고",
+                    f"마지막 유효 캡처 후 {age:.0f}초 경과 · 데이터가 최신이 아닙니다",
+                )
 
-        monitor.py의 주기적 유지보수와 동일한 data/ API를 사용한다.
-        스레드 풀에서 실행하므로 GUI 스레드를 블로킹하지 않는다.
+    def _run_maintenance(self):
+        """Run only non-destructive, best-effort backend synchronisation.
+
+        Dataset repair, metadata rebuilding and retention deletion are manual
+        maintenance tasks.  They must never be queued from an unattended GUI
+        refresh cycle on a factory line.
         """
         now = time.time()
-        save_dir = self.cfg.paths.dataset_dir
-
-        if now - self._last_integrity_check >= self.cfg.monitoring.integrity_interval_sec:
-            self._last_integrity_check = now
-            self._analysis_executor.submit(self._run_integrity, save_dir)
-
-        if now - self._last_metadata_update >= self.cfg.monitoring.metadata_interval_sec:
-            self._last_metadata_update = now
-            self._analysis_executor.submit(self._run_metadata_update, save_dir)
-
-        if now - self._last_cleanup_check >= 3600:
-            self._last_cleanup_check = now
-            retention = self.cfg.monitoring.cleanup_retention_days
-            self._analysis_executor.submit(self._run_cleanup, save_dir, retention)
-            self._analysis_executor.submit(self._run_normal_removal, save_dir)
 
         if now - self._last_backend_sync >= 30 and self.cfg.backend.enabled:
             self._last_backend_sync = now
-            self._analysis_executor.submit(self._sync_events_from_backend)
-            self._analysis_executor.submit(self._sync_temperature_history)
+            self._maintenance_executor.submit(self._sync_events_from_backend)
+            self._maintenance_executor.submit(self._sync_temperature_history)
+
+    def _queue_metadata_update(self) -> None:
+        """Append metadata for newly radiometrically decoded captures.
+
+        This is intentionally separate from broad integrity repair and all
+        retention deletion.  The single maintenance worker serializes CSV
+        appends without delaying camera I/O or live analysis.
+        """
+        self._maintenance_executor.submit(
+            self._run_metadata_update,
+            self.cfg.paths.dataset_dir,
+        )
 
     @staticmethod
-    def _run_integrity(save_dir: str):
-        try:
-            result = run_check(save_dir=save_dir, log_callback=None)
-            if result.missing_npy > 0 or result.orphan_npy > 0:
-                _file_log.info(
-                    "dashboard integrity: %d NPY recovered, %d orphans removed",
-                    result.fixed, result.removed,
-                )
-        except Exception as exc:
-            _file_log.warning("dashboard integrity check error: %s", exc)
-
-    @staticmethod
-    def _run_metadata_update(save_dir: str):
+    def _run_metadata_update(save_dir: str) -> None:
         try:
             result = run_metadata(save_dir=save_dir, log_callback=None)
             if result.new > 0:
                 _file_log.info("dashboard metadata: %d new records", result.new)
         except Exception as exc:
             _file_log.warning("dashboard metadata update error: %s", exc)
-
-    @staticmethod
-    def _run_cleanup(save_dir: str, retention_days: int):
-        try:
-            result = run_cleanup_if_due(
-                save_dir=save_dir,
-                retention_days=retention_days,
-                log_callback=None,
-            )
-            if result is not None:
-                _file_log.info(
-                    "dashboard cleanup: %d pairs removed, %.1f MB freed",
-                    result.removed_pairs,
-                    result.freed_bytes / (1024 * 1024),
-                )
-        except Exception as exc:
-            _file_log.warning("dashboard cleanup error: %s", exc)
-
-    @staticmethod
-    def _run_normal_removal(save_dir: str):
-        try:
-            result = remove_normal_pairs_if_due(
-                save_dir=save_dir,
-                log_callback=None,
-            )
-            if result is not None:
-                _file_log.info(
-                    "dashboard normal-pair removal: %d pairs removed, %.1f MB freed",
-                    result.removed_pairs,
-                    result.freed_bytes / (1024 * 1024),
-                )
-        except Exception as exc:
-            _file_log.warning("dashboard normal-pair removal error: %s", exc)
 
     def capture_and_refresh(self):
         """버튼 클릭 시 새 Thermal/Visual을 촬영하고 그 결과로 화면을 갱신한다."""
@@ -1294,10 +1614,10 @@ class ProductDashboard:
             npy = pairs.ensure_npy(thermal)
             pair = {"base": thermal.stem, "thermal": thermal, "visual": visual, "npy": npy}
             result = self._process_pair_to_dict(pair)
-            self.root.after(0, lambda: self._apply_capture_refresh_result(result))
+            self._post_to_ui(lambda: self._apply_capture_refresh_result(result))
         except Exception as exc:
             message = str(exc)
-            self.root.after(0, lambda msg=message: self._handle_capture_refresh_error(msg))
+            self._post_to_ui(lambda msg=message: self._handle_capture_refresh_error(msg))
 
     def _apply_capture_refresh_result(self, result: dict):
         try:
@@ -1337,14 +1657,13 @@ class ProductDashboard:
         try:
             pair = self._latest_pair()
             if not pair:
-                self.root.after(0, lambda: self._finish_analysis(generation))
+                self._post_to_ui(lambda: self._finish_analysis(generation))
                 return
             result = self._process_pair_to_dict(pair)
-            self.root.after(0, lambda: self._apply_analysis_result(result, generation))
+            self._post_to_ui(lambda: self._apply_analysis_result(result, generation))
         except Exception as exc:
             message = str(exc)
-            self.root.after(
-                0,
+            self._post_to_ui(
                 lambda msg=message: self._handle_analysis_error(msg, generation),
             )
 
@@ -1435,12 +1754,13 @@ class ProductDashboard:
         visual_display_img = visual_img
         visual_projection_warning = None
         if visual_img is not None and thermal_img is not None:
+            calibration_path = resolve_runtime_path(self.cfg.paths.homography_path)
             visual_display_img, visual_projection_warning = create_visual_roi_overlay(
                 visual_img,
                 [result.roi_bounds for result in roi_results],
                 [result.roi_name or f"ROI-{index + 1}" for index, result in enumerate(roi_results)],
                 [item["status"] for item in per_roi_statuses],
-                calibration_path=self.cfg.paths.homography_path,
+                calibration_path=str(calibration_path),
                 thermal_size=(thermal_img.shape[1], thermal_img.shape[0]),
             )
 
@@ -1551,16 +1871,13 @@ class ProductDashboard:
             result["_local_event_id"] = local_event["id"]
             self._last_alert_capture = captured_at
         elif status == Status.NORMAL and previous != Status.NORMAL:
-            if self.capture:
-                self.capture.set_warning_mode(False)
-            self._add_operating_log("분석", "성공",
-                                    f"캡처 주기 {self.capture._normal_interval:.0f}초로 복원" if self.capture
-                                    else "정상 복귀")
+            self._add_operating_log("분석", "성공", "정상 복귀")
 
         # 새로 촬영된 이미지일 때만 백엔드 DB에 측정값을 기록한다.
         if (
             is_new_capture
             and self._latest_pair_fresh
+            and quality_ok
             and self.cfg.backend.enabled
         ):
             result["_backend_posted_event"] = threading.Event()
@@ -1576,6 +1893,9 @@ class ProductDashboard:
             threading.Thread(
                 target=self.telegram.post_measurement, args=(result,), daemon=True
             ).start()
+
+        if is_new_capture and self._latest_pair_fresh:
+            self._queue_metadata_update()
 
         self.telegram.maybe_dispatch(
             result,
@@ -1751,7 +2071,7 @@ class ProductDashboard:
     def _finish_analysis(self, generation: int):
         self._analysis_running = False
         if self._analysis_pending:
-            self.root.after(0, self._schedule_analysis)
+            self._schedule_analysis()
 
     def _draw_visible_roi(self, img, roi):
         x1, y1, x2, y2 = roi; h, w = img.shape[:2]
@@ -1864,7 +2184,7 @@ class ProductDashboard:
         self.open_alert_history()
 
     def _update_metric_text_async(self):
-        if self.lifecycle == "running": self.root.after(0, self._update_metric_text)
+        self._post_to_ui(self._update_metric_text)
 
     def _update_metric_text(self):
         if not hasattr(self, "metric_label"):
@@ -1874,6 +2194,67 @@ class ProductDashboard:
             f"카메라 연결 {m.rate(m.connection_successes,m.connection_attempts):.1f}%   ·   "
             f"캡처 성공 {m.rate(m.capture_successes,m.capture_attempts):.1f}%   ·   "
             f"분석 정상 완료 {m.analysis_ok}회   ·   예외 처리 {m.exception_count}회"))
+
+    def _operating_log_summary_text(self) -> str:
+        m = self.metrics
+        return (
+            f"연결 성공률 {m.rate(m.connection_successes, m.connection_attempts):.1f}%   |   "
+            f"캡처 성공률 {m.rate(m.capture_successes, m.capture_attempts):.1f}%   |   "
+            f"분석 정상 완료 {m.analysis_ok}회   |   예외 처리 {m.exception_count}회   |   "
+            f"상태 {self.lifecycle}"
+        )
+
+    def _clear_operating_log_references(self, window=None) -> None:
+        if window is not None and getattr(self, "operating_log_window", None) is not window:
+            return
+        self.operating_log_window = None
+        self.operating_log_summary_label = None
+        self.operating_log_tree = None
+
+    def _close_operating_log(self) -> None:
+        win = getattr(self, "operating_log_window", None)
+        self._clear_operating_log_references(win)
+        try:
+            self.operating_log_button.configure(style="Action.TButton")
+        except (AttributeError, tk.TclError):
+            pass
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def _refresh_operating_log_ui(
+        self,
+        row: tuple[str, str, str, str] | None = None,
+    ) -> None:
+        """Push one persisted log row and current metrics into the open popup."""
+        if threading.current_thread() is not threading.main_thread():
+            self._post_to_ui(lambda current=row: self._refresh_operating_log_ui(current))
+            return
+        win = getattr(self, "operating_log_window", None)
+        label = getattr(self, "operating_log_summary_label", None)
+        tree = getattr(self, "operating_log_tree", None)
+        if win is None or label is None or tree is None:
+            return
+        try:
+            if not win.winfo_exists():
+                self._clear_operating_log_references(win)
+                return
+            label.configure(text=self._operating_log_summary_text())
+            if row is None:
+                children = tree.get_children()
+                if children:
+                    tree.delete(*children)
+                for existing_row in self.operating_logs:
+                    tree.insert("", "end", values=existing_row)
+            else:
+                tree.insert("", 0, values=row)
+            children = tree.get_children()
+            if len(children) > 1000:
+                tree.delete(*children[1000:])
+        except tk.TclError:
+            self._clear_operating_log_references(win)
 
     def open_operating_log(self):
         if self._operating_log_opening:
@@ -1889,7 +2270,7 @@ class ProductDashboard:
                     return
             except tk.TclError:
                 pass
-            self.operating_log_window = None
+            self._clear_operating_log_references(self.operating_log_window)
 
         # 참조가 유실되더라도 같은 이름의 Tk 창이 남아 있으면 새로 만들지 않는다.
         try:
@@ -1913,18 +2294,15 @@ class ProductDashboard:
         finally:
             self._operating_log_opening = False
 
-        def close_log_window():
-            self.operating_log_window = None
-            self.operating_log_button.configure(style="Action.TButton")
-            win.destroy()
-
-        win.protocol("WM_DELETE_WINDOW", close_log_window)
+        win.protocol("WM_DELETE_WINDOW", self._close_operating_log)
         summary = ttk.LabelFrame(win, text="운영 지표", padding=10); summary.pack(fill="x", padx=12, pady=(12,6))
-        m = self.metrics
-        ttk.Label(summary, text=(f"연결 성공률 {m.rate(m.connection_successes,m.connection_attempts):.1f}%   |   "
-                                 f"캡처 성공률 {m.rate(m.capture_successes,m.capture_attempts):.1f}%   |   "
-                                 f"분석 정상 완료 {m.analysis_ok}회   |   예외 처리 {m.exception_count}회   |   "
-                                 f"상태 {self.lifecycle}"), font=("맑은 고딕",10,"bold")).pack(anchor="w")
+        summary_label = ttk.Label(
+            summary,
+            text=self._operating_log_summary_text(),
+            font=("맑은 고딕",10,"bold"),
+        )
+        summary_label.pack(anchor="w")
+        self.operating_log_summary_label = summary_label
         frame = ttk.LabelFrame(win, text="시간순 기록", padding=8); frame.pack(fill="both", expand=True, padx=12, pady=(6,12))
         columns = ("time", "category", "result", "detail")
         tree = ttk.Treeview(frame, columns=columns, show="headings")
@@ -1932,14 +2310,20 @@ class ProductDashboard:
             tree.heading(key,text=label); tree.column(key,width=width,anchor="w" if key=="detail" else "center")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview); tree.configure(yscrollcommand=scroll.set)
         tree.pack(side="left",fill="both",expand=True); scroll.pack(side="right",fill="y")
-        for row in self.operating_logs:
-            tree.insert("", "end", values=row)
+        self.operating_log_tree = tree
+        self._refresh_operating_log_ui()
 
     def _add_operating_log(self, category: str, result: str, detail: str):
         row = (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), category, result, detail)
         self.operating_logs.insert(0, row)
         del self.operating_logs[1000:]
         _file_log.info("[%s] %s | %s", category, result, detail)
+        if threading.current_thread() is threading.main_thread():
+            self._refresh_operating_log_ui(row)
+        else:
+            self._post_to_ui(
+                lambda current=row: self._refresh_operating_log_ui(current)
+            )
         if self.cfg.backend.enabled:
             payload = {
                 "category": category,
@@ -1953,7 +2337,7 @@ class ProductDashboard:
                     requests.post(
                         f"{self.cfg.backend.url}/api/operation-logs",
                         json=payload,
-                        timeout=self.cfg.backend.timeout_sec,
+                        timeout=bounded_backend_timeout(self.cfg.backend.timeout_sec),
                     )
                 except requests.RequestException:
                     _file_log.debug("operation_logs API unavailable", exc_info=True)
@@ -1971,7 +2355,7 @@ class ProductDashboard:
                     "hours": self.trend_history_hours,
                     "limit": self.TREND_API_LIMIT,
                 },
-                timeout=self.cfg.backend.timeout_sec,
+                timeout=bounded_backend_timeout(self.cfg.backend.timeout_sec),
             )
             if resp.status_code != 200:
                 return
@@ -1980,9 +2364,8 @@ class ProductDashboard:
                 return
             if threading.current_thread() is threading.main_thread():
                 self._merge_temperature_history(points)
-            elif self.lifecycle == "running":
-                self.root.after(
-                    0,
+            else:
+                self._post_to_ui(
                     lambda rows=points: self._merge_temperature_history(rows),
                 )
         except Exception as exc:
@@ -2026,7 +2409,7 @@ class ProductDashboard:
                     "limit": 5000,
                     "hours": self.alert_history_hours,
                 },
-                timeout=self.cfg.backend.timeout_sec,
+                timeout=bounded_backend_timeout(self.cfg.backend.timeout_sec),
             )
             if resp.status_code != 200:
                 return
@@ -2036,8 +2419,8 @@ class ProductDashboard:
                 return
             if threading.current_thread() is threading.main_thread():
                 self._merge_backend_alerts(alerts)
-            elif self.lifecycle == "running":
-                self.root.after(0, lambda rows=alerts: self._merge_backend_alerts(rows))
+            else:
+                self._post_to_ui(lambda rows=alerts: self._merge_backend_alerts(rows))
         except Exception as exc:
             _file_log.warning("backend alert sync failed: %s", exc)
 
@@ -2094,7 +2477,7 @@ class ProductDashboard:
                 resp = requests.patch(
                     f"{self.cfg.backend.url}/api/alerts/{backend_id}",
                     json={"event_status": "acknowledged"},
-                    timeout=self.cfg.backend.timeout_sec,
+                    timeout=bounded_backend_timeout(self.cfg.backend.timeout_sec),
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -2110,16 +2493,14 @@ class ProductDashboard:
                     detail = f"HTTP {resp.status_code}"
             except Exception as exc:
                 detail = str(exc)
-            if self.lifecycle == "running":
-                self.root.after(
-                    0,
-                    lambda: self._finish_backend_ack(
-                        event_id,
-                        success,
-                        acknowledged_at,
-                        detail,
-                    ),
-                )
+            self._post_to_ui(
+                lambda: self._finish_backend_ack(
+                    event_id,
+                    success,
+                    acknowledged_at,
+                    detail,
+                ),
+            )
         threading.Thread(target=work, daemon=True).start()
 
     def _finish_backend_ack(
@@ -2174,20 +2555,63 @@ class ProductDashboard:
         self._check_connection_async()
 
     def on_close(self):
-        if self.lifecycle != "running": return
+        if self.lifecycle != "running":
+            return
         self.lifecycle = "closing"
         self._add_operating_log("프로그램", "시작", "running → closing")
         self._set_system_state("종료 중", COLORS["orange"])
         if self.timer_id:
-            self.root.after_cancel(self.timer_id); self.timer_id = None
+            self.root.after_cancel(self.timer_id)
+            self.timer_id = None
+        self._cancel_connection_retry()
+        if self._ui_dispatch_timer:
+            try:
+                self.root.after_cancel(self._ui_dispatch_timer)
+            except tk.TclError:
+                pass
+            self._ui_dispatch_timer = None
+        self._discard_ui_callbacks()
         self._stop_gige_probe()
-        if self.capture:
-            self.capture.request_stop()
+        if self._gige_stop_wait_timer:
+            try:
+                self.root.after_cancel(self._gige_stop_wait_timer)
+            except tk.TclError:
+                pass
+            self._gige_stop_wait_timer = None
+        gige_reader = self._stopping_gige_reader
+        capture = self.capture or self._stopping_capture
+        self.capture = None
         self.monitoring = False
-        self.lifecycle = "closed"
-        self._add_operating_log("프로그램", "성공", "closing → closed")
-        self._analysis_executor.shutdown(wait=False)
-        self.root.destroy()
+        if capture is not None:
+            capture.request_stop()
+        # Cancel queued disk/backend work.  Active requests are daemon workers,
+        # but no longer get access to the Tk interpreter through the UI queue.
+        self._analysis_executor.shutdown(wait=False, cancel_futures=True)
+        self._maintenance_executor.shutdown(wait=False, cancel_futures=True)
+
+        def finish_close() -> None:
+            if capture is not None and not capture.wait_stopped(timeout=0):
+                try:
+                    self.root.after(100, finish_close)
+                except tk.TclError:
+                    pass
+                return
+            if gige_reader is not None and not gige_reader.wait_stopped(timeout=0):
+                try:
+                    self.root.after(100, finish_close)
+                except tk.TclError:
+                    pass
+                return
+            if self._stopping_gige_reader is gige_reader:
+                self._stopping_gige_reader = None
+            self.lifecycle = "closed"
+            _file_log.info("dashboard lifecycle closing → closed")
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass
+
+        finish_close()
 
 
 class SettingsDialog:
@@ -2291,7 +2715,7 @@ class SettingsDialog:
         ttk.Label(
             parent,
             text="로그인을 누르면 별도 창에서 Bot Token과 Chat ID를 입력할 수 있습니다.\n"
-                 "로그인 정보는 이 PC의 .env에만 저장되며 Git에는 업로드되지 않습니다.",
+                 "로그인 정보는 이 PC의 보호된 dashboard 환경 파일에만 저장되며 Git에는 업로드되지 않습니다.",
             foreground="#59636d",
             justify="left",
         ).pack(anchor="w", pady=(12, 0))
@@ -2437,14 +2861,11 @@ class SettingsDialog:
         def work():
             from ..analysis import notifier
             result = notifier.test_connection(token, chat_id)
-            try:
-                if self.win.winfo_exists():
-                    self.win.after(
-                        0,
-                        lambda: self._finish_telegram_login(token, chat_id, result),
-                    )
-            except tk.TclError:
-                pass
+            # Worker threads must not inspect a Tk widget or call ``after``:
+            # the dashboard may be closing while a network request returns.
+            self.d._post_to_ui(
+                lambda: self._finish_telegram_login(token, chat_id, result),
+            )
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2655,7 +3076,8 @@ class SettingsDialog:
         """가장 최신의 Thermal/Visual 완성 쌍을 반환한다 (공용 pairs 모듈 위임)."""
         return pairs.latest_complete_pair(dataset)
     def open_roi_editor(self):
-
+        if not self._require_factory_capture_quiescent("ROI를 변경"):
+            return
         dataset = Path(self.d.cfg.paths.dataset_dir)
         if not dataset.exists():
             messagebox.showwarning("ROI 설정", "데이터셋 폴더가 없습니다.", parent=self.win); return
@@ -2669,7 +3091,8 @@ class SettingsDialog:
             )
             return
         thermal, visual = pair
-        if not Path(self.d.cfg.paths.homography_path).exists():
+        calibration_path = resolve_runtime_path(self.d.cfg.paths.homography_path)
+        if not calibration_path.exists():
             messagebox.showwarning(
                 "ROI 설정",
                 "캘리브레이션 정보가 없습니다.\n캘리브레이션을 먼저 실행하세요.",
@@ -2694,7 +3117,7 @@ class SettingsDialog:
                     self.d.cfg.identity.camera_id,
                     self.d.cfg.camera.ip,
                     entries,
-                    timeout=self.d.cfg.backend.timeout_sec,
+                    timeout=bounded_backend_timeout(self.d.cfg.backend.timeout_sec),
                     database_camera_id=self.d.cfg.identity.db_camera_id,
                 )
                 self.d.cfg.identity.db_camera_id = result.camera_id
@@ -2762,7 +3185,7 @@ class SettingsDialog:
                 response = requests.post(
                     f"{self.d.cfg.backend.url}/api/calibrations",
                     json={"camera_id": camera_id, **calibration_data},
-                    timeout=self.d.cfg.backend.timeout_sec,
+                    timeout=bounded_backend_timeout(self.d.cfg.backend.timeout_sec),
                 )
                 response.raise_for_status()
                 body = response.json()
@@ -2777,7 +3200,8 @@ class SettingsDialog:
                 result_callback=save_calibration_to_db,
             ))
             if saved:
-                self.d._add_operating_log("캘리브레이션", "완료", self.d.cfg.paths.homography_path)
+                calibration_path = resolve_runtime_path(self.d.cfg.paths.homography_path)
+                self.d._add_operating_log("캘리브레이션", "완료", str(calibration_path))
             else:
                 self.d._add_operating_log("캘리브레이션", "종료", "저장 없이 종료")
         except Exception as exc:
@@ -2805,73 +3229,168 @@ class SettingsDialog:
         ):
             self.win.after_idle(self.open_roi_editor)
 
+    def _require_factory_capture_quiescent(self, action: str) -> bool:
+        """Require stopped HTTP/GigE owners before remote policy mutation."""
+
+        active = factory_mode_enabled() and (
+            getattr(self.d, "monitoring", False)
+            or getattr(self.d, "capture", None) is not None
+            or getattr(self.d, "_stopping_capture", None) is not None
+            or getattr(self.d, "_gige_reader", None) is not None
+            or getattr(self.d, "_stopping_gige_reader", None) is not None
+        )
+        if not active:
+            return True
+        # Asset/ROI/threshold writes and local atomic replacement span process
+        # boundaries and cannot be one transaction.  Quiescence prevents live
+        # analysis from observing a partially changed remote policy.
+        messagebox.showerror(
+            "촬영 정지 필요",
+            f"현장에서 {action} 전에 촬영을 정지하고 이전 CaptureSession과 "
+            "GigE reader의 종료가 완료될 때까지 기다리세요.",
+            parent=self.win,
+        )
+        return False
+
     def save(self):
         try:
+            if not self._require_factory_capture_quiescent("설정을 저장하기"):
+                return
+
             camera_ip = self.ip.get().strip()
             dataset_value = self.dataset_dir.get().strip()
             if not dataset_value:
                 messagebox.showerror("입력 오류", "데이터 저장 폴더를 선택하세요.", parent=self.win)
                 return
 
-            dataset_path = os.path.normpath(os.path.expandvars(os.path.expanduser(dataset_value)))
-            overlay_path = os.path.join(dataset_path, "overlay")
-            os.makedirs(dataset_path, exist_ok=True)
-            os.makedirs(overlay_path, exist_ok=True)
-
-            capture_settings_changed = (
-                camera_ip != self.d.cfg.camera.ip
-                or dataset_path != os.path.normpath(self.d.cfg.paths.dataset_dir)
+            raw_dataset_path = Path(
+                os.path.expandvars(os.path.expanduser(dataset_value))
             )
+            if not raw_dataset_path.is_absolute():
+                raw_dataset_path = PROJECT_ROOT / raw_dataset_path
+            dataset_path = str(raw_dataset_path.resolve(strict=False))
+            overlay_path = str(Path(dataset_path) / "overlay")
 
-            if not self.d.cfg.backend.enabled:
-                messagebox.showerror(
-                    "DB 연동 비활성화",
-                    "Backend API 연동이 비활성화되어 있어 설비 정보를 저장할 수 없습니다.",
-                    parent=self.win,
-                )
+            # Validate a complete candidate before creating folders or writing
+            # anything to the backend.  Invalid threshold ordering or a mount
+            # root selection must be rejected without side effects.
+            candidate = deepcopy(self.d.cfg)
+            candidate.camera.ip = camera_ip
+            candidate.paths.dataset_dir = dataset_path
+            candidate.paths.overlay_dir = overlay_path
+            candidate.roi.baseline_temp = float(self.baseline.get())
+            candidate.roi.warning_delta = float(self.warning.get())
+            candidate.roi.critical_delta = float(self.critical.get())
+            # A generated factory config deliberately starts with Backend
+            # persistence disabled and no DB identity.  Commissioning is an
+            # explicit operator decision in this dialog: first validate the
+            # locally safe candidate with persistence disabled, then register
+            # the hierarchy, and only persist enabled=True after the API
+            # returns an authoritative camera ID.
+            bootstrap_backend = bool(
+                factory_mode_enabled()
+                and
+                not candidate.backend.enabled
+                and candidate.identity.db_camera_id is None
+            )
+            if bootstrap_backend and not messagebox.askyesno(
+                "현장 Backend 등록",
+                "이 설비는 아직 Backend에 등록되지 않았습니다.\n\n"
+                "계속하면 factory·line·robot·camera 정보를 Backend에 등록하고 "
+                "측정값 DB 저장을 활성화합니다. 승인된 현장 정보와 연결 상태를 "
+                "확인한 뒤 계속하시겠습니까?",
+                parent=self.win,
+            ):
                 return
 
-            from .asset_api_client import register_asset_hierarchy
+            # ``validate_config`` correctly rejects enabled=True without a
+            # DB camera ID.  Keep it false through local validation and turn
+            # it on only after successful registration below.
+            if bootstrap_backend:
+                candidate.backend.enabled = False
+            validate_config(candidate, collection_mode=True)
 
-            identity = self.d.cfg.identity
-            # DB 스키마의 factory → line → robot → camera 외래키 연결은
-            # 측정·알림 저장에 필요하다. 사용자가 입력하거나 화면에서 보는
-            # 항목은 제거하고, 기존 값 또는 내부 기본값으로만 유지한다.
-            factory_name = identity.factory_name.strip() or "ThermoGuard"
-            line_name = identity.line_name.strip() or "기본 라인"
-            robot_name = identity.robot_name.strip() or identity.robot_id
-            registration = register_asset_hierarchy(
-                base_url=self.d.cfg.backend.url,
-                timeout=self.d.cfg.backend.timeout_sec,
-                factory_name=factory_name,
-                line_name=line_name,
-                robot_code=identity.robot_id,
-                robot_name=robot_name,
-                camera_code=identity.camera_id,
-                camera_ip=camera_ip,
-                factory_id=identity.factory_id,
-                line_id=identity.line_id,
-                robot_id=identity.db_robot_id,
-                camera_id=identity.db_camera_id,
+            current_dataset_path = Path(
+                os.path.expandvars(os.path.expanduser(self.d.cfg.paths.dataset_dir))
+            )
+            if not current_dataset_path.is_absolute():
+                current_dataset_path = PROJECT_ROOT / current_dataset_path
+            capture_runtime_changed = (
+                camera_ip != self.d.cfg.camera.ip
+                or dataset_path != str(current_dataset_path.resolve(strict=False))
             )
 
-            self.d.cfg.camera.ip = camera_ip
-            identity.factory_id = registration.factory_id
-            identity.line_id = registration.line_id
-            identity.db_robot_id = registration.robot_id
-            identity.db_camera_id = registration.camera_id
-            self.d.cfg.paths.dataset_dir = dataset_path
-            self.d.cfg.paths.overlay_dir = overlay_path
-            self.d.cfg.roi.baseline_temp = float(self.baseline.get())
-            self.d.cfg.roi.warning_delta = float(self.warning.get())
-            self.d.cfg.roi.critical_delta = float(self.critical.get())
-            save_config(self.d.cfg)
-            self._sync_thresholds_to_backend()
-            self.d._add_operating_log(
-                "DB",
-                "저장 완료",
-                f"카메라 연결 정보 저장 (camera_id={registration.camera_id})",
-            )
+            registration = None
+            if candidate.backend.enabled or bootstrap_backend:
+                from .asset_api_client import register_asset_hierarchy
+
+                identity = candidate.identity
+                # DB 스키마의 factory → line → robot → camera 외래키 연결은
+                # 측정·알림 저장에 필요하다. 사용자가 입력하거나 화면에서 보는
+                # 항목은 제거하고, 기존 값 또는 내부 기본값으로만 유지한다.
+                factory_name = identity.factory_name.strip() or "ThermoGuard"
+                line_name = identity.line_name.strip() or "기본 라인"
+                robot_name = identity.robot_name.strip() or identity.robot_id
+                registration = register_asset_hierarchy(
+                    base_url=candidate.backend.url,
+                    timeout=bounded_backend_timeout(candidate.backend.timeout_sec),
+                    factory_name=factory_name,
+                    line_name=line_name,
+                    robot_code=identity.robot_id,
+                    robot_name=robot_name,
+                    camera_code=identity.camera_id,
+                    camera_ip=camera_ip,
+                    capture_mode=candidate.tools.mode,
+                    normal_interval_sec=candidate.camera.capture_interval_sec,
+                    warning_interval_sec=candidate.camera.warning_interval_sec,
+                    factory_id=identity.factory_id,
+                    line_id=identity.line_id,
+                    robot_id=identity.db_robot_id,
+                    camera_id=identity.db_camera_id,
+                )
+
+                identity.factory_id = registration.factory_id
+                identity.line_id = registration.line_id
+                identity.db_robot_id = registration.robot_id
+                identity.db_camera_id = registration.camera_id
+                if bootstrap_backend:
+                    candidate.backend.enabled = True
+                # Prove the now-complete persisted form satisfies strict
+                # startup validation before any local state changes.
+                validate_config(candidate, collection_mode=True)
+
+                # This is intentionally before save_config/self.d.cfg/capture
+                # restart.  If threshold sync fails, the running capture stays
+                # on its prior coherent configuration rather than splitting
+                # camera, ROI and DB identities across two settings versions.
+                self._sync_thresholds_to_backend(cfg=candidate)
+
+            # In development this still restarts capture when its source path
+            # changes.  Factory save is accepted only after capture has become
+            # quiescent, so the next operator start necessarily uses the fully
+            # persisted candidate.
+            os.makedirs(dataset_path, exist_ok=True)
+            os.makedirs(overlay_path, exist_ok=True)
+            save_collection_config(candidate)
+            self.d.cfg = candidate
+            if bootstrap_backend:
+                # The factory start gate intentionally marked monitoring as
+                # paused.  A successful, explicitly approved registration is
+                # the only path that clears that commissioning pause.
+                self.d.capture_paused_by_user = False
+                self.d._commissioning_block_announced = False
+            if registration is not None:
+                self.d._add_operating_log(
+                    "DB",
+                    "저장 완료",
+                    f"카메라 연결 정보 저장 (camera_id={registration.camera_id})",
+                )
+            else:
+                self.d._add_operating_log(
+                    "DB",
+                    "보류",
+                    "Backend 연동이 비활성화되어 로컬 설정만 저장함",
+                )
             self.d._add_operating_log("설정", "성공", dataset_path)
             self.d._add_operating_log(
                 "설정",
@@ -2883,14 +3402,24 @@ class SettingsDialog:
                 ),
             )
 
-            if capture_settings_changed and self.d.capture:
-                self.d.capture.request_stop()
-                self.d.capture = None
+            if capture_runtime_changed and self.d.capture:
+                old_capture = self.d.capture
                 self.d.monitoring = False
-                self.d.root.after(300, self.d.start_monitoring)
+                self.d.capture = None
+                self.d._stop_gige_probe()
+                old_capture.request_stop()
+                self.d._stopping_capture = old_capture
+                self.d.capture_paused_by_user = False
+                self.d._wait_for_capture_stop(old_capture, restart=True)
 
             self.d.apply_saved_settings_immediately()
             self.close()
+        except ConfigValidationError as exc:
+            messagebox.showerror(
+                "안전 검증 실패",
+                f"설정이 현장 운영 조건을 만족하지 않습니다.\n\n{exc}",
+                parent=self.win,
+            )
         except OSError as exc:
             messagebox.showerror("저장 경로 오류", f"폴더를 만들거나 사용할 수 없습니다.\n{exc}", parent=self.win)
         except ValueError:
@@ -2903,15 +3432,23 @@ class SettingsDialog:
                 parent=self.win,
             )
 
-    def _sync_thresholds_to_backend(self, roi_entries=None):
-        if not self.d.cfg.backend.enabled or not self.d.cfg.identity.db_camera_id:
+    def _sync_thresholds_to_backend(self, roi_entries=None, *, cfg=None):
+        """Synchronize one validated config before making it live locally.
+
+        ``cfg`` allows Settings save to prove backend threshold persistence
+        before it writes ``config.json`` or replaces ``self.d.cfg``.  ROI
+        editing keeps the default current dashboard config.
+        """
+
+        target_cfg = self.d.cfg if cfg is None else cfg
+        if not target_cfg.backend.enabled or not target_cfg.identity.db_camera_id:
             raise RuntimeError(
                 "Backend 또는 카메라 DB ID가 없어 threshold를 저장할 수 없습니다."
             )
 
         from .threshold_api_client import sync_threshold_profiles
 
-        entries = self.d.cfg.roi.rois if roi_entries is None else roi_entries
+        entries = target_cfg.roi.rois if roi_entries is None else roi_entries
         roi_ids = [
             (
                 entry.get("db_roi_id")
@@ -2924,28 +3461,21 @@ class SettingsDialog:
         if not roi_ids:
             self.d._add_operating_log(
                 "DB",
-                "보류",
-                "저장된 DB ROI ID가 없어 ROI 저장 후 생성합니다.",
-            )
-            from .threshold_api_client import ThresholdSyncResult
-            return ThresholdSyncResult(
-                camera_id=int(self.d.cfg.identity.db_camera_id),
-                roi_ids=(),
-                created=0,
-                updated=0,
+                "시작",
+                "저장된 DB ROI ID가 없어 camera-wide threshold를 동기화합니다.",
             )
 
         result = sync_threshold_profiles(
-            base_url=self.d.cfg.backend.url,
-            timeout=self.d.cfg.backend.timeout_sec,
-            camera_id=self.d.cfg.identity.db_camera_id,
+            base_url=target_cfg.backend.url,
+            timeout=bounded_backend_timeout(target_cfg.backend.timeout_sec),
+            camera_id=target_cfg.identity.db_camera_id,
             roi_ids=roi_ids,
-            baseline_temp=self.d.cfg.roi.baseline_temp,
-            warning_delta=self.d.cfg.roi.warning_delta,
-            critical_delta=self.d.cfg.roi.critical_delta,
-            min_hotspot_size=self.d.cfg.hotspot.min_size,
-            min_hotspot_size_max=self.d.cfg.hotspot.min_size_max,
-            alarm_cooldown_sec=self.d.cfg.monitoring.alarm_cooldown_sec,
+            baseline_temp=target_cfg.roi.baseline_temp,
+            warning_delta=target_cfg.roi.warning_delta,
+            critical_delta=target_cfg.roi.critical_delta,
+            min_hotspot_size=target_cfg.hotspot.min_size,
+            min_hotspot_size_max=target_cfg.hotspot.min_size_max,
+            alarm_cooldown_sec=target_cfg.monitoring.alarm_cooldown_sec,
         )
         _file_log.info(
             "backend ROI threshold sync success: camera_id=%s roi_ids=%s "
@@ -2964,11 +3494,22 @@ class SettingsDialog:
         return result
 
 
-def main():
-    root = tk.Tk(); app = ProductDashboard(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_close)
-    root.mainloop()
+def main() -> int:
+    """Run the supervised data-collection dashboard without factory gates."""
+    # Keep the runtime scope solely so CaptureSession can identify this as the
+    # supported dashboard path when THERMOGUARD_FACTORY_MODE happens to remain
+    # set.  It does not acquire or require a host lock.
+    with dashboard_runtime_scope():
+        root = tk.Tk()
+        app = ProductDashboard(root)
+        root.protocol("WM_DELETE_WINDOW", app.on_close)
+        try:
+            root.mainloop()
+        finally:
+            if getattr(app, "lifecycle", "closed") == "running":
+                app.on_close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
